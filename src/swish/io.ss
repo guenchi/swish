@@ -29,8 +29,11 @@
    close-path-watcher
    close-tcp-listener
    connect-tcp
+   count-foreign-handles
    directory?
    force-close-output-port
+   foreign-handle-count
+   foreign-handle-print
    get-datum/annotations-all
    get-file-size
    get-real-path
@@ -41,11 +44,20 @@
    list-directory
    listen-tcp
    listener-address
+   listener-create-time
    listener-port-number
    listener?
    make-directory
    make-directory-path
+   make-foreign-handle-guardian
+   make-osi-input-port
+   make-osi-output-port
    make-utf8-transcoder
+   open-binary-file-to-append
+   open-binary-file-to-read
+   open-binary-file-to-replace
+   open-binary-file-to-write
+   open-fd-port
    open-file
    open-file-port
    open-file-to-append
@@ -53,13 +65,20 @@
    open-file-to-replace
    open-file-to-write
    open-utf8-bytevector
+   osi-port-closed?
    osi-port-count
+   osi-port-create-time
+   osi-port-name
+   osi-port?
    path-combine
    path-watcher-count
+   path-watcher-create-time
    path-watcher-path
    path-watcher?
+   print-foreign-handles
    print-osi-ports
    print-path-watchers
+   print-signal-handlers
    print-tcp-listeners
    read-bytevector
    read-file
@@ -69,6 +88,8 @@
    remove-file
    rename-path
    set-file-mode
+   signal-handler
+   signal-handler-count
    spawn-os-process
    stat-directory?
    stat-regular-file?
@@ -110,27 +131,37 @@
      (immutable create-time)
      (mutable handle)))
 
+  (define (get-osi-port-handle who p)
+    (unless (osi-port? p)
+      (bad-arg who p))
+    (or (osi-port-handle p)
+        (raise `#(osi-port-closed ,who ,p))))
+
   (define (read-osi-port port bv start n fp)
     (define result)
     (with-interrupts-disabled
-     (match (osi_read_port* (osi-port-handle port) bv start n fp
-              (let ([p self])
-                (lambda (r)
-                  (#%$keep-live port)
-                  (set! result r)
-                  (complete-io p))))
-       [#t
-        (wait-for-io (osi-port-name port))
-        (cond
-         [(>= result 0) result]
-         [(eqv? result UV_EOF) 0]
-         [else (io-error (osi-port-name port) 'osi_read_port result)])]
-       [(,who . ,errno) (io-error (osi-port-name port) who errno)])))
+     (let retry ()
+       (match (osi_read_port* (get-osi-port-handle 'read-osi-port port)
+                bv start n fp
+                (let ([p self])
+                  (lambda (r)
+                    (#%$keep-live port)
+                    (set! result r)
+                    (complete-io p))))
+         [#t
+          (wait-for-io (osi-port-name port))
+          (cond
+           [(>= result 0) result]
+           [(eqv? result UV_EOF) 0]
+           [(eqv? result UV_EINTR) (retry)]
+           [else (io-error (osi-port-name port) 'osi_read_port result)])]
+         [(,who . ,errno) (io-error (osi-port-name port) who errno)]))))
 
   (define (write-osi-port port bv start n fp)
     (define result)
     (with-interrupts-disabled
-     (match (osi_write_port* (osi-port-handle port) bv start n fp
+     (match (osi_write_port* (get-osi-port-handle 'write-osi-port port)
+              bv start n fp
               (let ([p self])
                 (lambda (r)
                   (#%$keep-live port)
@@ -144,6 +175,8 @@
        [(,who . ,errno) (io-error (osi-port-name port) who errno)])))
 
   (define (close-osi-port port)
+    (unless (osi-port? port)
+      (bad-arg 'close-osi-port port))
     (with-interrupts-disabled
      (let ([handle (osi-port-handle port)])
        (when handle
@@ -153,34 +186,20 @@
                       (#%$keep-live port)
                       (complete-io p))))
            [#t
-            (osi-port-handle-set! port #f)
-            (eq-hashtable-delete! osi-port-table port)
+            (osi-ports port #f)
             (wait-for-io (osi-port-name port))]
            [(,who . ,errno) (io-error (osi-port-name port) who errno)])))))
 
   (define (force-close-output-port op)
     (unless (port-closed? op)
       (match (catch (close-output-port op))
-        [#(EXIT #(io-error ,_ osi_write_port ,_))
+        [#(EXIT ,_)
          (clear-output-port op)
          (close-output-port op)]
-        [#(EXIT ,reason) (raise reason)]
         [,_ (void)])))
 
   (define (io-error name who errno)
     (raise `#(io-error ,name ,who ,errno)))
-
-  (define (make-r! port)
-    (lambda (bv start n)
-      (read-osi-port port bv start n -1)))
-
-  (define (make-w! port)
-    (lambda (bv start n)
-      (write-osi-port port bv start n -1)))
-
-  (define (make-close port)
-    (lambda ()
-      (close-osi-port port)))
 
   (define (make-utf8-transcoder)
     (make-transcoder (utf-8-codec)
@@ -191,12 +210,34 @@
     (transcoded-port bp (make-utf8-transcoder)))
 
   (define (make-iport name port close?)
-    (make-custom-binary-input-port name (make-r! port) #f #f
-      (and close? (make-close port))))
+    (define fp 0)
+    (define (r! bv start n)
+      (let ([count (read-osi-port port bv start n -1)])
+        (set! fp (+ fp count))
+        count))
+    (define (gp) fp)
+    (make-custom-binary-input-port name r! gp #f
+      (and close? (lambda () (close-osi-port port)))))
+
+  (define (make-osi-input-port p)
+    (unless (osi-port? p)
+      (bad-arg 'make-osi-input-port p))
+    (make-iport (osi-port-name p) p #t))
 
   (define (make-oport name port)
-    (make-custom-binary-output-port name (make-w! port) #f #f
-      (make-close port)))
+    (define fp 0)
+    (define (w! bv start n)
+      (let ([count (write-osi-port port bv start n -1)])
+        (set! fp (+ fp count))
+        count))
+    (define (gp) fp)
+    (define (close) (close-osi-port port))
+    (make-custom-binary-output-port name w! gp #f close))
+
+  (define (make-osi-output-port p)
+    (unless (osi-port? p)
+      (bad-arg 'make-osi-output-port p))
+    (make-oport (osi-port-name p) p))
 
   (define (open-utf8-bytevector bv)
     (binary->utf8 (open-bytevector-input-port bv)))
@@ -235,44 +276,130 @@
           (set-port-position! ip start)))
     (port-position ip))
 
-  (define osi-port-guardian (make-guardian))
-  (define osi-port-table (make-weak-eq-hashtable))
+  (define (sorted-cells ht create-time cell->record cell->handle)
+    ;; cell is in ht iff its cell->handle is not #f
+    (define (cell<? x1 x2)
+      (let ([t1 (create-time (cell->record x1))] [t2 (create-time (cell->record x2))])
+        (cond
+         [(< t1 t2) #t]
+         [(> t1 t2) #f]
+         [else (< (cell->handle x1) (cell->handle x2))])))
+    (let ([v (with-interrupts-disabled (hashtable-cells ht))])
+      (vector-sort! cell<? v)
+      v))
 
-  (define (osi-port-count) (hashtable-size osi-port-table))
+  (define-record-type %type-reporter
+    (nongenerative)
+    (fields
+     (immutable name)
+     (immutable count)
+     (immutable print)))
 
-  (define print-osi-ports
-    (case-lambda
-     [() (print-osi-ports (current-output-port))]
-     [(op)
-      (let ([v (with-interrupts-disabled (hashtable-keys osi-port-table))])
-        (vector-sort!
-         (lambda (p1 p2)
-           (let ([t1 (osi-port-create-time p1)] [t2 (osi-port-create-time p2)])
-             (cond
-              [(< t1 t2) #t]
-              [(> t1 t2) #f]
-              [else (< (osi-port-handle p1) (osi-port-handle p2))])))
-         v)
+  (define foreign-handle-reporters (make-hashtable symbol-hash eq?))
+
+  (define (add-foreign-reporter name table cell->record cell->handle get-create-time print-one)
+    (define (get-count) (hashtable-size table))
+    (define print
+      (case-lambda
+       [() (print (current-output-port))]
+       [(op)
         (vector-for-each
-         (lambda (p)
-           (fprintf op "  ~d: ~a opened ~d\n"
-             (osi-port-handle p)
-             (osi-port-name p)
-             (osi-port-create-time p)))
-         v))]))
+         (lambda (x)
+           (print-one op (cell->record x) (cell->handle x)))
+         (sorted-cells table get-create-time cell->record cell->handle))]))
+    (hashtable-update! foreign-handle-reporters name
+      (lambda (prev)
+        (when prev (raise `#(type-already-registered ,name)))
+        (make-%type-reporter name get-count print))
+      #f))
+
+  (define (count-foreign-handles obj report-count)
+    (vector-for-each
+     (lambda (cell)
+       (report-count obj (car cell) ((%type-reporter-count (cdr cell)))))
+     (hashtable-cells foreign-handle-reporters))
+    obj)
+
+  (define (get-type-reporter who type)
+    (let ([tr (hashtable-ref foreign-handle-reporters type #f)])
+      (if (%type-reporter? tr)
+          tr
+          (bad-arg who type))))
+
+  (define (foreign-handle-count type)
+    (%type-reporter-count
+     (get-type-reporter 'foreign-handle-count type)))
+
+  (define (foreign-handle-print type)
+    (%type-reporter-print
+     (get-type-reporter 'foreign-handle-print type)))
+
+  (define print-foreign-handles
+    (case-lambda
+     [() (print-foreign-handles (current-output-port))]
+     [(op)
+      (define (symbol<? a b)
+        (string<? (symbol->string a) (symbol->string b)))
+      (vector-for-each
+       (lambda (cell)
+         (fprintf op "\n~a:\n" (car cell))
+         ((%type-reporter-print (cdr cell)) op))
+       (vector-sort (lambda (a b) (symbol<? (car a) (car b)))
+         (hashtable-cells foreign-handle-reporters)))]))
+
+  (define (make-foreign-handle-guardian name get-handle set-handle! get-create-time close-handle print)
+    (define guardian (make-guardian))
+    (define table (make-weak-eq-hashtable))
+    (define (close-dead-handles)
+      ;; This procedure runs in the finalizer process.
+      (let ([x (guardian)])
+        (when x
+          (catch (close-handle x))
+          (close-dead-handles))))
+    (arg-check 'make-foreign-handle-guardian
+      [name symbol?]
+      [get-handle procedure?]
+      [set-handle! procedure?]
+      [get-create-time procedure?]
+      [close-handle procedure?]
+      [print procedure?])
+    (add-finalizer close-dead-handles)
+    (add-foreign-reporter name table car cdr get-create-time print)
+    (lambda (record handle)
+      (cond
+       [handle
+        ;; avoid re-registering with guardian if we're reviving handle because
+        ;; close failed and we want to be able to print the handle
+        (if (get-handle record)
+            (guardian record)
+            (set-handle! record handle))
+        (eq-hashtable-set! table record handle)]
+       [else
+        (set-handle! record #f)
+        (eq-hashtable-delete! table record)])
+      record))
+
+  (define (osi-port-closed? p)
+    (unless (osi-port? p)
+      (bad-arg 'osi-port-closed? p))
+    (not (osi-port-handle p)))
+
+  (define osi-ports
+    (make-foreign-handle-guardian 'osi-ports
+      osi-port-handle
+      osi-port-handle-set!
+      osi-port-create-time
+      close-osi-port
+      (lambda (op p handle)
+        (fprintf op "  ~d: ~a opened ~d\n" handle
+          (osi-port-name p)
+          (osi-port-create-time p)))))
+
+  (define osi-port-count (foreign-handle-count 'osi-ports))
+  (define print-osi-ports (foreign-handle-print 'osi-ports))
 
   (define (@make-osi-port name handle)
-    (let ([port (make-osi-port name (erlang:now) handle)])
-      (osi-port-guardian port)
-      (eq-hashtable-set! osi-port-table port 0)
-      port))
-
-  (define (close-dead-osi-ports)
-    ;; This procedure runs in the finalizer process.
-    (let ([port (osi-port-guardian)])
-      (when port
-        (close-osi-port port)
-        (close-dead-osi-ports))))
+    (osi-ports (make-osi-port name (erlang:now) handle) handle))
 
   ;; Path watching
 
@@ -283,39 +410,6 @@
      (immutable create-time)
      (mutable handle)))
 
-  (define path-watcher-guardian (make-guardian))
-  (define path-watcher-table (make-weak-eq-hashtable))
-
-  (define (path-watcher-count) (hashtable-size path-watcher-table))
-
-  (define print-path-watchers
-    (case-lambda
-     [() (print-path-watchers (current-output-port))]
-     [(op)
-      (let ([v (with-interrupts-disabled (hashtable-keys path-watcher-table))])
-        (vector-sort!
-         (lambda (p1 p2)
-           (let ([t1 (path-watcher-create-time p1)] [t2 (path-watcher-create-time p2)])
-             (cond
-              [(< t1 t2) #t]
-              [(> t1 t2) #f]
-              [else (< (path-watcher-handle p1) (path-watcher-handle p2))])))
-         v)
-        (vector-for-each
-         (lambda (p)
-           (fprintf op "  ~d: ~a opened ~d\n"
-             (path-watcher-handle p)
-             (path-watcher-path p)
-             (path-watcher-create-time p)))
-         v))]))
-
-  (define (close-dead-path-watchers)
-    ;; This procedure runs in the finalizer process.
-    (let ([w (path-watcher-guardian)])
-      (when w
-        (close-path-watcher w)
-        (close-dead-path-watchers))))
-
   (define (close-path-watcher watcher)
     (unless (path-watcher? watcher)
       (bad-arg 'close-path-watcher watcher))
@@ -323,8 +417,21 @@
      (let ([handle (path-watcher-handle watcher)])
        (when handle
          (osi_close_path_watcher handle)
-         (path-watcher-handle-set! watcher #f)
-         (eq-hashtable-delete! path-watcher-table watcher)))))
+         (path-watchers watcher #f)))))
+
+  (define path-watchers
+    (make-foreign-handle-guardian 'path-watchers
+      path-watcher-handle
+      path-watcher-handle-set!
+      path-watcher-create-time
+      close-path-watcher
+      (lambda (op p handle)
+        (fprintf op "  ~d: ~a opened ~d\n" handle
+          (path-watcher-path p)
+          (path-watcher-create-time p)))))
+
+  (define path-watcher-count (foreign-handle-count 'path-watchers))
+  (define print-path-watchers (foreign-handle-print 'path-watchers))
 
   (define (watch-path path process)
     (unless (string? path)
@@ -340,19 +447,14 @@
                [(errno)
                 (send process
                   `#(path-watcher-failed ,path ,errno))]))
-       [(,who . ,errno) (raise `#(watch-path-failed ,path ,who ,errno))]
+       [(,who . ,errno) (io-error path who errno)]
        [,handle
-        (let ([w (make-path-watcher path (erlang:now) handle)])
-          (path-watcher-guardian w)
-          (eq-hashtable-set! path-watcher-table w 0)
-          w)])))
+        (path-watchers (make-path-watcher path (erlang:now) handle) handle)])))
 
   ;; Console Ports
 
   (define (make-console-input)
-    ;; no need to register static stdin port with the guardian
-    (define name "stdin-nb")
-    (binary->utf8 (make-iport name (make-osi-port name (erlang:now) (osi_get_stdin)) #f)))
+    (binary->utf8 (make-osi-input-port (open-fd-port "stdin-nb" 0 #f))))
 
   (define hook-console-input
     (let ([hooked? #f])
@@ -481,6 +583,16 @@
           (io-error path 'osi_chmod result))]
        [(,who . ,errno) (io-error path who errno)])))
 
+  (define (open-fd-port name fd close?)
+    (unless (string? name)
+      (bad-arg 'open-fd-port name))
+    (unless (and (fixnum? fd) (fx>= fd 0))
+      (bad-arg 'open-fd-port fd))
+    (with-interrupts-disabled
+     (match (osi_open_fd* fd close?)
+       [(,who . ,errno) (io-error name who errno)]
+       [,handle (@make-osi-port name handle)])))
+
   (define (open-file-port name flags mode)
     (define result)
     (with-interrupts-disabled
@@ -501,7 +613,7 @@
   (define (get-file-size port)
     (define result)
     (with-interrupts-disabled
-     (match (osi_get_file_size* (osi-port-handle port)
+     (match (osi_get_file_size* (get-osi-port-handle 'get-file-size port)
               (let ([p self])
                 (lambda (r)
                   (#%$keep-live port)
@@ -567,15 +679,14 @@
   (include "io-constants.ss")
 
   (define (open-file name flags mode type)
-    (unless (memq type '(binary-input binary-output input output append))
+    (unless (memq type '(binary-input binary-output binary-append input output append))
       (bad-arg 'open-file type))
     (let ([port (open-file-port name flags mode)])
       (define fp 0)
       (define (r! bv start n)
-        (let ([x (read-osi-port port bv start n fp)])
-          (unless (eof-object? x)
-            (set! fp (+ fp x)))
-          x))
+        (let ([count (read-osi-port port bv start n fp)])
+          (set! fp (+ fp count))
+          count))
       (define (w! bv start n)
         (let ([count (write-osi-port port bv start n fp)])
           (set! fp (+ fp count))
@@ -584,32 +695,41 @@
       (define (gp) fp)
       (define (sp! pos) (set! fp pos))
       (define (close) (close-osi-port port))
-      (case type
-        [(binary-input)
-         (make-custom-binary-input-port name r! gp sp! close)]
-        [(binary-output)
-         (make-custom-binary-output-port name w! gp sp! close)]
-        [(input)
-         (binary->utf8
-          (make-custom-binary-input-port name r! gp sp! close))]
-        [(output)
-         (binary->utf8
-          (make-custom-binary-output-port name w! gp sp! close))]
-        [(append)
-         (binary->utf8
-          (make-custom-binary-output-port name a! #f #f close))])))
+      (let open ([type type])
+        (case type
+          [(binary-input)
+           (make-custom-binary-input-port name r! gp sp! close)]
+          [(binary-output)
+           (make-custom-binary-output-port name w! gp sp! close)]
+          [(binary-append)
+           (make-custom-binary-output-port name a! #f #f close)]
+          [(input) (binary->utf8 (open 'binary-input))]
+          [(output) (binary->utf8 (open 'binary-output))]
+          [(append) (binary->utf8 (open 'binary-append))]))))
 
   (define (open-file-to-read name)
     (open-file name O_RDONLY 0 'input))
 
+  (define (open-binary-file-to-read name)
+    (open-file name O_RDONLY 0 'binary-input))
+
   (define (open-file-to-write name)
-    (open-file name (+ O_WRONLY O_CREAT O_EXCL) #o777 'output))
+    (open-file name (+ O_WRONLY O_CREAT O_EXCL) #o666 'output))
+
+  (define (open-binary-file-to-write name)
+    (open-file name (+ O_WRONLY O_CREAT O_EXCL) #o666 'binary-output))
 
   (define (open-file-to-append name)
-    (open-file name (+ O_WRONLY O_CREAT O_APPEND) #o777 'append))
+    (open-file name (+ O_WRONLY O_CREAT O_APPEND) #o666 'append))
+
+  (define (open-binary-file-to-append name)
+    (open-file name (+ O_WRONLY O_CREAT O_APPEND) #o666 'binary-append))
 
   (define (open-file-to-replace name)
-    (open-file name (+ O_WRONLY O_CREAT O_TRUNC) #o777 'output))
+    (open-file name (+ O_WRONLY O_CREAT O_TRUNC) #o666 'output))
+
+  (define (open-binary-file-to-replace name)
+    (open-file name (+ O_WRONLY O_CREAT O_TRUNC) #o666 'binary-output))
 
   (define (read-file name)
     (let ([port (open-file-port name O_RDONLY 0)])
@@ -634,7 +754,7 @@
      (match (osi_spawn* path args
               (lambda (os-pid exit-status term-signal)
                 (send process
-                  `#(<process-terminated> ,os-pid ,exit-status ,term-signal))))
+                  `#(process-terminated ,os-pid ,exit-status ,term-signal))))
        [#(,to-stdin ,from-stdout ,from-stderr ,os-pid)
         (values
          (let ([name (format "process ~d stdin" os-pid)])
@@ -656,61 +776,31 @@
      (immutable create-time)
      (mutable handle)))
 
-  (define listener-guardian (make-guardian))
-  (define listener-table (make-weak-eq-hashtable))
+  (define tcp-listeners
+    (make-foreign-handle-guardian 'tcp-listeners
+      listener-handle
+      listener-handle-set!
+      listener-create-time
+      (lambda (l) (close-tcp-listener l))
+      (lambda (op l handle)
+        (define (contains-period? s)
+          (let lp ([i 0] [n (string-length s)])
+            (and (< i n)
+                 (or (char=? (string-ref s i) #\.)
+                     (lp (+ i 1) n)))))
+        (fprintf op "  ~d: " handle)
+        (let ([addr (listener-address l)])
+          (if (contains-period? addr)
+              (display-string addr op)
+              (fprintf op "[~a]" addr))
+          (fprintf op ":~d opened ~d\n"
+            (listener-port-number l)
+            (listener-create-time l))))))
 
-  (define (tcp-listener-count) (hashtable-size listener-table))
-
-  (define print-tcp-listeners
-    (case-lambda
-     [() (print-tcp-listeners (current-output-port))]
-     [(op)
-      (let ([v (with-interrupts-disabled (hashtable-keys listener-table))])
-        (vector-sort!
-         (lambda (l1 l2)
-           (let ([t1 (listener-create-time l1)] [t2 (listener-create-time l2)])
-             (cond
-              [(< t1 t2) #t]
-              [(> t1 t2) #f]
-              [else (< (listener-handle l1) (listener-handle l2))])))
-         v)
-        (vector-for-each
-         (lambda (l)
-           (define (contains-period? s)
-             (let lp ([i 0] [n (string-length s)])
-               (and (< i n)
-                    (or (char=? (string-ref s i) #\.)
-                        (lp (+ i 1) n)))))
-           (fprintf op "  ~d: " (listener-handle l))
-           (let ([addr (listener-address l)])
-             (if (contains-period? addr)
-                 (display-string addr op)
-                 (fprintf op "[~a]" addr)))
-           (fprintf op ":~d opened ~d\n"
-             (listener-port-number l)
-             (listener-create-time l)))
-         v))]))
+  (define tcp-listener-count (foreign-handle-count 'tcp-listeners))
+  (define print-tcp-listeners (foreign-handle-print 'tcp-listeners))
 
   (define (port-number? x) (and (fixnum? x) (fx<= 0 x 65535)))
-
-  (define (close-dead-listeners)
-    ;; This procedure runs in the finalizer process.
-    (let ([l (listener-guardian)])
-      (when l
-        (close-tcp-listener l)
-        (close-dead-listeners))))
-
-  (define (accept-tcp name port)
-    (define fp 0)
-    (define w! (make-w! port))
-    (define (counting-w! bv start n)
-      (let ([count (w! bv start n)])
-        (set! fp (+ fp count))
-        count))
-    (define (gp) fp)
-    (values (make-iport name port #f)
-      (make-custom-binary-output-port name counting-w! gp #f
-        (make-close port))))
 
   (define (listen-tcp address port-number process)
     ;; Keep a weak reference to the listener in cell so that the
@@ -733,9 +823,9 @@
                             `#(accept-tcp-failed ,listener ,(car r) ,(cdr r)))
                           (let* ([name (osi_get_ip_address r)]
                                  [port (@make-osi-port name r)])
-                            (let-values ([(ip op) (accept-tcp name port)])
-                              (send process
-                                `#(accept-tcp ,listener ,ip ,op)))))
+                            (send process
+                              `#(accept-tcp ,listener ,(make-iport name port #f)
+                                  ,(make-oport name port)))))
                       (unless (pair? r)
                         (osi_close_port* r 0))))))
        [(,who . ,errno)
@@ -744,9 +834,7 @@
         (let ([l (make-listener address (osi_get_tcp_listener_port handle)
                    (erlang:now) handle)])
           (set-car! cell l)
-          (listener-guardian l)
-          (eq-hashtable-set! listener-table l 0)
-          l)])))
+          (tcp-listeners l handle))])))
 
   (define (close-tcp-listener listener)
     ;; This procedure may run in the finalizer process.
@@ -756,8 +844,7 @@
      (let ([handle (listener-handle listener)])
        (when handle
          (osi_close_tcp_listener handle)
-         (listener-handle-set! listener #f)
-         (eq-hashtable-delete! listener-table listener)))))
+         (tcp-listeners listener #f)))))
 
   (define (connect-tcp hostname port-spec)
     (define result
@@ -785,7 +872,74 @@
              (let ([name (osi-port-name port)])
                (values (make-iport name port #f) (make-oport name port)))]))])))
 
-  (add-finalizer close-dead-osi-ports)
-  (add-finalizer close-dead-path-watchers)
-  (add-finalizer close-dead-listeners)
+  (define-record-type sighandler
+    (nongenerative)
+    (fields
+     (immutable signum)
+     (immutable create-time)
+     (immutable handle)
+     (immutable callback)))
+
+  (define signal-handlers
+    (let ([table (make-hashtable values fx=)])
+      (define cell->record cdr)
+      (define (cell->handle cell) (sighandler-handle (cell->record cell)))
+      (add-foreign-reporter 'signal-handlers table cell->record cell->handle
+        sighandler-create-time
+        (lambda (op s handle)
+          (fprintf op "  ~d: for signal ~a registered ~d\n" handle
+            (sighandler-signum s)
+            (sighandler-create-time s))))
+      table))
+
+  (define signal-handler-count (foreign-handle-count 'signal-handlers))
+  (define print-signal-handlers (foreign-handle-print 'signal-handlers))
+
+  (define (@signal-handler-callback signum)
+    (cond
+     [(hashtable-ref signal-handlers signum #f) => sighandler-callback]
+     [else #f]))
+
+  (define (@deliver-signal signum)
+    (cond
+     [(@signal-handler-callback signum) =>
+      (lambda (callback) (callback signum))]))
+
+  (define signal-handler
+    (case-lambda
+     [(signum)
+      (arg-check 'signal-handler [signum fixnum? fxpositive?])
+      (with-interrupts-disabled
+        (@signal-handler-callback signum))]
+     [(signum callback)
+      (arg-check 'signal-handler
+        [signum fixnum? fxpositive?]
+        [callback (lambda (cb) (or (not cb) (procedure? cb)))])
+      (with-interrupts-disabled
+       (let* ([cell (hashtable-cell signal-handlers signum #f)]
+              [prev (cdr cell)])
+         (define (set-handler! signum handle callback)
+           (set-cdr! cell
+             (make-sighandler signum (erlang:now) handle callback)))
+         (cond
+          [(sighandler? prev)
+           (if (not callback)
+               (@close-sighandler prev)
+               (set-handler! signum (sighandler-handle prev) callback))]
+          [(procedure? callback)
+           (match (osi_start_signal* signum)
+             [(,who . ,errno)
+              (hashtable-delete! signal-handlers signum)
+              (io-error signum who errno)]
+             [,handle
+              (set-handler! signum handle callback)])])))]))
+
+  (define (@close-sighandler handler)
+    (let ([handle (sighandler-handle handler)])
+      (match (osi_stop_signal* handle)
+        [#t
+         (hashtable-delete! signal-handlers (sighandler-signum handler))]
+        [(,who . ,errno) (io-error (sighandler-signum handler) who errno)])))
+
+  (set-top-level-value! '@deliver-signal @deliver-signal)
   )

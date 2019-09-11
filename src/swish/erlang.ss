@@ -24,21 +24,26 @@
 (library (swish erlang)
   (export
    add-finalizer
+   arg-check
    bad-arg
    catch
    complete-io
    console-event-handler
    dbg
+   define-match-extension
    define-tuple
    demonitor
    demonitor&flush
    dump-stack
    erlang:now
    get-registered
+   inherited-parameters
    kill
    link
+   make-inherited-parameter
    make-process-parameter
    match
+   match-define
    match-let*
    monitor
    monitor?
@@ -66,6 +71,18 @@
    (swish osi)
    )
   ;; Procedures starting with @ must be called with interrupts disabled.
+
+  (define-syntax (arg-check x)
+    (syntax-case x ()
+      [(k $who [$arg pred ...] ...)
+       #'(let ([who $who])
+           (let ([arg $arg])
+             (unless (and (pred arg) ...)
+               ;; count on arg-check indicates test coverage of bad-arg case
+               (profile-me-as k)
+               (bad-arg who arg)))
+           ...
+           (void))]))
 
   (define-syntax on-exit
     (syntax-rules ()
@@ -143,6 +160,7 @@
     (fields
      (immutable id)
      (immutable create-time)
+     (immutable parameters)
      (mutable name)
      (mutable cont)
      (mutable sic)
@@ -159,7 +177,8 @@
     (protocol
      (lambda (new)
        (lambda (id cont)
-         ((new) id (erlang:now) #f cont 0 '() #f (make-queue) 0 0 '() '() #f)))))
+         ((new) id (erlang:now) (make-weak-eq-hashtable)
+          #f cont 0 '() #f (make-queue) 0 0 '() '() #f)))))
 
   (define (pcb-sleeping? p)
     (fxlogbit? 0 (pcb-flags p)))
@@ -404,7 +423,8 @@
   (define dump-stack
     (let ()
       (define (source-path obj)
-        (call-with-values (lambda () (obj 'source-path))
+        (call-with-values
+          (lambda () (obj 'source-path))
           (case-lambda
            [() #f]
            [(path char)
@@ -487,22 +507,33 @@
         (bad-arg 'process-id p))
       (pcb-id p)]))
 
+  (define (inherit-parameters thunk)
+    (define inherited (inherited-parameters))
+    (define vals (map (lambda (p) (p)) inherited))
+    (lambda ()
+      (for-each (lambda (p v) (p v)) inherited vals)
+      (set! inherited '())
+      (set! vals '())
+      (thunk)))
+
   (define (spawn thunk)
     (unless (procedure? thunk)
       (bad-arg 'spawn thunk))
-    (no-interrupts
-     (let ([p (@make-process (@thunk->cont thunk))])
-       (@enqueue p run-queue 0)
-       p)))
+    (let ([thunk (inherit-parameters thunk)])
+      (no-interrupts
+       (let ([p (@make-process (@thunk->cont thunk))])
+         (@enqueue p run-queue 0)
+         p))))
 
   (define (spawn&link thunk)
     (unless (procedure? thunk)
       (bad-arg 'spawn&link thunk))
-    (no-interrupts
-     (let ([p (@make-process (@thunk->cont thunk))])
-       (@link p self)
-       (@enqueue p run-queue 0)
-       p)))
+    (let ([thunk (inherit-parameters thunk)])
+      (no-interrupts
+       (let ([p (@make-process (@thunk->cont thunk))])
+         (@link p self)
+         (@enqueue p run-queue 0)
+         p))))
 
   (define (@send p x)
     (let ([inbox (pcb-inbox p)])
@@ -574,7 +605,7 @@
 
   (define process-default-ticks 1000)
 
-  (define tick-nanoseconds 1000000) ;; 1 millisecond
+  (define quantum-nanoseconds 1000000) ;; 1 millisecond
 
   (define (insert-q x next)
     ;; No interrupts occur within this procedure because the record
@@ -657,7 +688,7 @@
     (pcb-cont-set! self #f)            ;; drop ref
     (pcb-winders-set! self '())        ;; drop ref
     (pcb-exception-state-set! self #f) ;; drop ref
-    (osi_set_tick tick-nanoseconds)
+    (osi_set_quantum quantum-nanoseconds)
     (set-timer process-default-ticks)
     (enable-interrupts))
 
@@ -679,7 +710,7 @@
                                 (current-exception-state
                                  (create-exception-state done))
                                 (pcb-cont-set! self #f) ;; drop ref
-                                (osi_set_tick tick-nanoseconds)
+                                (osi_set_quantum quantum-nanoseconds)
                                 (set-timer process-default-ticks)
                                 (enable-interrupts)
                                 (exit-handler
@@ -802,7 +833,7 @@
 
   (define (console-event-handler event)
     (with-interrupts-disabled
-     (let ([op (console-output-port)]
+     (let ([op (console-error-port)]
            [ht (or (event-condition-table) (make-eq-hashtable))])
        (event-condition-table ht)
        (fprintf op "\nDate: ~a\n" (date-and-time))
@@ -826,18 +857,39 @@
      [(initial filter)
       (unless (procedure? filter)
         (bad-arg 'make-process-parameter filter))
-      (let ([ht (make-weak-eq-hashtable)]
-            [initial (filter initial)])
-        (case-lambda
-         [() (no-interrupts (eq-hashtable-ref ht self initial))]
-         [(u)
-          (let ([v (filter u)])
-            (no-interrupts (eq-hashtable-set! ht self v)))]))]
+      (let ([initial (filter initial)])
+        (rec process-parameter
+          (case-lambda
+           [() (#3%eq-hashtable-ref (pcb-parameters self)
+                 process-parameter initial)]
+           [(u) (#3%eq-hashtable-set! (pcb-parameters self)
+                  process-parameter (filter u))])))]
      [(initial)
-      (let ([ht (make-weak-eq-hashtable)])
+      (rec process-parameter
         (case-lambda
-         [() (no-interrupts (eq-hashtable-ref ht self initial))]
-         [(u) (no-interrupts (eq-hashtable-set! ht self u))]))]))
+         [() (#3%eq-hashtable-ref (pcb-parameters self)
+               process-parameter initial)]
+         [(u) (#3%eq-hashtable-set! (pcb-parameters self)
+                process-parameter u)]))]))
+
+  (define inherited-parameters
+    (make-parameter '()
+      (lambda (ps)
+        (unless (and (list? ps) (andmap procedure? ps))
+          (bad-arg 'inherited-parameters ps))
+        ps)))
+
+  (define (add-inherited p)
+    (no-interrupts
+     (inherited-parameters (cons p (inherited-parameters))))
+    p)
+
+  (define make-inherited-parameter
+    (case-lambda
+     [(initial filter)
+      (add-inherited (make-process-parameter initial filter))]
+     [(initial)
+      (add-inherited (make-process-parameter initial))]))
 
   ;; to get better names for match continuations than native or
   (define-syntax match-or
@@ -850,6 +902,11 @@
 
   (define-syntax (match x)
     (syntax-case x ()
+      [(_ exp (pattern (guard g) b1 b2 ...))
+       (eq? (datum guard) 'guard)
+       #`(match-let* ([pattern (guard g) exp]) b1 b2 ...)]
+      [(_ exp (pattern b1 b2 ...))
+       #`(match-let* ([pattern exp]) b1 b2 ...)]
       [(_ exp (pattern b1 b2 ...) ...)
        #`(let ([v exp])
            ((match-or (match-pattern v pattern b1 b2 ...) ...
@@ -891,166 +948,319 @@
   (define (bad-match v src)
     (raise `#(bad-match ,v ,src)))
 
-  (define-syntax (match-one x)
+  (define extension)
+  (define extensions)
+
+  (define-syntax (define-match-extension x)
+    (syntax-case x ()
+      [(_ type handle-object-expr)
+       #'(define-match-extension type handle-object-expr
+           (lambda x
+             (errorf 'define-match-extension
+               "no handle-field procedure provided for ~s" 'type)))]
+      [(_ type handle-object-expr handle-field-expr)
+       #'(begin
+           (define-syntax handle-object
+             (make-compile-time-value handle-object-expr))
+           (define-syntax handle-field
+             (make-compile-time-value handle-field-expr))
+           (define-property type extensions
+             #'(extension handle-object handle-field)))]))
+
+  (meta define (get-rtd lookup id)
+    (let ([hit (lookup id)])
+      (and (list? hit)
+           (apply
+            (case-lambda
+             [(ignore1 rtd . ignore2)
+              (and (record-type-descriptor? rtd) rtd)]
+             [other #f])
+            hit))))
+
+  (meta define (get-extended lookup type)
+    (define (reject-options options context)
+      (syntax-case options ()
+        [() (void)]
+        [_ (pretty-syntax-violation "invalid match pattern" context)]))
+    (cond
+     [(not (identifier? type)) 'bad-pattern]
+     [(lookup type #'extensions) =>
+      (lambda (x)
+        (syntax-case x (extension)
+          [(extension handle-object handle-field)
+           (values
+            (lookup #'handle-object)
+            (lookup #'handle-field))]))]
+     [(lookup type #'fields) =>
+      ;; tuple
+      (lambda (fields)
+        (values
+         (lambda (v pattern)
+           ;; handle-object
+           (syntax-case pattern (quasiquote)
+             [`(type spec ...)
+              #`((guard (type is? #,v))
+                 ;; could convert to sub-match, but this is easier
+                 (handle-fields (#,v type) spec ...))]))
+         ;; handle-field
+         (lambda (input fld var options context)
+           (reject-options options context)
+           (and (memq (syntax->datum fld) fields)
+                (syntax-case input ()
+                  [(v type)
+                   #`((bind #,var (type no-check #,fld v)))])))))]
+     [(get-rtd lookup type) =>
+      ;; native record
+      (lambda (rtd)
+        (values
+         ;; handle-object
+         (lambda (v pattern)
+           (syntax-case pattern (quasiquote)
+             [`(type spec ...)
+              #`((guard ((#3%record-predicate '#,rtd) #,v))
+                 (handle-fields #,v spec ...))]))
+         ;; handle-field
+         (lambda (v fld var options context)
+           (reject-options options context)
+           (and (guard (c [else #f])
+                  (csv7:record-field-accessible? rtd (syntax->datum fld)))
+                #`((bind #,var
+                     ((#3%csv7:record-field-accessor '#,rtd '#,fld) #,v)))))))]
+     [else #f]))
+
+  ;; fail is currently propagated unchanged
+  (meta define (match-help lookup x nested?)
     (define (bad-pattern x)
-      (syntax-error x "invalid match pattern"))
-    (define (add-identifier id ids)
-      (if (duplicate-id? id ids)
-          (syntax-error id "duplicate pattern variable")
-          (cons id ids)))
-    (define (duplicate-id? id ids)
-      (and (not (null? ids))
-           (or (bound-identifier=? (car ids) id)
-               (duplicate-id? id (cdr ids)))))
+      (syntax-case x ()
+        [(e pat . rest)
+         (pretty-syntax-violation "invalid match pattern" #'pat)]))
+    (define (bad-syntax context msg detail)
+      (syntax-case context ()
+        [(e pat . rest)
+         (pretty-syntax-violation msg #'pat detail)]))
+    (define reject-duplicate
+      (let ([bound-vars '()])
+        (define (duplicate? id)
+          (lambda (b) (bound-identifier=? b id)))
+        (lambda (id)
+          (if (ormap (duplicate? id) bound-vars)
+              (syntax-error id "duplicate pattern variable")
+              (set! bound-vars (cons id bound-vars))))))
+    (define-syntax bind-help
+      (syntax-rules ()
+        [(_ v e expr)
+         (if nested?
+             #`(let ([v e]) #,expr)
+             #`(begin (define v e) #,expr))]))
+    (define-syntax bind-var
+      (syntax-rules ()
+        [(_ v e expr)
+         (let ()
+           (reject-duplicate #'v)
+           (bind-help v e expr))]))
+    (define-syntax fresh-var
+      (syntax-rules ()
+        [(_ v e expr)
+         (with-temporaries (v)
+           (bind-help v e expr))]))
+    (define-syntax test
+      (syntax-rules ()
+        [(_ pred body fail)
+         (if nested?
+             #`(if pred body (fail))
+             (with-temporaries (tmp)
+               #`(begin (define tmp (unless pred (fail))) body)))]))
+    (define (generate context object? handle-field fail body ir)
+      (let f ([ir ir])
+        (syntax-case ir ()
+          [#f (bad-pattern x)]
+          [() body]
+          [((bind v e) . more)
+           (eq? (datum bind) 'bind)
+           (bind-var v e (f #'more))]
+          [((guard g) . more)
+           (eq? (datum guard) 'guard)
+           (test g #,(f #'more) #,fail)]
+          [((sub-match v pattern))
+           (and object? (eq? (datum sub-match) 'sub-match))
+           ;; sub-match pattern does not allow guard
+           (convert #`(v pattern #,fail #,body))]
+          [((handle-fields v field-spec ...))
+           (and object? (eq? (datum handle-fields) 'handle-fields))
+           (let ()
+             (define (do-field field dest-var options body)
+               ;; We don't check whether handler emits a bind for dest-var.
+               ;; If the code is in a library, the compiler will complain for us.
+               (generate context #f #f fail body
+                 (or (handle-field #'v field dest-var options context)
+                     (bad-syntax x "unknown field" field))))
+             (let match-extended-help ([specs #'(field-spec ...)])
+               (syntax-case specs (unquote unquote-splicing)
+                 [() body]
+                 [((unquote field) . rest)
+                  (if (identifier? #'field)
+                      (do-field #'field #'field '()
+                        (match-extended-help #'rest))
+                      (bad-pattern x))]
+                 [((unquote-splicing var) . rest)
+                  (if (identifier? #'var)
+                      (with-temporaries (tmp)
+                        (do-field #'var #'tmp '()
+                          (test (equal? tmp var)
+                            #,(match-extended-help #'rest)
+                            #,fail)))
+                      (bad-pattern x))]
+                 [([field pattern option ...] . rest)
+                  (with-temporaries (tmp)
+                    (do-field #'field #'tmp #'(option ...)
+                      (convert #`(tmp pattern #,fail #,(match-extended-help #'rest)))))]
+                 [other (bad-pattern x)])))]
+          [oops
+           (pretty-syntax-violation
+            (if object?
+                "invalid handle-object output"
+                "invalid handle-field output")
+            context #'oops 'define-match-extension)])))
+    (define (convert x)
+      (syntax-case x (unquote unquote-splicing quasiquote)
+        [(e (unquote (v <= pattern)) fail body)
+         (and (identifier? #'v) (eq? (datum <=) '<=))
+         (bind-var v e (convert #'(v pattern fail body)))]
+        [(e (unquote v) fail body)
+         (cond
+          [(eq? (datum v) '_) #'body]
+          [(identifier? #'v) (bind-var v e #'body)]
+          [else (bad-pattern x)])]
+        [(e (unquote-splicing var) fail body)
+         (if (identifier? #'var)
+             (test (equal? e var) body fail)
+             (bad-pattern x))]
+        [(e (quasiquote (type spec ...)) fail body)
+         (call-with-values
+           (lambda () (get-extended lookup #'type))
+           (case-lambda
+            [(fail)
+             (cond
+              [(eq? fail 'bad-pattern) (bad-pattern x)]
+              [else (bad-syntax x "unknown type" #'type)])]
+            [(handle-object handle-field)
+             ;; extract pattern, don't rebuild or we'll get wrong source info
+             (let ([pattern (syntax-case x () [(_ pat . _) #'pat])])
+               (fresh-var v e
+                 (generate pattern
+                   #t handle-field #'fail #'body
+                   (handle-object #'v pattern))))]))]
+        [(e lit fail body)
+         (let ([x (datum lit)])
+           (or (symbol? x) (number? x) (boolean? x) (char? x)))
+         (fresh-var v e (test (eqv? v 'lit) body fail))]
+        [(e s fail body)
+         (string? (datum s))
+         (fresh-var v e (test (and (string? v) (#3%string=? v s)) body fail))]
+        [(e eof fail body)
+         (eof-object? (datum eof))
+         (fresh-var v e (test (eof-object? v) body fail))]
+        [(e bv fail body)
+         (bytevector? (datum bv))
+         (fresh-var v e (test (and (bytevector? v) (#3%bytevector=? v bv)) body fail))]
+        [(e () fail body)
+         (fresh-var v e (test (null? v) body fail))]
+        [(e (first . rest) fail body)
+         (fresh-var v e
+           (test (pair? v)
+             #,(convert
+                #`((#3%car v) first fail
+                   #,(convert #'((#3%cdr v) rest fail body))))
+             fail))]
+        [(e #(element ...) fail body)
+         (let ([len (length (datum (element ...)))])
+           (fresh-var v e
+             (test (and (vector? v)
+                        (#3%fx= (#3%vector-length v) #,len))
+               #,(let lp ([i 0] [elt* #'(element ...)])
+                   (if (= i len)
+                       #'body
+                       (convert
+                        #`((#3%vector-ref v #,i)
+                           #,(car elt*) fail #,(lp (+ i 1) (cdr elt*))))))
+               fail)))]
+        [_ (bad-pattern x)]))
+    (convert x))
+
+  (define-syntax (match-one x)
     (syntax-case x ()
       [(_ e pattern fail body)
        (lambda (lookup)
-         (let check ([ids '()] [x #'pattern])
-           (syntax-case x (unquote unquote-splicing quasiquote)
-             [(unquote (v <= pattern))
-              (and (identifier? #'v) (eq? (datum <=) '<=))
-              (check (add-identifier #'v ids) #'pattern)]
-             [(unquote v)
-              (let ([s (datum v)])
-                (cond
-                 [(eq? s '_) ids]
-                 [(symbol? s) (add-identifier #'v ids)]
-                 [else (bad-pattern x)]))]
-             [(unquote-splicing var)
-              (if (identifier? #'var)
-                  ids
-                  (bad-pattern x))]
-             [(quasiquote (tuple spec ...))
-              (identifier? #'tuple)
-              (let ([fields (lookup #'tuple #'fields)])
-                (unless fields
-                  (syntax-error x "unknown tuple type in pattern"))
-                (let check-specs ([ids ids] [specs #'(spec ...)])
-                  (syntax-case specs (unquote)
-                    [() ids]
-                    [((unquote field) . rest)
-                     (identifier? #'field)
-                     (if (memq (datum field) fields)
-                         (check-specs (add-identifier #'field ids) #'rest)
-                         (syntax-error x
-                           (format "unknown field ~a in pattern"
-                             (datum field))))]
-                    [([field pattern] . rest)
-                     (identifier? #'field)
-                     (if (memq (datum field) fields)
-                         (check-specs (check ids #'pattern) #'rest)
-                         (syntax-error x
-                           (format "unknown field ~a in pattern"
-                             (datum field))))]
-                    [_ (bad-pattern x)])))]
-             [(quasiquote _) (bad-pattern x)]
-             [lit
-              (let ([x (datum lit)])
-                (or (symbol? x) (number? x) (boolean? x) (char? x)
-                    (string? x) (bytevector? x) (null? x)))
-              ids]
-             [(first . rest) (check (check ids #'first) #'rest)]
-             [#(element ...) (fold-left check ids #'(element ...))]
-             [_ (bad-pattern x)]))
-         #'(match-help e pattern fail body))]))
+         (match-help lookup #'(e pattern fail body) #t))]))
 
-  (define-syntax (match-help x)
-    (syntax-case x (unquote unquote-splicing quasiquote)
-      [(_ e (unquote (v <= pattern)) fail body)
-       #'(let ([v e]) (match-help v pattern fail body))]
-      [(_ e (unquote v) fail body)
-       (if (eq? (datum v) '_)
-           #'(begin e body)
-           #'(let ([v e]) body))]
-      [(_ e (unquote-splicing var) fail body)
-       #`(let ([v e])
-           (if (equal? v var)
-               body
-               (fail)))]
-      [(_ e (quasiquote (tuple spec ...)) fail body)
-       #`(let ([v e])
-           (if (tuple is? v)
-               (match-tuple v (tuple spec ...) fail body)
-               (fail)))]
-      [(_ e lit fail body)
-       (let ([x (datum lit)])
-         (or (symbol? x) (number? x) (boolean? x) (char? x)))
-       #`(let ([v e])
-           (if (eqv? v 'lit)
-               body
-               (fail)))]
-      [(_ e s fail body)
-       (string? (datum s))
-       #`(let ([v e])
-           (if (and (string? v) (#3%string=? v s))
-               body
-               (fail)))]
-      [(_ e bv fail body)
-       (bytevector? (datum bv))
-       #`(let ([v e])
-           (if (and (bytevector? v) (#3%bytevector=? v bv))
-               body
-               (fail)))]
-      [(_ e () fail body)
-       #`(let ([v e])
-           (if (null? v)
-               body
-               (fail)))]
-      [(_ e (first . rest) fail body)
-       #`(let ([v e])
-           (if (pair? v)
-               (match-help (#3%car v) first fail
-                 (match-help (#3%cdr v) rest fail body))
-               (fail)))]
-      [(_ e #(element ...) fail body)
-       #`(let ([v e])
-           (if (and (vector? v)
-                    (#3%fx= (#3%vector-length v) (length '(element ...))))
-               (match-vector v 0 (element ...) fail body)
-               (fail)))]))
+  (define-syntax (match-define x)
+    (lambda (lookup)
+      (syntax-case x ()
+        [(_ pattern e)
+         #`(begin
+             (define v e)
+             (define (fail) (pariah (bad-match v #,(find-source #'pattern))))
+             #,(match-help lookup
+                 #'(v pattern fail (begin)) #f))])))
 
-  (define-syntax match-tuple
-    (syntax-rules (unquote)
-      [(_ v (tuple) fail body) body]
-      [(_ v (tuple (unquote field) . rest) fail body)
-       (let ([field (tuple no-check field v)])
-         (match-tuple v (tuple . rest) fail body))]
-      [(_ v (tuple [field pattern] . rest) fail body)
-       (match-help (tuple no-check field v) pattern fail
-         (match-tuple v (tuple . rest) fail body))]))
+  (meta define (valid-fields? x f* known-fields forbidden)
+    (let valid? ([f* f*] [seen '()])
+      (syntax-case f* ()
+        [(fn . rest)
+         (identifier? #'fn)
+         (let ([f (datum fn)])
+           (when (memq f seen)
+             (syntax-violation #f "duplicate field" x #'fn))
+           (when (memq f forbidden)
+             (syntax-violation #f "invalid field" x #'fn))
+           (unless (or (not known-fields) (memq f known-fields))
+             (syntax-violation #f "unknown field" x #'fn))
+           (valid? #'rest (cons f seen)))]
+        [() #t]
+        [_ #f])))
 
-  (define-syntax match-vector
-    (syntax-rules ()
-      [(_ v i () fail body) body]
-      [(_ v i (pattern . rest) fail body)
-       (match-help (#3%vector-ref v i) pattern fail
-         (match-vector v (fx+ i 1) rest fail body))]))
+  (meta define (generate-name prefix fn)
+    (if (not prefix) fn (compound-id fn prefix fn)))
+
+  (meta define (get-binding-names bindings)
+    (syntax-case bindings ()
+      [((fn fv) . rest)
+       (cons #'fn (get-binding-names #'rest))]
+      [() '()]))
+
+  (meta define (remove-binding f bindings)
+    (syntax-case bindings ()
+      [((fn fv) . rest)
+       (if (syntax-datum-eq? #'fn f)
+           #'rest
+           #`((fn fv) #,@(remove-binding f #'rest)))]))
+
+  (meta define (find-index fn fields index)
+    (let ([f (scar fields)])
+      (if (syntax-datum-eq? f fn)
+          index
+          (find-index fn (scdr fields) (+ index 1)))))
+
+  (meta define (find-binding f bindings)
+    (syntax-case bindings ()
+      [((fn fv) . rest)
+       (if (syntax-datum-eq? #'fn f)
+           #'fv
+           (find-binding f #'rest))]
+      [() #f]))
 
   (define-syntax (define-tuple x)
     (syntax-case x ()
       [(_ name field ...)
        (and (identifier? #'name)
-            (let valid-fields? ([fields #'(field ...)] [seen '()])
-              (syntax-case fields ()
-                [(fn . rest)
-                 (and (identifier? #'fn)
-                      (let ([f (datum fn)])
-                        (when (memq f '(make copy copy* is?))
-                          (bad-syntax "invalid field" x #'fn))
-                        (when (memq f seen)
-                          (bad-syntax "duplicate field" x #'fn))
-                        (valid-fields? #'rest (cons f seen))))]
-                [() #t]
-                [_ #f])))
+            (valid-fields? x #'(field ...) #f '(make copy copy* is?)))
        #'(begin
            (define-syntax (name x)
-             (define (generate-name prefix fn)
-               (if (not prefix) fn (compound-id fn prefix fn)))
              (define (handle-open x expr prefix field-names)
                (define (make-accessor fn)
                  (let ([new-name (generate-name prefix fn)])
                    #`(define-syntax #,new-name (identifier-syntax (name no-check #,fn tmp)))))
-               (if (not (valid-field-references? field-names))
+               (if (not (valid-fields? x field-names '(field ...) '()))
                    (syntax-case x ())
                    #`(begin
                        (define tmp
@@ -1068,27 +1278,8 @@
                        [copy*
                         (handle-open x #'src #f (get-binding-names bindings))])
                    (vector 'name #,@(copy-tuple #'(field ...) 1 bindings))))
-             (define (get-binding-names bindings)
-               (syntax-case bindings ()
-                 [((fn fv) . rest)
-                  (cons #'fn (get-binding-names #'rest))]
-                 [() '()]))
              (define (valid-bindings? bindings)
-               (valid-field-references?
-                (get-binding-names bindings)))
-             (define (valid-field-references? f*)
-               (let valid? ([f* f*] [seen '()])
-                 (syntax-case f* ()
-                   [(fn . rest)
-                    (identifier? #'fn)
-                    (let ([f (datum fn)])
-                      (when (memq f seen)
-                        (bad-syntax "duplicate field" x #'fn))
-                      (unless (memq f '(field ...))
-                        (bad-syntax "unknown field" x #'fn))
-                      (valid? #'rest (cons f seen)))]
-                   [() #t]
-                   [_ #f])))
+               (valid-fields? x (get-binding-names bindings) '(field ...) '()))
              (define (make-tuple fields bindings)
                (if (snull? fields)
                    '()
@@ -1109,24 +1300,7 @@
                                    (remove-binding f bindings)))
                          (cons #`(#3%vector-ref src #,(datum->syntax f index))
                            (copy-tuple (scdr fields) (+ index 1) bindings))))))
-             (define (find-binding f bindings)
-               (syntax-case bindings ()
-                 [((fn fv) . rest)
-                  (if (syntax-datum-eq? #'fn f)
-                      #'fv
-                      (find-binding f #'rest))]
-                 [() #f]))
-             (define (remove-binding f bindings)
-               (syntax-case bindings ()
-                 [((fn fv) . rest)
-                  (if (syntax-datum-eq? #'fn f)
-                      #'rest
-                      #`((fn fv) #,@(remove-binding f #'rest)))]))
-             (define (find-index fn fields index)
-               (let ([f (scar fields)])
-                 (if (syntax-datum-eq? f fn)
-                     index
-                     (find-index fn (scdr fields) (+ index 1)))))
+
              (syntax-case x ()
                [(_name make . bindings)
                 (and (eq? (datum make) 'make)
@@ -1171,10 +1345,10 @@
                ...
                [(name fn)
                 (identifier? #'fn)
-                (bad-syntax "unknown field" x #'fn)]
+                (syntax-violation #f "unknown field" x #'fn)]
                [(name fn expr)
                 (identifier? #'fn)
-                (bad-syntax "unknown field" x #'fn)]
+                (syntax-violation #f "unknown field" x #'fn)]
                ))
            (define-property name fields '(field ...)))]))
 
@@ -1215,7 +1389,7 @@
   (set! finalizer-process (spawn finalizer-loop))
   (timer-interrupt-handler
    (lambda ()
-     (if (osi_is_tick_over)
+     (if (osi_is_quantum_over)
          (yield run-queue 0)
          (set-timer process-default-ticks))))
   (redefine collect
@@ -1225,6 +1399,18 @@
         (send finalizer-process 'go))))
 
   ;; Redefine Chez Scheme parameters
+  (redefine command-line
+    (make-process-parameter (command-line)
+      (lambda (x)
+        (unless (and (list? x) (andmap string? x))
+          (bad-arg 'command-line x))
+        x)))
+  (redefine command-line-arguments
+    (make-process-parameter (command-line-arguments)
+      (lambda (x)
+        (unless (and (list? x) (andmap string? x))
+          (bad-arg 'command-line-arguments x))
+        x)))
   (redefine custom-port-buffer-size
     (make-process-parameter 1024
       (lambda (x)
@@ -1313,7 +1499,13 @@
         (unless (procedure? x)
           (bad-arg 'waiter-prompt-and-read x))
         x)))
+  (redefine waiter-prompt-string
+    (make-process-parameter (waiter-prompt-string)
+      (lambda (x)
+        (unless (string? x)
+          (bad-arg 'waiter-prompt-string x))
+        x)))
 
-  (osi_set_tick tick-nanoseconds)
+  (osi_set_quantum quantum-nanoseconds)
   (set-timer process-default-ticks)
   (enable-interrupts))

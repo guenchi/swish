@@ -41,6 +41,7 @@
    (swish event-mgr)
    (swish events)
    (swish io)
+   (swish json)
    (swish osi)
    (swish software-info)
    (swish string-utils)
@@ -64,7 +65,8 @@
             (event-mgr:flush-buffer)
             (system-detail <system-attributes>
               [date (current-date)]
-              [software-version software-version]
+              [software-info (software-info)]
+              [machine-type (symbol->string (machine-type))]
               [computer-name (osi_get_hostname)])
             'ignore)]
          [,error error])]
@@ -186,20 +188,22 @@
      [(process? x) (process->child-id x)]
      [(date? x) (format-rfc2822 x)]
      [(condition? x)
-      (let ([op (open-output-string)])
-        (display-condition x op)
-        (write-char #\. op)
-        (let ([reason-string (get-output-string op)]
-              [stack-string
-               (and (continuation-condition? x)
-                    (let ([op (open-output-string)])
-                      (dump-stack (condition-continuation x) op 'default)
-                      (get-output-string op)))])
-          (format "~s"
-            (if stack-string
-                `#(error ,reason-string ,stack-string)
-                `#(error ,reason-string)))))]
-     [else (format "~s" x)]))
+      (parameterize ([print-graph #t])
+        (let ([op (open-output-string)])
+          (display-condition x op)
+          (write-char #\. op)
+          (let ([reason-string (get-output-string op)]
+                [stack-string
+                 (and (continuation-condition? x)
+                      (let ([op (open-output-string)])
+                        (dump-stack (condition-continuation x) op 'default)
+                        (get-output-string op)))])
+            (format "~s"
+              (if stack-string
+                  `#(error ,reason-string ,stack-string)
+                  `#(error ,reason-string))))))]
+     [(json:object? x) (json:object->string x)]
+     [else (parameterize ([print-graph #t]) (format "~s" x))]))
 
   (define-syntax (log-sql x)
     (syntax-case x ()
@@ -211,7 +215,7 @@
 
   (module (swish-event-logger)
     (define schema-name 'swish)
-    (define schema-version "2018-03-02")
+    (define schema-version "2019-06-26")
 
     (define-simple-events create-simple-tables log-simple-event
       (<child-end>
@@ -258,10 +262,7 @@
        (osi-bytes-used integer)
        (sqlite-memory integer)
        (sqlite-memory-highwater integer)
-       (databases integer)
-       (listeners integer)
-       (ports integer)
-       (watchers integer)
+       (foreign-handles text)
        (cpu real)
        (real real)
        (bytes integer)
@@ -279,7 +280,8 @@
       (<system-attributes>
        (timestamp integer)
        (date text)
-       (software-version text)
+       (software-info text)
+       (machine-type text)
        (computer-name text))
       (<transaction-retry>
        (timestamp integer)
@@ -353,6 +355,28 @@
     (define (upgrade-db)
       (match (log-db:version schema-name)
         [,@schema-version (create-db)]
+        ["2019-05-24"
+         (execute "alter table statistics rename to statistics_orig")
+         (execute "create table statistics(timestamp integer, date text, reason text, bytes_allocated integer, osi_bytes_used integer, sqlite_memory integer, sqlite_memory_highwater integer, foreign_handles text, cpu real, real real, bytes integer, gc_count integer, gc_cpu real, gc_real real, gc_bytes integer)")
+         (execute "insert into statistics select timestamp, date, reason, bytes_allocated, osi_bytes_used, sqlite_memory, sqlite_memory_highwater,json_object('databases', databases, 'statements', statements, 'tcp-listeners', listeners, 'osi-ports', ports, 'path-watchers', watchers),cpu, real, bytes, gc_count, gc_cpu, gc_real, gc_bytes from statistics_orig order by rowid")
+         (execute "drop table statistics_orig")
+         (log-db:version schema-name "2019-06-26")
+         (upgrade-db)]
+        ["2018-09-25"
+         (execute "alter table system_attributes rename to system_attributes_orig")
+         (execute "create table system_attributes (timestamp integer, date text, software_info text, machine_type text, computer_name text)")
+         (execute "insert into system_attributes select timestamp, date, json_object('swish',json_object('product-name','Swish','version',software_version)), ?, computer_name from system_attributes_orig order by rowid"
+           (symbol->string (machine-type)))
+         (execute "drop table system_attributes_orig")
+         (log-db:version schema-name "2019-05-24")
+         (upgrade-db)]
+        ["2018-03-02"
+         (execute "alter table statistics rename to statistics_orig")
+         (execute "create table statistics(timestamp integer, date text, reason text, bytes_allocated integer, osi_bytes_used integer, sqlite_memory integer, sqlite_memory_highwater integer, databases integer, statements integer, listeners integer, ports integer, watchers integer, cpu real, real real, bytes integer, gc_count integer, gc_cpu real, gc_real real, gc_bytes integer)")
+         (execute "insert into statistics select timestamp, date, reason, bytes_allocated, osi_bytes_used, sqlite_memory, sqlite_memory_highwater, databases, 0, listeners, ports, watchers, cpu, real, bytes, gc_count, gc_cpu, gc_real, gc_bytes from statistics_orig order by rowid")
+         (execute "drop table statistics_orig")
+         (log-db:version schema-name "2018-09-25")
+         (upgrade-db)]
         ["l2icz69tb6toyr48uf90nlbm3"
          (execute "alter table statistics rename to statistics_orig")
          (execute "create table statistics(timestamp integer, date text, reason text, bytes_allocated integer, osi_bytes_used integer, sqlite_memory integer, sqlite_memory_highwater integer, databases integer, listeners integer, ports integer, watchers integer, cpu real, real real, bytes integer, gc_count integer, gc_cpu real, gc_real real, gc_bytes integer)")

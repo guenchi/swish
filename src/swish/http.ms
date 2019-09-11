@@ -92,22 +92,23 @@
 (http-mat handlers ()
   (define (test input)
     (let-values ([(op get) (open-bytevector-output-port)])
-      (http:handle-input (open-bytevector-input-port (string->utf8 input)) op)
-      (utf8->string (get))))
+      (match (catch (http:handle-input
+                     (open-bytevector-input-port (string->utf8 input)) op))
+        [#(EXIT ,reason) (guard (not (eq? reason 'normal))) (raise reason)]
+        [,_ (utf8->string (get))])))
   (define (test-error&output input)
     (let-values ([(op get) (open-bytevector-output-port)])
-      (cons
-       (catch (http:handle-input
-               (open-bytevector-input-port (string->utf8 input))
-               op))
-       (utf8->string (get)))))
+      (let ([er (catch (http:handle-input
+                        (open-bytevector-input-port (string->utf8 input))
+                        op))])
+        (cons er (utf8->string (get))))))
   (when (file-directory? (tmp-dir))
     (for-each (lambda (x)
                 (when (ends-with? x ".tmp")
                   (delete-file (path-combine (tmp-dir) x))))
       (directory-list (tmp-dir))))
   (match-let*
-   ([#(EXIT normal) (catch (test ""))]
+   (["" (test "")]
     [#(EXIT #(unhandled-input ,bv))
      (guard (string=? (utf8->string bv) "unhandled"))
      (catch (test "unhandled"))]
@@ -125,9 +126,19 @@
      (catch (test (string-append
                    "POST /static/ok.txt HTTP/1.1\r\n"
                    "Content-Length: 16777217\r\n"
+                   "Content-Type: application/x-www-form-urlencoded\r\n"
                    "\r\n")))]
+    [#(EXIT unexpected-eof)
+     (catch (test (string-append
+                   "POST /static/ok.txt HTTP/1.1\r\n"
+                   "Content-Length: 10\r\n"
+                   "Content-Type: application/x-www-form-urlencoded\r\n"
+                   "\r\n"
+                   "0123")))]
     [#(EXIT #(invalid-http-path "/.."))
      (catch (test "GET /.. HTTP/1.1\r\n\r\n"))]
+    [#(EXIT #(invalid-http-path "foo"))
+     (catch (test "GET foo HTTP/1.1\r\n\r\n"))]
     [#(EXIT #(bad-arg http:respond "foo"))
      (catch (test "GET /mat?cmd=bad+arg&bad=foo HTTP/1.1\r\n\r\n"))]
     [#(EXIT #(invalid-content-length "none"))
@@ -137,8 +148,9 @@
                    "\r\n")))]
 
     ;; internal server errors
-    [(#(EXIT internal-error) .
-      "HTTP/1.1 500 \r\nContent-Length: 216\r\nCache-Control: no-cache\r\n\r\n<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Internal server error</title></head><body><h1>The server encountered an unexpected condition which prevented it from fullfilling the request.</h1></body></html>")
+    [,internal-server-error
+      "HTTP/1.1 500 \r\nContent-Length: 167\r\nCache-Control: no-cache\r\n\r\n<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Internal server error</title></head><body><h1>The server was unable to complete the request.</h1></body></html>"]
+    [(#(EXIT internal-error) . ,@internal-server-error)
      (test-error&output "GET /mat?cmd=internal-error HTTP/1.1\r\n\r\n")]
     [(#(EXIT internal-error) . "partial-output")
      (test-error&output "GET /mat?cmd=internal-error&partial=partial-output HTTP/1.1\r\n\r\n")]
@@ -155,19 +167,32 @@
     ;; header
     [#(EXIT invalid-header)
      (catch (test (string-append
-                   "GET /mat?cmd=echo%20header HTTP/1.1\r\n"
+                   "GET /mat?cmd=echo+header HTTP/1.1\r\n"
                    "Host localhost\r\n\r\n")))]
     ["HTTP/1.1 200 \r\nContent-Length: 49\r\nCache-Control: no-cache\r\n\r\n((\"Connection\" . \"close\") (\"Host\" . \"localhost\"))"
      (test (string-append
-            "GET /mat?cmd=echo%20header HTTP/1.1\r\n"
+            "GET /mat?cmd=echo+header HTTP/1.1\r\n"
             "Connection: close\r\n"
             "Host: localhost\r\n\r\n"))]
     ["HTTP/1.1 200 \r\nContent-Length: 49\r\nCache-Control: no-cache\r\n\r\n((\"Connection\" . \"close\") (\"Host\" . \"localhost\"))"
      (test (string-append
-            "GET /mat?cmd=echo%20header HTTP/1.1\r\n"
+            "GET /mat?cmd=echo+header HTTP/1.1\r\n"
             "Connection: close\r\n"
             "Host: \t localhost\r\n\r\n"))]
-
+    ["HTTP/1.1 200 \r\nContent-Length: 67\r\nCache-Control: no-cache\r\n\r\n((\"Connection\" . \"close\") (\"Host\" . \"localhost\") (\"No-Value\" . \"\"))"
+     (test
+      (string-append
+       "GET /mat?cmd=echo+header HTTP/1.1\r\n"
+       "Connection: close\r\n"
+       "Host: localhost\r\n"
+       "No-Value:\r\n\r\n"))]
+    ["HTTP/1.1 200 \r\nContent-Length: 67\r\nCache-Control: no-cache\r\n\r\n((\"Connection\" . \"close\") (\"Host\" . \"localhost\") (\"No-Value\" . \"\"))"
+     (test
+      (string-append
+       "GET /mat?cmd=echo+header HTTP/1.1\r\n"
+       "Connection: close\r\n"
+       "Host: localhost\r\n"
+       "No-Value: \r\n\r\n"))]
     ["HTTP/1.1 200 \r\nContent-Length: 3\r\nCache-Control: no-cache\r\nContent-Type: text/plain\r\n\r\nok\n"
      (test
       (string-append
@@ -208,6 +233,41 @@
                    "Content-Length: 256\r\n"
                    "\r\n"
                    "ok")))]
+    ["HTTP/1.1 200 \r\nContent-Length: 7\r\nCache-Control: no-cache\r\n\r\n0123456"
+     (test (string-append
+            "GET /mat?cmd=echo+unhandled&count=7 HTTP/1.1\r\n"
+            "Content-Length: 16\r\n"
+            "\r\n"
+            "0123456789ABCDEF"))]
+    [(#(EXIT http-violation) .
+      "HTTP/1.1 200 \r\nContent-Length: 17\r\nCache-Control: no-cache\r\n\r\n0123456789ABCDEFG")
+     (test-error&output
+      (string-append
+       "GET /mat?cmd=echo+unhandled&count=17 HTTP/1.1\r\n"
+       "Content-Length: 16\r\n"
+       "\r\n"
+       "0123456789ABCDEF"
+       "GET /mat?cmd=echo+unhandled&count=7 HTTP/1.1\r\n"
+       "Content-Length: 16\r\n"
+       "\r\n"
+       "0123456789ABCDEF"))]
+    [(#(EXIT http-violation) . ,@internal-server-error)
+     (test-error&output
+      (string-append
+       "GET /mat?cmd=bad+read&count=17 HTTP/1.1\r\n"
+       "Content-Length: 16\r\n"
+       "\r\n"
+       "0123456789ABCDEF"
+       "GET /mat?cmd=echo&echo=ok HTTP/1.1\r\n"
+       "Content-Length: 16\r\n"
+       "\r\n"
+       "0123456789ABCDEF"))]
+    ["HTTP/1.1 200 \r\nContent-Length: 2\r\nCache-Control: no-cache\r\n\r\nok"
+     (test (string-append
+            "GET /mat?cmd=echo&echo=ok HTTP/1.1\r\n"
+            "Content-Length: 16\r\n"
+            "\r\n"
+            "0123456789abcdef"))]
     ["HTTP/1.1 200 \r\nContent-Length: 2\r\nCache-Control: no-cache\r\n\r\nok"
      (test (string-append
             "POST /mat HTTP/1.1\r\n"
@@ -216,6 +276,27 @@
             "Content-Type: application/x-www-form-urlencoded\r\n"
             "\r\n"
             "cmd=echo&echo=ok"))]
+    [(#(EXIT http-violation) . ,@internal-server-error)
+     (test-error&output
+      (string-append
+       "POST /mat HTTP/1.1\r\n"
+       "Connection: keep-alive\r\n"
+       "Content-Length: 20\r\n"
+       "Content-Type: application/x-www-form-urlencoded\r\n"
+       "\r\n"
+       "cmd=bad+read&count=1"
+       "don't read me"))]
+    [(#(EXIT http-violation) .
+      "HTTP/1.1 200 \r\nContent-Length: 10\r\nCache-Control: no-cache\r\n\r\ndon't read")
+     (test-error&output
+      (string-append
+       "POST /mat HTTP/1.1\r\n"
+       "Connection: keep-alive\r\n"
+       "Content-Length: 27\r\n"
+       "Content-Type: application/x-www-form-urlencoded\r\n"
+       "\r\n"
+       "cmd=echo+unhandled&count=10"
+       "don't read me"))]
     ["HTTP/1.1 200 \r\nContent-Length: 2\r\nCache-Control: no-cache\r\n\r\nok"
      (test (string-append
             "GET /mat?cmd=echo+unhandled HTTP/1.1\r\n"
@@ -381,7 +462,15 @@
   (define header '(("Content-Length" . "bar") ("Content-Type" . "foo")))
   (define params '(("query" . "lookup") ("val" . "1")))
   (match-let*
-   ([#f (http:find-header "None" header)]
+   ([#(EXIT #(bad-arg http-port-number a)) (catch (http-port-number 'a))]
+    [#(EXIT #(bad-arg http-port-number -1)) (catch (http-port-number -1))]
+    [#(EXIT #(bad-arg http-request-limit a)) (catch (http-request-limit 'a))]
+    [#(EXIT #(bad-arg http-request-limit 0)) (catch (http-request-limit 0))]
+    [#(EXIT #(bad-arg http-header-limit a)) (catch (http-header-limit 'a))]
+    [#(EXIT #(bad-arg http-header-limit 0)) (catch (http-header-limit 0))]
+    [#(EXIT #(bad-arg http-content-limit a)) (catch (http-content-limit 'a))]
+    [#(EXIT #(bad-arg http-content-limit 0)) (catch (http-content-limit 0))]
+    [#f (http:find-header "None" header)]
     [#(EXIT #(bad-arg http:find-header None))
      (catch (http:find-header 'None header))]
     ["foo" (http:find-header "Content-Type" header)]
@@ -479,9 +568,9 @@
     (on-exit (rename-path mime-types.bak mime-types)
       ;; no mime-types file; http-cache crashes; supervisor will restart
       (utf8->string (simple-get "/static/ok.html"))
-      (receive (after 1000 'timeout-waiting-for-cache-to-fail)
+      (receive (after 1000 (raise 'timeout-waiting-for-cache-to-fail))
         [`(<gen-server-terminating> [name http-cache]
-            [reason #(io-error ,_ CreateFileW 2)])
+            [reason #(io-error ,_ uv_fs_open ,_)])
          'ok])
 
       ;; invalid mime-types file; http-cache crashes; supervisor will restart
@@ -490,7 +579,7 @@
           (invalid mime type expression)
           ("html" . "text/html")))
       (utf8->string (simple-get "/static/ok.html"))
-      (receive (after 1000 'timeout-waiting-for-cache-to-fail)
+      (receive (after 1000 (raise 'timeout-waiting-for-cache-to-fail))
         [`(<gen-server-terminating> [name http-cache]
             [reason #(invalid-mime-type (invalid mime type expression))])
          'ok])))
@@ -568,7 +657,7 @@
   (capture-events)
   (let ([path (web-dir)])
     (send 'http-cache `#(path-watcher-failed ,path -1234))
-    (receive (after 1000 'timeout-waiting-for-cache-to-fail)
+    (receive (after 1000 (raise 'timeout-waiting-for-cache-to-fail))
       [`(<gen-server-terminating> [name http-cache] ,reason)
        (match reason
          [#(bad-match #(path-watcher-failed ,@path -1234) ,_)

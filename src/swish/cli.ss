@@ -42,7 +42,7 @@
    )
 
   (define-tuple <arg-spec>
-    name                            ; string that appears in output ht
+    name                            ; symbol that appears in output ht
     type                            ;
     short                           ; #f | character
     long                            ; #f | string
@@ -143,24 +143,24 @@
        [short (values 'fit 'opt)]
        [long (values 'fit 'opt)]
        [else (values 'show 'req)]))
-   (define (populate-defaults short long usage)
-     (define base-how `(and (or short long) args))
-     (define (either x y) (if (pair? x) x (list y)))
-     (let-values ([(vis rest) (extract-usage usage)]
-                  [(def-vis def-req) (get-default-usage short long)])
-       (append
-        (either vis def-vis)
-        (match rest
-          [(,x . ,rest)
-           (guard (memq x '(opt req)))
-           (cons `(,x ,base-how) rest)]
-          [(,x . ,rest)
-           (guard (memq x '(long short)))
-           (cons `(,def-req (and ,x args)) rest)]
-          [(,x . ,_)
-           (guard (valid-usage-how? x))
-           rest]
-          [,_ (append rest (list `(,def-req ,base-how)))]))))
+    (define (populate-defaults short long usage)
+      (define base-how `(and (or short long) args))
+      (define (either x y) (if (pair? x) x (list y)))
+      (let-values ([(vis rest) (extract-usage usage)]
+                   [(def-vis def-req) (get-default-usage short long)])
+        (append
+         (either vis def-vis)
+         (match rest
+           [(,x . ,rest)
+            (guard (memq x '(opt req)))
+            (cons `(,x ,base-how) rest)]
+           [(,x . ,rest)
+            (guard (memq x '(long short)))
+            (cons `(,def-req (and ,x args)) rest)]
+           [(,x . ,_)
+            (guard (valid-usage-how? x))
+            rest]
+           [,_ (append rest (list `(,def-req ,base-how)))]))))
 
     (define (spec-maker spec name short long type help optionals)
       (let ([type (syntax->datum type)])
@@ -181,7 +181,7 @@
                          (not (null? (scdr usage-clause)))))
           (syntax-error spec (format "invalid ~a in" usage)))
         #`(<arg-spec> make
-            [name #,name]
+            [name '#,name]
             [type '#,type]
             [short #,short]
             [long #,long]
@@ -194,7 +194,7 @@
       (syntax-case spec ()
         [default-help
          (eq? (datum default-help) 'default-help)
-         (translate #'["help" -h --help bool "display this help and exit" (usage fit)])]
+         (translate #'[help -h --help bool "display this help and exit" (usage fit)])]
         [(name short long type help . optionals)
          (and (short? #'short) (long? #'long))
          (spec-maker spec #'name #'short #'long #'type #'help #'optionals)]
@@ -218,7 +218,7 @@
   (define (partial-check-specs specs) (check-specs-help specs #f))
 
   (define (check-specs-help specs check-missing?)
-    (let ([ht (make-hashtable string-hash string=?)])
+    (let ([ht (make-hashtable symbol-hash eq?)])
       (define (specs-missing ls)
         (fold-right
          (lambda (x acc)
@@ -230,7 +230,7 @@
       (for-each
        (lambda (s)
          (<arg-spec> open s [name type short long help usage])
-         (unless (string? name) (bad-spec 'name name s))
+         (unless (symbol? name) (bad-spec 'name name s))
          (unless (or (not short) (and (char? short) (valid-short-char? short)))
            (bad-spec 'short short s))
          (unless (or (not long) (string? long)) (bad-spec 'long long s))
@@ -247,14 +247,14 @@
        specs)
       (for-each
        (lambda (s)
-         (<arg-spec> open s [name conflicts requires])
-         (unless (and (list? conflicts) (for-all string? conflicts))
+         (<arg-spec> open s [conflicts requires])
+         (unless (and (list? conflicts) (for-all symbol? conflicts))
            (bad-spec 'conflicts conflicts s))
          (when check-missing?
            (let ([missing (specs-missing conflicts)])
              (unless (null? missing)
                (bad-spec 'missing-specs missing s))))
-         (unless (and (list? requires) (for-all string? requires))
+         (unless (and (list? requires) (for-all symbol? requires))
            (bad-spec 'requires requires s))
          (when check-missing?
            (let ([missing (specs-missing requires)])
@@ -304,7 +304,7 @@
         (or (starts-with? arg "--")
             (and (> (string-length arg) 0) (shortish? arg))))
 
-      (define ht (make-hashtable string-hash string=?))
+      (define ht (make-hashtable symbol-hash eq?))
 
       (define (update-list ht name value)
         (hashtable-update! ht name
@@ -329,7 +329,7 @@
                    (take-opt ls pos-specs)]
                   [,p                   ; rest
                    (guard (string? p))
-                   (update-list ht name ls)
+                   (update-list ht name (append (reverse acc) ls))
                    (take-opt '() pos-specs)]
                   [(,p ...)             ; many
                    (if (and (pair? ls) (not (maybe-option? (car ls))))
@@ -377,7 +377,7 @@
                 (take-opt ls pos-specs)]
                [,p                      ; rest
                 (guard (string? p))
-                (update-list ht name ls)
+                (update-list ht name (append (reverse acc) ls))
                 (take-opt '() pos-specs)]
                [(,p ...)                ; many
                 (if (and (pair? ls) (not (maybe-option? (car ls))))
@@ -466,14 +466,6 @@
             (raise `#(no-spec-with-name ,name)))
           (hashtable-ref ht name #f)]))))
 
-  (define-syntax arg-check
-    (syntax-rules ()
-      [(_ who [$arg pred] ...)
-       (begin
-         (let ([arg $arg])
-           (unless (pred arg) (bad-arg who arg)))
-         ...)]))
-
   (define parse-command-line-arguments
     (case-lambda
      [(specs) (parse-command-line-arguments specs (command-line-arguments))]
@@ -483,7 +475,7 @@
           (apply errorf #f fmt args)))]
      [(specs ls fail)
       (arg-check 'parse-command-line-arguments
-        [ls (lambda (x) (and (list? x) (for-all string? x)))]
+        [ls list? (lambda (x) (for-all string? x))]
         [fail procedure?])
       (parse-arguments specs ls fail)]))
 
@@ -580,7 +572,7 @@
       (<arg-spec> open s [type short long usage])
       (define flag-char
         (and short
-             (pregexp-match "\\[-.\\]" (format-spec s))
+             (pregexp-match (re "\\[-.\\]") (format-spec s))
              short))
       (cons (and (memq 'show usage) #t)
         (or flag-char (format-spec s))))
@@ -628,7 +620,7 @@
                                  (- opt-width (string-length minimal))
                                  (if min-flags 0 flag-oh))])
                     x))))))
-      (fprintf op "~a~a~a\n" leader named-args pos-args))
+    (fprintf op "~a~a~a\n" leader named-args pos-args))
 
   (define (valid-width? n) (or (not n) (and (fixnum? n) (fx>= n 0))))
 
@@ -643,7 +635,7 @@
         [prefix string?]
         [exe-name string?]
         [width valid-width?]
-        [op (lambda (p) (and (output-port? p) (textual-port? p)))])
+        [op output-port? textual-port?])
       (partial-check-specs specs)
       (let-values ([(pos opt) (partition positional? specs)])
         (display-usage-internal prefix exe-name width opt pos op))]))
@@ -661,7 +653,7 @@
      [(specs args op)
       (arg-check 'display-options
         [args parsed-options?]
-        [op (lambda (p) (and (output-port? p) (textual-port? p)))])
+        [op output-port? textual-port?])
       (partial-check-specs specs)
       (let-values ([(pos opt) (partition positional? specs)])
         (display-options-internal opt pos args op))]))
@@ -676,7 +668,7 @@
       (arg-check 'display-help
         [exe-name string?]
         [args parsed-options?]
-        [op (lambda (p) (and (output-port? p) (textual-port? p)))])
+        [op output-port? textual-port?])
       (check-specs specs)
       (let-values ([(pos opt) (partition positional? specs)])
         (display-usage-internal "Usage:" exe-name #f opt pos op)
@@ -684,4 +676,4 @@
           (newline op)
           (display-options-internal opt pos args op)))]))
 
-)
+  )

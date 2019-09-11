@@ -1,4 +1,4 @@
-;;; Copyright 2018 Beckman Coulter, Inc.
+;;; Copyright 2019 Beckman Coulter, Inc.
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person
 ;;; obtaining a copy of this software and associated documentation
@@ -20,14 +20,13 @@
 ;;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 ;;; DEALINGS IN THE SOFTWARE.
 
-(console-event-handler 'reboot-via-web-page)
-(app:shutdown 200)
-(http:respond op 200 '(("Content-Type" . "text/html"))
-  (html->bytevector
-   `(html5
-     (head
-      (meta (@ (charset "UTF-8")))
-      (meta (@ (http-equiv "refresh") (content "15; url=/")))
-      (title "Reboot"))
-     (body
-      (p "Rebooting...")))))
+(import
+ (swish mat)
+ (swish script-testing)
+ (swish testing))
+
+(isolate-mat go ()
+  (parameterize ([cd "src"])
+    (test-os-process scheme-exe `("--eedisable" "--program" "repl.ss")
+      "(exit)"
+      `("Swish Version"))))

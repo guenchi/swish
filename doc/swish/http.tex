@@ -50,14 +50,14 @@ Each handler reads from its input port until a CR LF
 occurs. Well-formed input is converted to a \code{<request>} tuple,
 and the HTTP request header and any content parameters are read.
 
-When \code{Content-Length} appears in the header, the content bytes
-are read. If the \code{Content-Type} is \code{multipart/form-data}
-or \code{application/x-www-form-urlencoded}, the content is
-converted to an association list. Otherwise, parameter
-\code{"unhandled-content"} is included with the value of the raw
-bytevector of data. Each uploaded file is stored in
-\code{(tmp-dir)}, and the association list value is
-\code{\#(<file> \var{filename})}.
+When \code{Content-Length} appears in the header and
+\code{Content-Type} is \code{multipart/form-data} or
+\code{application/x-www-form-urlencoded}, the content is read and
+converted to an association list. Otherwise, the handler is
+responsible for reading the content. Any unread content as determined
+by \code{Content-Length} is ignored. Each uploaded file is stored in
+\code{(tmp-dir)}, and the association list value is \code{\#(<file>
+  \var{filename})}.
 
 \code{http:file-handler} is then called combining the
 \code{<request>} query parameters and content
@@ -68,8 +68,10 @@ page handler from the \code{http-cache}, and invokes it. A
 request. The output port is flushed after the page handler returns.
 
 After a request is processed, all uploaded files are deleted, and the
-current process and connection can be reused. The system reads another
-request from the input port.
+current process and connection can be reused. Unless the
+\code{Connection} header specifies \code{close}, the system reads
+another request from the input port after skipping any unread content
+from the current request.
 
 The \code{http-cache} is a gen-server that stores page handlers and
 provides a mapping from file extension to content type. It creates a
@@ -94,9 +96,7 @@ A URL which directs the system away from \code{(web-dir)} using
 explicitly checks for relative paths.
 
 The HTTP interface limits incoming data to protect against large
-memory allocation which may crash the system. URL requests are limited
-to 4,096 bytes. Headers are limited to 1,048,576 bytes. Posted content
-is limited to 4,194,304 bytes, not including uploaded files.
+memory allocation which may crash the system.
 
 The HTTP interface does not limit incoming file uploads. If the disk
 runs out of space, the handler process will exit with an I/O error.
@@ -172,6 +172,39 @@ The \code{http-port-number} parameter specifies whether or not
 \code{http-sup:start\&link} should start the HTTP server and,
 if started, on what port that server should listen for connections.
 
+\defineentry{http-request-limit}
+\begin{parameter}
+  \code{http-request-limit}
+\end{parameter}
+\hasvalue{} a positive fixnum
+
+The \code{http-request-limit} parameter specifies the maximum length
+in bytes of the first line of an HTTP request. It defaults to 4,096.
+
+\defineentry{http-header-limit}
+\begin{parameter}
+  \code{http-header-limit}
+\end{parameter}
+\hasvalue{} a positive fixnum
+
+The \code{http-header-limit} parameter specifies the maximum length in
+bytes of the HTTP request headers. It defaults to 1,048,576.
+
+\defineentry{http-content-limit}
+\begin{parameter}
+  \code{http-content-limit}
+\end{parameter}
+\hasvalue{} a positive fixnum
+
+The \code{http-content-limit} parameter specifies the maximum length
+in bytes of HTTP request content read by the system handlers when
+\code{Content-Type} is \code{multipart/form-data} or
+\code{application/x-www-form-urlencoded}. It defaults to
+4,194,304. The limit does not include uploaded files, because they are
+not stored in memory. For all other content types, the handler is
+responsible for enforcing appropriate limits. The system ignores any
+content unread by the handler.
+
 \defineentry{http-sup:start\&link}
 \begin{procedure}
   \code{(http-sup:start\&link)}
@@ -204,9 +237,10 @@ the server is listening on.
 \returns{} a string \alt{} \code{\#f}
 
 The \code{http:find-header} procedure returns the value associated
-with \var{name} in \var{header}. Header comparisons are
-case-insensitive. If \var{name} is not a string, exception
-\code{\#(bad-arg http:find-header \var{name})} is raised.
+with \var{name} in \var{header} if present and \code{\#f}
+otherwise. Header comparisons are case-insensitive. If \var{name} is
+not a string, exception \code{\#(bad-arg http:find-header \var{name})}
+is raised.
 
 \defineentry{http:get-header}
 \begin{procedure}
@@ -214,11 +248,23 @@ case-insensitive. If \var{name} is not a string, exception
 \end{procedure}
 \returns{} a string
 
-The \code{http:get-header} procedure returns the value assocated
-with \var{name} in \var{header} or exits with reason
-\code{\#(invalid-header \var{name} \var{header})}. Header
+The \code{http:get-header} procedure returns the value associated with
+\var{name} in \var{header} if present and raises exception
+\code{\#(invalid-header \var{name} \var{header})} otherwise. Header
 comparisons are case-insensitive. If \var{name} is not a string,
 exception \code{\#(bad-arg http:get-header \var{name})} is raised.
+
+\defineentry{http:get-content-length}
+\begin{procedure}
+  \code{(http:get-content-length \var{header})}
+\end{procedure}
+\returns{} an unsigned integer \alt{} \code{\#f}
+
+The \code{http:get-content-length} procedure returns the unsigned
+integer value associated with \code{Content-Length} in \var{header} if
+present and \code{\#f} otherwise. It raises exception
+\code{\#(invalid-content-length \var{value})} if the \var{value}
+string does not represent an unsigned integer.
 
 \defineentry{http:find-param}
 \begin{procedure}
@@ -226,10 +272,11 @@ exception \code{\#(bad-arg http:get-header \var{name})} is raised.
 \end{procedure}
 \returns{} a string \alt{} \code{\#f}
 
-The \code{http:find-param} procedure returns the value associated
-with \var{name} in \var{params}. Parameter comparisons are
-case-sensitive. If \var{name} is not a string, exception
-\code{\#(bad-arg http:find-param \var{name})} is raised.
+The \code{http:find-param} procedure returns the value associated with
+\var{name} in \var{params} if present and \code{\#f}
+otherwise. Parameter comparisons are case-sensitive. If \var{name} is
+not a string, exception \code{\#(bad-arg http:find-param \var{name})}
+is raised.
 
 \defineentry{http:get-param}
 \begin{procedure}
@@ -237,9 +284,9 @@ case-sensitive. If \var{name} is not a string, exception
 \end{procedure}
 \returns{} a string
 
-The \code{http:get-param} procedure returns the value associated
-with \var{name} in \var{params} or exits with reason
-\code{\#(invalid-param \var{name} \var{params})}. Parameter
+The \code{http:get-param} procedure returns the value associated with
+\var{name} in \var{params} if present and raises exception
+\code{\#(invalid-param \var{name} \var{params})} otherwise. Parameter
 comparisons are case-sensitive. If \var{name} is not a string,
 exception \code{\#(bad-arg http:get-param \var{name})} is raised.
 
@@ -256,11 +303,11 @@ An association list is created by making a string from the characters
 before the first colon as the key. Non-linear white space is skipped,
 and the remaining characters are converted to a string value.
 
-Reading beyond \var{limit} will result in exiting with reason
+Reading beyond \var{limit} raises exception
 \code{input-limit-exceeded}.
 
-Failure to find a colon on any given line will result in exiting with
-reason \code{invalid-header}.
+Failure to find a colon on any given line raises exception
+\code{invalid-header}.
 
 \defineentry{http:read-status}
 \begin{procedure}
@@ -271,7 +318,7 @@ reason \code{invalid-header}.
 The \code{http:read-status} procedure reads the HTTP response status
 line from the binary input port \var{op} and returns the number if
 well formed and \code{\#f} otherwise. Reading beyond \var{limit}
-will result in exiting with reason \code{input-limit-exceeded}.
+raises exception \code{input-limit-exceeded}.
 
 \defineentry{http:write-status}
 \begin{procedure}
@@ -466,7 +513,7 @@ Scheme types:
   \var{string} & \var{string} \\
   \var{number} & \var{number} \\
   \var{array} & \var{list} \\
-  \var{object} & hashtable mapping case-sensitive strings to values \\
+  \var{object} & hashtable mapping symbols to values \\
 
   \hline
 \end{tabular}
@@ -481,7 +528,9 @@ JavaScript implementation can interpret the data.
 
 The \code{json:extend-object} construct adds the \var{key} /
 \var{value} pairs to the hashtable \var{ht} using
-\code{hashtable-set!}. The resulting expression returns \var{ht}.
+\code{hashtable-set!}. Each \var{key} is a literal identifier
+or an unquoted expression \code{,\var{e}} that evaluates to a
+symbol. The resulting expression returns \var{ht}.
 
 \defineentry{json:make-object}
 \begin{syntax}
@@ -491,11 +540,124 @@ The \code{json:extend-object} construct adds the \var{key} /
 The \code{json:make-object} construct expands into a call to
 \code{json:extend-object} with a new hashtable.
 
+\defineentry{json:object?}
+\begin{procedure}
+  \code{(json:object? \var{x}}
+\end{procedure}
+\returns{} a boolean
+
+The \code{json:object?} procedure determines whether or not the datum
+\var{x} is an object created by \code{json:make-object}.
+
+\defineentry{json:cells}
+\begin{procedure}
+  \code{(json:cells \var{ht})}
+\end{procedure}
+\returns{} a vector
+
+The \code{json:cells} procedure returns a vector containing the
+cells of the underlying hashtable.
+
+\defineentry{json:size}
+\begin{procedure}
+  \code{(json:size \var{ht})}
+\end{procedure}
+\returns{} an integer
+
+The \code{json:size} procedure returns the number of cells
+in the underlying hashtable.
+
+\defineentry{json:delete!}
+\begin{procedure}
+  \code{(json:delete! \var{ht} \var{path})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{json:delete!} procedure expects \var{path} to be a symbol or
+a non-empty list of symbols.
+If \var{path} is a symbol, then \code{json:delete!} is equivalent
+to \code{hashtable-delete!}.
+Otherwise, \code{json:delete!} follows \var{path} as it descends into
+the nested hashtable \var{ht}, treating each element as a key into
+the hashtable reached by traversing the preceding elements.
+When \code{json:delete!} reaches the final key in \var{path},
+it calls \code{hashtable-delete!} to remove the association for
+that key in the hashtable reached at that point.
+If any key along the way does not map to a hashtable,
+\code{json:delete!} has no effect.
+
+\defineentry{json:ref}
+\begin{procedure}
+  \code{(json:ref \var{ht} \var{path} \var{default})}
+\end{procedure}
+\returns{} the value found by traversing \var{path} in \var{ht},
+\var{default} if none
+
+The \code{json:ref} procedure expects \var{path} to be a symbol or
+a non-empty list of symbols.
+If \var{path} is a symbol, then \code{json:ref} is equivalent
+to \code{hashtable-ref}.
+Otherwise, \code{json:ref} follows \var{path} as it descends into
+the nested hashtable \var{ht}, treating each element as a key into
+the hashtable reached by traversing the preceding elements.
+When \code{json:ref} reaches the final key in \var{path},
+it calls \code{hashtable-ref} to retrieve the value of that key
+in the hashtable reached at that point.
+If any key along the way does not map to a hashtable,
+or if the final hashtable does not contain the final key,
+\code{json:ref} returns \var{default}.
+
+\defineentry{json:set!}
+\begin{procedure}
+  \code{(json:set! \var{ht} \var{path} \var{value})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{json:set!} procedure expects \var{path} to be a symbol or
+a non-empty list of symbols.
+If \var{path} is a symbol, then \code{json:set!} is equivalent
+to \code{hashtable-set!}.
+Otherwise, \code{json:set!} follows \var{path} as it descends into
+the nested hashtable \var{ht}, treating each element as a key into
+the hashtable reached by traversing the preceding elements.
+When \code{json:set!} reaches the final key in \var{path},
+it calls \code{hashtable-set!} to set that key in the
+hashtable reached at that point.
+If any key along the way does not map to a hashtable,
+\code{json:set!} installs an empty hashtable at that key
+before proceding.
+If \var{path} is malformed at some point, \code{json:set!} may
+still mutate hashtables along the valid portion of the path
+before reporting an error.
+
+\defineentry{json:update!}
+\begin{procedure}
+  \code{(json:update! \var{ht} \var{path} \var{procedure} \var{default})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{json:update!} procedure expects \var{path} to be a symbol or
+a non-empty list of symbols.
+If \var{path} is a symbol, then \code{json:update!} is equivalent
+to \code{hashtable-update!}.
+Otherwise, \code{json:update!} follows \var{path} as it descends into
+the nested hashtable \var{ht}, treating each element as a key into
+the hashtable reached by traversing the preceding elements.
+When \code{json:update!} reaches the final key in \var{path},
+it calls \code{hashtable-update!} to update that key in the
+hashtable reached at that point.
+If any key along the way does not map to a hashtable,
+\code{json:update!} installs an empty hashtable at that key
+before proceding.
+If \var{path} is malformed at some point, \code{json:update!} may
+still mutate hashtables along the valid portion of the path
+before reporting an error.
+
 \defineentry{json:read}
 \begin{procedure}
   \code{(json:read \var{ip} \opt{\var{custom-inflate}})}
 \end{procedure}
-\returns{} a Scheme object
+\returns{} a Scheme object or the eof object
 
 The \code{json:read} procedure reads characters from the textual
 input port \var{ip} and returns an appropriate Scheme object.
@@ -513,89 +675,91 @@ The following exceptions may be raised:
 
 \defineentry{json:write}
 \begin{procedure}
-  \code{(json:write \var{op} \var{x} \opt{\var{custom-write}})}
+  \code{(json:write \var{op} \var{x} \opt{\var{indent}} \opt{\var{custom-write}})}
 \end{procedure}
 \returns{} unspecified
 
 The \code{json:write} procedure writes the object \var{x} to the
 textual output port \var{op} in JSON format. JSON objects are sorted
-by key using \code{string<?} to provide stable output. Scheme fixnums,
-bignums, and finite flonums may be used as numbers.
+by key using \code{string<?} on the string values of the symbols to
+provide stable output. Scheme fixnums, bignums, and finite flonums may
+be used as numbers.
+
+When \var{indent} is a non-negative fixnum, the output is more
+readable by a human. List items and key/value pairs are indented on
+individual lines by the specified number of spaces. When \var{indent}
+is 0, a newline is added to the end of the output. The default indent
+of \code{\#f} produces compact output.
 
 The optional \var{custom-write} procedure may intervene to handle
 lists and hashtables differently or to handle objects that have no
-direct JSON counterpart.
-If \var{custom-write} does not handle a given object, it should
-return false to let \code{json:write} proceed normally.
-The \var{custom-write} procedure is called with three arguments:
-the textual output port \var{op}, the Scheme object \var{x}, and
-a writer procedure \var{wr} that should be used to write the values
-of arbitrary Scheme objects.
-The \var{wr} procedure is equivalent to
-\code{(lambda (\var{op} \var{x}) (json:write \var{op} \var{x} \var{custom-write}))}.
+direct JSON counterpart.  If \var{custom-write} does not handle a
+given object, it should return false to let \code{json:write} proceed
+normally.  The \var{custom-write} procedure is called with four
+arguments: the textual output port \var{op}, the Scheme object
+\var{x}, the current \var{indent} level, and a writer procedure
+\var{wr} that should be used to write the values of arbitrary Scheme
+objects.  The \var{wr} procedure is equivalent to
+\code{(lambda (\var{op} \var{x} \var{indent}) (json:write \var{op} \var{x} \var{indent} \var{custom-write}))}.
 
 If an object cannot be formatted, \code{\#(invalid-datum \var{x})}
 is raised.
 
 \defineentry{json:write-object}
 \begin{syntax}
-  \code{(json:write-object \var{op} \var{wr} [\var{key} \var{value}] \etc)}
+  \code{(json:write-object \var{op} \var{indent} \var{wr} [\var{key} \var{value}] \etc)}
 \end{syntax}
+\returns{} \code{\#t}
 
-Given a textual output port \var{op} and a writer procedure \var{wr},
-the \code{json:write-object} construct writes a JSON object with the given
-\var{key} / \var{value} pairs to \var{op}, sorted by key using
-\code{string<?}.
-Each \var{key} must be a distinct string literal.
-The \var{wr} procedure takes \var{op} and an object \var{x}, just like
-the \var{wr} procedure that is passed to \code{json:write}'s
+Given a textual output port \var{op}, an \var{indent} level, and a
+writer procedure \var{wr}, the \code{json:write-object} construct
+writes a JSON object with the given \var{key} / \var{value} pairs to
+\var{op}, sorted by key using \code{string<?} on the string values of
+the symbols.  Each \var{key} must be a distinct symbol.  The \var{wr}
+procedure takes \var{op}, an object \var{x}, and an \var{indent} level
+just like the \var{wr} procedure that is passed to \code{json:write}'s
 \var{custom-write} procedure.
 
-The following are equivalent, provided the keys are string literals.
+The following are equivalent, provided the keys are symbols.
 
 \antipar\begin{alltt}
-(json:write \var{op} (json:make-object [\var{key} \var{value}] \etc))
-(json:write-object \var{op} json:write [\var{key} \var{value}] \etc)\end{alltt}\antipar
+(begin (json:write \var{op} (json:make-object [\var{key} \var{value}] \etc) \var{indent}) \#t)
+(json:write-object \var{op} \var{indent} json:write [\var{key} \var{value}] \etc)\end{alltt}\antipar
 
 The latter trades code size and compile time for run-time efficiency.
-At compile time,
-\code{json:write-object} sorts the keys and
+At compile time, \code{json:write-object} sorts the keys and
 preformats the strings that will separate values.
-For example:
-
-\code{(json:write-object op wr ["bar" e0] ["foo" e1] ["ace" e2])}
-
-expands to:
-
-\begin{alltt}\antipar
-(let ([op op] [wr wr])
-  (display "\{\textbackslash"ace\textbackslash":" op)
-  (wr op e2)
-  (display ",\textbackslash"bar\textbackslash":" op)
-  (wr op e0)
-  (display ",\textbackslash"foo\textbackslash":" op)
-  (wr op e1)
-  (write-char \#\textbackslash\} op))\end{alltt}\antipar
 
 \defineentry{json:object->bytevector}
 \begin{procedure}
-  \code{(json:object->bytevector \var{x} \opt{\var{custom-write}})}
+  \code{(json:object->bytevector \var{x} \opt{\var{indent}} \opt{\var{custom-write}})}
 \end{procedure}
 \returns{} a bytevector
 
-The \code{json:object->bytevector} procedure calls
-\code{json:write} on \var{x} with the optional \var{custom-write},
-if any, using a bytevector output port transcoded using
+The \code{json:object->bytevector} procedure calls \code{json:write}
+on \var{x} with the optional \var{indent} and \var{custom-write}, if
+any, using a bytevector output port transcoded using
 \code{(make-utf8-transcoder)} and returns the resulting bytevector.
+
+\defineentry{json:bytevector->object}
+\begin{procedure}
+  \code{(json:bytevector->object \var{x} \opt{\var{custom-inflate}})}
+\end{procedure}
+\returns{} a Scheme object
+
+The \code{json:bytevector->object} procedure creates a bytevector input port
+on \var{x}, calls \code{json:read} with the optional \var{custom-inflate},
+if any, and returns the resulting Scheme object after making sure the rest
+of the bytevector is only whitespace.
 
 \defineentry{json:object->string}
 \begin{procedure}
-  \code{(json:object->string \var{x} \opt{\var{custom-write}})}
+  \code{(json:object->string \var{x} \opt{\var{indent}} \opt{\var{custom-write}})}
 \end{procedure}
 \returns{} a JSON formatted string
 
-The \code{json:object->string} procedure creates a string output
-port, calls \code{json:write} on \var{x} with the optional
+The \code{json:object->string} procedure creates a string output port,
+calls \code{json:write} on \var{x} with the optional \var{indent} and
 \var{custom-write}, if any, and returns the resulting string.
 
 \defineentry{json:string->object}
@@ -609,10 +773,23 @@ on \var{x}, calls \code{json:read} with the optional \var{custom-inflate},
 if any, and returns the resulting Scheme object after making sure the rest
 of the string is only whitespace.
 
+\defineentry{json:write-structural-char}
+\begin{procedure}
+  \code{(json:write-structural-char \var{x} \var{indent} \var{op})}
+\end{procedure}
+\returns{} the new indent level
+
+The \code{json:write-structural-char} procedure writes the character
+\var{x} at an appropriate \var{indent} level to the textual output
+port \var{op}. The character should be one of the following JSON
+structural characters: \code{[ ] \{ \} : ,}
+
+This procedure is intended for use within custom writers passed in to
+\code{json:write} and, for performance, it does not check its input arguments.
+
 \section {Published Events}
 
-\begin{event}\codeindex{<http-request>}\end{event}\antipar
-\begin{argtbl}
+\begin{pubevent}{<http-request>}
   \argrow{timestamp}{timestamp from \code{erlang:now}}
   \argrow{pid}{handler process}
   \argrow{host}{the IP address of the client}
@@ -620,4 +797,4 @@ of the string is only whitespace.
   \argrow{path}{\code{<request>} path}
   \argrow{header}{an association list}
   \argrow{params}{an association list}
-\end{argtbl}
+\end{pubevent}

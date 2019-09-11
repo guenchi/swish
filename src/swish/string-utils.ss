@@ -26,6 +26,7 @@
    ends-with?
    format-rfc2822
    join
+   oxford-comma
    split
    split-n
    starts-with-ci?
@@ -144,9 +145,8 @@
     (find-start s 0 (string-length s)))
 
   (define (extract text)
-    (define compiled (pregexp "[^ \\n]+| |\\n"))
     (let lp ([start 0] [acc '()])
-      (match (pregexp-match-positions compiled text start)
+      (match (pregexp-match-positions (re "[^ \\n]+| |\\n") text start)
         [#f (reverse acc)]
         [((,start . ,end))
          (let ([s (substring text start end)])
@@ -192,5 +192,11 @@
            (display-string (make-string indent #\space) op))
          (display text op)
          (lp rest (+ pos (string-length text)) indent #f)])))
+
+  (define oxford-comma
+    (case-lambda
+     [(each conj) (oxford-comma "~{" each conj "~}")]
+     [(start each conj end)
+      (string-append start each "~#[~;" conj "~;, " each "," conj "~:;, ~]" end)]))
 
   )

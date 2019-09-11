@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/becls/swish.svg?branch=master)](https://travis-ci.org/becls/swish)
+
 # Swish Concurrency Engine
 
 The Swish Concurrency Engine is a framework used to write
@@ -10,12 +12,15 @@ programming language. Swish also provides a web server.
 Swish uses [libuv](http://libuv.org) for cross-platform asynchronous
 I/O.
 
+Although Swish can be run in threaded Chez Scheme for convenience, it
+is not thread safe and should be used from the main thread only.
+
 # Notes
 
 1. install the prerequisites (see Build System Requirements)
-2. `./configure` (see `./configure --help` for options)
-3. `make`
-4. `make test`
+1. `./configure` (see `./configure --help` for options)
+1. `make`
+1. `make test`
 
 - After `./configure`; you can also `cd src; ./go` to build and run the engine.
 - We disable the expression editor with --eedisable because Chez Scheme's
@@ -23,12 +28,21 @@ I/O.
   have to modify the places where s/expeditor.ss calls `$ee-read-char`
   in blocking mode to use libuv's asynchronous read function instead
   of the one in c/expeditor.c.
+- If you get a "symbol(s) not found" error, you may need to use CPPFLAGS
+  and LDFLAGS to supply the header and library path. If the C compiler
+  refuses unused arguments, you may need
+  `CFLAGS="-Qunused-arguments"`. e.g.,
+
+  ```
+  ./configure CPPFLAGS="-I/usr/local/opt/libiconv/include" \
+    CFLAGS="-Qunused-arguments" LDFLAGS="-L/usr/local/opt/libiconv/lib"
+  ```
 
 # Build System Requirements
 
 ## Linux
 
-- Chez Scheme 9.5.1 from July 18, 2018 or later (commit a0adfa1, which adds load-compiled-from-port)
+- Chez Scheme 9.5.2 or later
 - GCC, the GNU Compiler Collection
 - GNU C++ compiler for libuv
 - GNU make
@@ -37,17 +51,19 @@ I/O.
 
 ## Mac
 
-- Chez Scheme 9.5.1 from July 18, 2018 or later (commit a0adfa1, which adds load-compiled-from-port)
+- Chez Scheme 9.5.2 or later
 - dot (can be installed through homebrew using `brew install graphviz --with-app`)
 - pdflatex (can be installed through homebrew using `brew cask install mactex`)
 - ginstall and realpath (can be installed through homebrew using `brew install coreutils`)
-- XCode and the command-line tools must be set (Xcode->Preferences->Locations->command line tools)
+- XCode and the command-line tools must be set
+  (Xcode->Preferences->Locations->command line tools)
 
 ## Windows
 
-- Chez Scheme 9.5.1 from July 18, 2018 or later (commit a0adfa1, which adds load-compiled-from-port)
-- Cygwin with bash, git, graphviz, grep, perl, texlive, GNU make, etc.
-- Microsoft Visual Studio 2017 or 2015 with Visual C++
+- Chez Scheme 9.5.2 or later
+- Cygwin or MinGW/MSYS with bash, git, graphviz, grep, perl, texlive,
+  GNU make, etc.
+- Microsoft Visual Studio 2017 with Visual C++
 - Python 2.7 for Windows in C:\Python27 (see below for other options)
 - Put scheme in PATH.
 
@@ -55,6 +71,7 @@ I/O.
 
 - Install [Python 2.7](https://conda.io/miniconda.html)
 - Provide the path to the python2.7 executable as an argument to the configure script:
+
   ```
   ./configure --python=~/Miniconda2/python.exe
   ```
@@ -66,6 +83,40 @@ I/O.
   `conda create -n py27 python=2.7 anaconda`
 
 - Provide the path to the python2.7 executable as an argument to the configure script:
+
   ```
   ./configure --python=~/Anaconda3/envs/py27/python.exe
   ```
+
+# Stand-alone Swish Applications
+
+Swish can be used to build, test, and deploy stand-alone
+applications. A given application might load foreign code for image
+processing or USB access. Code that may block should use the API
+described in the "Operating System Interface" chapter of the
+[documentation](https://becls.github.io/swish/swish.pdf) to
+integrate with Swish's I/O loop.
+
+## Build
+
+For details about building a Swish application, see:
+`swish-build --help`
+
+## Test
+
+For details about testing a Swish application, see:
+`swish-test --help`
+
+## Deploying a Stand-alone Application
+
+On Linux and macOS, you can deploy your application's executable and
+boot file.
+
+On Windows, your install should include the application's executable
+and boot file, `osi.dll`, `libuv.dll`, `sqlite3.dll`, Chez Scheme's
+`csv952.dll`, and Microsoft's C Runtime Library `vcruntime140.dll`.
+
+Developers writing stand-alone applications should clone the Swish
+repository and run `configure`.  Swish's source repository provides
+`swish.h` to define callable exports for `osi.dll`. `Mf-config` can be
+used in makefiles to define variables for system-specific paths.

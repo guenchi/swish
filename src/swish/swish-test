@@ -29,38 +29,53 @@
 
 (define shared-cli
   (cli-specs
-   ["libdirs" -L (list "<libdir>") "add <libdir> to library-directories"]
-   ["srcdirs" -s (list "<srcdir>") "add <srcdir> to source-directories"]
-   ["help" -h --help (list "[<section>]" ...)
+   ;; -L and -s are allowed in testing and REPL
+   [libdirs -L (list "<libdir>") "add <libdir> to library-directories"]
+   [srcdirs -s (list "<srcdir>") "add <srcdir> to source-directories"]
+   [help -h --help (list "[<section>]" ...)
     (format "display help, <section>={~{~a~^|~}}" help-sections)
-    (usage hide)]))
+    (usage hide)]
+   [version --version bool "print version information"]))
 
-(define misc-cli
+(define test-only-cli
   (cli-specs
-   ["incl-tags" --tag (list "<tag>") "run only the tests with this tag"]
-   ["excl-tags" --not (list "<tag>") "exclude tests with this tag"]
-   ["load-prof" --load-profile (list "<file>" "<file>" ...)
+   [incl-tags --tag (list "<tag>") "run only the tests with this tag"]
+   [excl-tags --not (list "<tag>") "exclude tests with this tag"]
+   [progress --progress (string "<mode>") "<mode>={test|suite|none}"]
+   [test-run --test-run (string "<UUID>")
+    "use the specified <UUID> to identify the test run instead of generating one"]
+   [specs (list . "<spec>") "directory | suite [{test | -t test} ...]"]))
+
+(define test-and-report-cli
+  (cli-specs
+   [load-prof --load-profile (list "<file>" "<file>" ...)
     "load the specified profile(s)"]
-   ["save-prof" --save-profile (string "<file>")
+   [save-prof --save-profile (string "<file>")
     "save profile data to specified file"]
-   ["progress" --progress (string "<mode>") "<mode>={test|suite|none}"]
-   ["report" --report (string "<file>") "write HTML report to <file>"]
-   ["coverage" --coverage (string "<file>") "write coverage report to <file>"]
-   ["exclude" --exclude (list "<glob>")
+   [report --report (string "<file>")
+    "write report to <file> in format determined by extension"]
+   [coverage --coverage (string "<file>") "write coverage report to <file>"]
+   [exclude --exclude (list "<glob>")
     "exclude these files from coverage report"]
-   ["include" --include (list "<glob>") "override exclude for coverage report"]))
+   [include --include (list "<glob>") "override exclude for coverage report"]))
+
+(define report-only-cli
+  (cli-specs
+   [harvest --harvest (list "<from>" "<from>" ...)
+    "load mat results from the specified files and directories"]
+   [load-results --load-results (string "<file>")
+    "load harvested mat results from <file>"
+    (conflicts '(harvest))]))
 
 (define testing-cli
-  (append misc-cli
-    (cli-specs
-     ["specs" (list . "<spec>") "directory | suite [{test | -t test} ...]"])))
+  (append shared-cli test-only-cli test-and-report-cli))
 
 (define repl-cli
   (cli-specs
-   ["repl" --repl bool "start a repl" (usage show req)]
-   ["files" (list "<file>" ...) "load remaining arguments"]))
+   [repl --repl bool "start a repl" (usage show req)]
+   [files (list "<file>" ...) "load remaining arguments"]))
 
-(define any-cli (append shared-cli testing-cli repl-cli))
+(define any-cli (append testing-cli report-only-cli repl-cli))
 
 (define swish (osi_get_executable_path))
 (define swish-libdir (path-parent swish))
@@ -71,6 +86,23 @@
 (define (wrap indent . texts)
   (wrap-text (current-output-port)
     (- (help-wrap-width) indent) indent indent (join texts #\space)))
+
+(define report-formats '(("json" . json) ("html" . html) ("htm" . html)))
+
+(define (check-report-format report-fn key)
+  (when (and report-fn (not (assoc (path-extension report-fn) report-formats)))
+    (fail
+     (oxford-comma
+      "cannot determine output format from ~a ~a, expected ~{"
+      ".~a" " or " "~} extension")
+     (option-named key)
+     report-fn
+     (map car report-formats))))
+
+(define-syntax foreach
+  (syntax-rules ()
+    [(_ ([var ls] ...) body0 body1 ...)
+     (for-each (lambda (var ...) body0 body1 ...) ls ...)]))
 
 (define-syntax example
   (syntax-rules ()
@@ -99,25 +131,54 @@
      [(pair? sections) sections]
      [short? '(usage)]
      [else '(usage help)]))
+  (define supported-formats
+    (let ([ht (make-hashtable string-hash string=?)])
+      (foreach ([fmt report-formats])
+        (match fmt
+          [(,ext . ,type)
+           (hashtable-update! ht (symbol->string type)
+             (lambda (prev) (cons ext prev))
+             '())]))
+      (format "~@?." (oxford-comma "~a" " and ")
+        (map (lambda (fmt)
+               (format (oxford-comma "~{~a (~@{" "\".~a\"" " or " "~})~}")
+                 fmt))
+          (vector->list
+           (vector-sort (lambda (a b) (string<? (car a) (car b)))
+             (hashtable-cells ht)))))))
   (any-sections selected
     [(all usage)
-     (display-usage "Usage:" who (append shared-cli testing-cli))
+     (display-usage "Usage:" who testing-cli)
      (display-usage "   or:" who (append shared-cli repl-cli))]
     [(all help)
-     (when ht (hashtable-delete! ht "help"))
+     (when ht (hashtable-delete! ht 'help))
      (display-options shared-cli ht)
-     (printf "\n  Testing options:\n")
-     (display-options testing-cli ht)
+     (printf "\n  Test-only options:\n")
+     (display-options test-only-cli ht)
+     (printf "\n  Test and report options:\n")
+     (display-options test-and-report-cli ht)
+     (printf "\n  Report-only options:\n")
+     (display-options report-only-cli ht)
      (printf "\n  REPL options:\n")
      (display-options repl-cli ht)]
     [(all details)
      (wrap 0
-       "By default, " who " runs all tests found by searching for *.ms files"
-       "in the current directory and its subdirectories. To run a limited set"
-       "of tests, specify a suite or a suite and test or use --tag or --not to"
-       "filter tests based on tags.\n"
+       "By default, " who " runs all tests in the specified test suites."
+       "To run a limited set of tests, specify a suite or a suite and test"
+       "or use --tag or --not to filter tests based on tags.\n"
        "\n"
-       "If --report <file> is specified, " who " writes an HTML report to that file."
+       "Test suites are files with a \".ms\" or \".ss\" extension listed"
+       "explicitly on the command line or found by recursively searching"
+       "the specified directories."
+       "Files with a \".ms\" extension are expected to contain tests,"
+       "called mats, defined via the mat macro or the add-mat procedure"
+       "exported by the (swish mat) library."
+       "Files with a \".ss\" extension may contain mats following the"
+       "\"#!eof mats\" tokens.\n"
+       "\n"
+       "If --report <file> is specified, " who " writes a test report to that file"
+       "in a format determined by the file extension."
+       "Supported formats for the report are:" supported-formats
        "If --coverage <file> is specified, " who " writes an HTML coverage report"
        "to that file."
        "The glob arguments to --include and --exclude should be quoted to prevent"
@@ -127,10 +188,19 @@
     [(all examples)
      (printf "Examples:\n")
      (newline)
-     (example (who "--progress suite --report result.html .")
+     (example (who "--progress suite --report results.html .")
        "Run all tests found in the current directory and its subdirectories."
        "Echo suite-level progress output to the console and write detailed results"
-       "to result.html.\n")
+       "to results.html, overwriting the file if it exists.\n")
+     (example (who "--progress suite --report results.json .")
+       "As above, but write results in JSON format rather than HTML.\n")
+     (example (who "--harvest src --report results.json")
+       "Harvest test results from \"*.mo\" files found under the src"
+       "directory and write the results to results.json in JSON format,"
+       "overwriting the file if it exists.\n")
+     (example (who "--load-results results.json --report results.html")
+       "Generate an HTML report form a JSON report file,"
+       "overwriting results.html if it exists.\n")
      (example (who "--save-profile prof.dat src")
        "Save profile data to prof.dat while running all tests found"
        "under the src directory, overwriting prof.dat if it exists.\n")
@@ -138,7 +208,7 @@
        "Load profile data from p1.dat and p2.dat and save to both.prof.\n")
      (example (who "-s src --load-profile p1 p2 --coverage ./cov/summary.html")
        "Load profile data from p1 and p2 and generate a coverage report"
-       "in ./cov/summary.html,adding \"src\" to the set of directories"
+       "in ./cov/summary.html, adding \"src\" to the set of directories"
        "searched for source files referenced in the profile.\n")
      (example (who "src/foo.ms")
        "run all tests in ./src/foo.ms\n")
@@ -180,60 +250,317 @@
  (swish testing)
  )
 
-(define (html-report filename report-files)
-  (define (stringify x)
-    (if (string? x)
-        x
-        (format "~s" x)))
-  (define (make-row c1 c2 c3)
-    (let ([result (or c3 `(span (@ (style "color:#007F00;")) "PASS"))])
-      `(tr (td ,c1) (td ,(stringify c2)) (td ,result))))
-  (define (make-result r)
-    (let ([name (mat-result-test r)])
-      (match (mat-result-type r)
-        [pass (make-row "" name #f)]
-        [skip (void)]
-        [fail (make-row "" name (mat-result-message r))])))
-  (define (results< x y)
-    (define (get-name r) (symbol->string (mat-result-test r)))
-      (string-ci<? (get-name x) (get-name y)))
+;; expands to a procedure that returns content between enclosed
+;; block-comment delimiters as a string
+(define-syntax (extract-block-comment x)
+  (let ([annotation (syntax->annotation x)])
+    (assert annotation)
+    (let* ([src (annotation-source annotation)]
+           [bfp (source-object-bfp src)]
+           [efp (source-object-efp src)]
+           [path (source-file-descriptor-path (source-object-sfd src))])
+      #`(lambda ()
+          (let ([s (utf8->string (read-file #,path))])
+            (define (scan i dir prev)
+              (let ([c (string-ref s i)] [next (+ i dir)])
+                (unless (< 0 next #,efp)
+                  (errorf 'extract-block-comment "expected to find #| ... |# in ~a" s))
+                (if (and (char=? c #\|) (eqv? prev #\#))
+                    next
+                    (scan next dir c))))
+            (substring s (scan #,bfp 1 #f) (scan #,efp -1 #f)))))))
+
+(define (html-report filename mat-data*)
+  (define js-code
+    ((extract-block-comment
+#|
+  function escapeHtml(text) {
+    var map = {'&': '&amp;','<': '&lt;','>': '&gt;','"': '&quot;',"'": '&#039;'};
+    return text.replace(/[&<>"']/g, m => map[m]);
+  }
+  let header = {
+    "message": "",
+    "sstats": {
+      "bytes": "bytes",
+      "cpu": "cpu",
+      "gc-bytes": "GC bytes",
+      "gc-count": "# GC",
+      "gc-cpu": "GC cpu",
+      "gc-real": "GC real",
+      "real": "real"
+    },
+    "stack": "",
+    "suite": {
+      "completed": true,
+      "test-file": "Suite"
+    },
+    "tags": [],
+    "test": "Name",
+    "type": "Result"
+  };
+  function renderMeta(meta) {
+    if (!meta.hostname) return '';
+    let info = meta['software-info'];
+    var keys = [];
+    for (key in info) keys.push(key);
+    keys.sort((a, b) => a > b);
+    return `<div class="suite-meta">
+             <span class="date">${meta.date || "?"}<\/span>
+             <span class="hostname">${meta['hostname']}<\/span>
+             <span class="machine-type">${meta['machine-type']}<\/span>
+             ${keys.map(key => `<div class="product"><span class="product-name">${escapeHtml(info[key]['product-name'])}<\/span>
+                                  <span class="version">${escapeHtml(info[key]['version'])}<\/span>
+                                  <div class="revision">${escapeHtml(info[key]['revision'])}<\/div>
+                                <\/div>`).join('')}
+            <\/div>`;
+  }
+  var results = [];
+  var showStatistics;
+  let locale = new Intl.NumberFormat().resolvedOptions().locale;
+  let formatter = new Intl.NumberFormat(locale, {
+    style: 'decimal',
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 3
+  });
+  function renderDuration(duration) {
+    return typeof(duration) == 'number' ? formatter.format(duration) : duration;
+  }
+  function renderSstats(stats) {
+    return (showStatistics.checked) ?
+      `<td><div class="result-sstats sstats-cpu">${renderDuration(stats.cpu)}<\/div><\/td>
+       <td><div class="result-sstats sstats-real">${renderDuration(stats.real)}<\/div><\/td>
+       <td><div class="result-sstats sstats-bytes">${stats.bytes}<\/div><\/td>
+       <td><div class="result-sstats sstats-gc-count">${stats["gc-count"]}<\/div><\/td>
+       <td><div class="result-sstats sstats-gc-cpu">${renderDuration(stats["gc-cpu"])}<\/div><\/td>
+       <td><div class="result-sstats sstats-gc-real">${renderDuration(stats["gc-real"])}<\/div><\/td>
+       <td><div class="result-sstats sstats-gc-bytes">${stats["gc-bytes"]}<\/div><\/td>`
+      : '<td colspan="7"><\/td>';
+  }
+  function renderSummary(data) {
+    var summary = {
+      pass: 0,
+      skip: 0,
+      fail: 0,
+      incomplete: 0
+    };
+    data.forEach(suite => suite.results.forEach(r => summary[r.type] += 1));
+    data.forEach(suite => summary.incomplete += suite['meta-data'].completed ? 0 : 1);
+    let incomplete = summary.incomplete ? ` <span class="incomplete">(${summary.incomplete} suites incomplete)<\/span>` : false;
+    let skipped = summary.skip ? ` (skipped ${summary.skip})` : false;
+    if (summary.fail) return `<div class="summary-fail">Failed ${summary.fail} of ${summary.fail + summary.pass} tests${skipped||''}${incomplete||''}.<\/div>`;
+    if (incomplete) return `<div class="summary-pass">passed ${summary.pass} tests${skipped||''}${incomplete}.<\/div>`;
+    if (skipped) return `<div class="summary-pass">passed ${summary.pass} tests${skipped}.<\/div>`;
+    if (summary.pass == 0) return `<div class="summary-pass">No tests run.<\/div>`;
+    return `<div class="summary-pass">PASSED all ${summary.pass} tests.<\/div>`;
+  }
+  let prevSuite = false;
+  let prevSuiteMeta = '';
+  function renderSuite(r) {
+    let dup = (prevSuite === r.suite);
+    prevSuite = r.suite;
+    if (!dup) prevSuiteMeta = renderMeta(r.suite);
+    return `<td class="suite ${dup ? 'duplicate' : '' }">
+              <div class="suite-name ${r.suite.completed ? '' : 'incomplete'}">
+                ${escapeHtml(r.suite['test-file'])}
+                ${prevSuiteMeta}
+              <\/div>
+            <\/td>`;
+  }
+  function renderName(r) {
+    if (!r.test) return `<td><\/td>`;
+    return `<td>
+              <div class="result-info">
+                <span class="result-name">${escapeHtml(r.test)}<\/span>
+                <span class="result-tags">${r.tags.sort((a,b) => a > b).map(escapeHtml).join(', ')}<\/span>
+              <\/div>
+            <\/td>`;
+  }
+  function renderType(r) {
+    return `<td class="result-type"><div class="result-${r.type}">${escapeHtml(r.type)}<\/div><\/td>`;
+  }
+  function renderDetails(r) {
+    return (r.message || r.stack) ?
+      `<td colspan="7">
+         <div class="result-error">
+           <div class="result-message">${escapeHtml(r.message)}<\/div>
+           <div class="result-stack">${escapeHtml(r.stack)}<\/div>
+         <\/div>
+       <\/td>`
+      : ('pass' == r.type || 'Result' == r.type) ? renderSstats(r.sstats) : '<td colspan="7"><\/td>';
+  }
+  function renderResult(r, id) {
+    return `<tr id="${id}">${renderSuite(r)}${renderName(r)}${renderType(r)}${renderDetails(r)}<\/tr>`;
+  }
+  let ordering = [];
+  function compareResults(r1, r2) {
+    return ordering.reduceRight((verdict, order) => verdict || order.compare(r1, r2) * (order.invert ? -1 : 1), 0);
+  }
+  function compareString(getter) {
+    return (r1, r2) => {
+      let v1 = getter(r1) || '';
+      let v2 = getter(r2) || 'z';
+      if (v1 < v2) return -1;
+      if (v1 > v2) return 1;
+      return 0;
+    }
+  }
+  function compareNumeric(getter) { return (r1, r2) => getter(r1) - getter(r2); }
+  function setSort(col) {
+    let hit = ordering.find(x => x.col == col);
+    if (hit) ordering.splice(ordering.indexOf(hit), 1);
+    else hit = {};
+    if (hit.invert) return;
+    hit.invert = hit.hasOwnProperty('invert');
+    hit.col = col;
+    switch (col) {
+      case 'Suite':
+        hit.class = 'suite-name';
+        hit.compare = compareString(r => r.suite['test-file']);
+        break;
+      case 'Name':
+        hit.class = 'result-name';
+        hit.compare = compareString(r => r.test);
+        break;
+      case 'Result':
+        hit.class = 'result-Result';
+        hit.compare = compareString(r => r.type);
+        break;
+      case 'cpu':
+      case 'real':
+      case 'bytes':
+        hit.class = `sstats-${col}`;
+        hit.compare = compareNumeric(r => r.sstats && r.sstats[col]);
+        break;
+      case '# GC':
+        hit.class = `sstats-gc-count`;
+        hit.compare = compareNumeric(r => r.sstats && r.sstats['gc-count']);
+        break;
+      case 'GC cpu':
+        hit.class = `sstats-gc-cpu`;
+        hit.compare = compareNumeric(r => r.sstats && r.sstats['gc-cpu']);
+        break;
+      case 'GC real':
+        hit.class = `sstats-gc-real`;
+        hit.compare = compareNumeric(r => r.sstats && r.sstats['gc-real']);
+        break;
+      case 'GC bytes':
+        hit.class = `sstats-gc-bytes`;
+        hit.compare = compareNumeric(r => r.sstats && r.sstats['gc-bytes']);
+        break;
+    }
+    if (hit.compare) ordering.push(hit);
+  }
+  function render() {
+    let content = document.getElementById('content');
+    let stylesheet = document.styleSheets[1];
+    if (stylesheet.ownerNode.id == 'activeheaders') {
+      while (stylesheet.cssRules.length > 0) stylesheet.deleteRule(0);
+      ordering.forEach(order => stylesheet.insertRule(`#tableheader .${order.class}:after { padding-left: .25em; float: right; content: "${order.invert ? '\u25bc' : '\u25b2'}"; }`, stylesheet.cssRules.length));
+    }
+    results.sort(compareResults);
+    content.innerHTML = renderResult(header, 'tableheader') + results.map(renderResult).join('');
+    let x = document.getElementById('tableheader');
+    x.onclick = e => {
+      setSort(e.target.innerHTML.trim());
+      render();
+    };
+  }
+  document.addEventListener('DOMContentLoaded', function(event) {
+    data.forEach(suite => {
+      let meta = suite['meta-data'];
+      let rs = suite.results || [];
+      if (!meta.completed && 0 == rs.length) rs.push({ 'type' : '?'});
+      rs.forEach(r => {
+        r['suite'] = meta;
+        results.push(r);
+      });
+    });
+    showStatistics = document.getElementById('showStatistics');
+    showStatistics.checked = false;
+    showStatistics.onclick = event => {
+      render();
+    };
+    let summary = document.getElementById('summary');
+    summary.innerHTML = renderSummary(data);
+    setSort('Name');
+    setSort('Suite');
+    if (!results.every(r => 'pass' == r.type || 'skip' == r.type)) setSort('Result');
+    render();
+  });
+|#)))
   (let ([op (open-file-to-replace filename)])
     (on-exit (close-port op)
       (html->string op
         `(html5
-          (head (meta (@ (charset "UTF-8"))))
-          (style
-            "table { table-layout: fixed; border-collapse: collapse; }"
-            "thead tr td:nth-child(1) { min-width: 15vw; }"
-            "thead tr td:nth-child(2) { min-width: 15vw; }"
-            "tr td:nth-child(3) { padding-left: 1ex; }")
+          (head
+           (meta (@ (charset "UTF-8")))
+           (title "Test Results")
+           ;; separate script tag to help automated tests parse output
+           (script ,(format "var data = ~a;" (json:object->string mat-data*)))
+           (script ,js-code)
+           (style
+             "body {--tableheaderheight: 1.25rem; --marginwidth: 4px; margin: var(--marginwidth); height: calc(100vh - 2*var(--marginwidth)); display: grid; grid-template-rows: auto 1fr; overflow: hidden;}"
+             ".header {background: lightgray; margin-bottom: .5ex; }"
+             "#summary {font-size: x-large; }"
+             ".summary-fail {color: red;}"
+             ".summary-pass {}"
+             "#controls { display: flex; align-items: center; }"
+             "#showStatistics { }"
+             ".product { display: list-item; margin-left: 1em; }"
+             ".date { }"
+             ".hostname { }"
+             ".machine-type { }"
+             ".suite { border-top: 1px solid lightgray; position: relative; }"
+             ".suite-name { }"
+             ".suite-name .suite-meta { display: none; visibility: hidden; opacity: 0; font-size: small; }"
+             ".suite-name:hover .suite-meta { position: absolute; z-index: 1; display: block; visibility: visible; opacity: 1; padding: 10px; margin-top: .5em; width: 300px; background: rgba(240,240,240,1); border-radius: 10px; }"
+             ".duplicate { visibility: hidden; border-top-style: none; }"
+             ".incomplete { background: yellow; }"
+             ".result-info { word-break: break-all; min-width: 15vw; max-width: 25vw; }"
+             ".result-name { }"
+             ".result-tags:not(:empty) { font-family: sans; font-size: x-small; margin-left: 1em;}"
+             ".result-pass { width: 4em; text-transform: uppercase; color: green;}"
+             ".result-skip { width: 4em; text-transform: uppercase; font-style: oblique;}"
+             ".result-fail { width: 4em; text-transform: uppercase; color: red;}"
+             ".result-error { position: relative; min-width: 50vw; max-width: 60vw; }"
+             ".result-message { }"
+             ".result-stack:hover { max-height: 10em; overflow: auto; }"
+             ".result-stack:not(:hover):not(:empty):before { content: \"...\"; position: absolute; right: 0px; bottom: 0px; margin-right: .5em; font-size: large; }"
+             ".result-stack { font-family: monospace; white-space: pre; background: rgba(255,220,220,.125); max-height: 1em; overflow: hidden; }"
+             ".result-type { width: 5em; }"
+             ".result-sstats { text-align: right;}"
+             ".sstats-cpu { width: 6em; }"
+             ".sstats-real { width: 6em; }"
+             ".sstats-bytes { width: 7em; }"
+             ".sstats-gc-count { width: 4em; }"
+             ".sstats-gc-cpu { width: 6em; }"
+             ".sstats-gc-real { width: 6em; }"
+             ".sstats-gc-bytes { width: 7em; }"
+             ".vscroll { overflow-y: auto; overflow-x: hidden; margin-top: var(--tableheaderheight); }"
+             ".vscroll tr:first-child td {border-top-style: none; position: unset;}"
+             ".vscroll tr:first-child div {background: rgb(245,245,245); position: absolute; top 0px; margin-top: calc(-1 * var(--tableheaderheight));}"
+             "table { table-layout: fixed; border-collapse: collapse; }"
+             "tr { vertical-align: text-top; }"
+             "tr:not(:first-child):hover { background: #f4f4f4; }"
+             "td:not(:last-child) { padding-right: .5em; }")
+           (style (@ (id "activeheaders"))))
           (body (@ (style "font-family:monospace;"))
-            (h1 ,(let-values ([(pass fail skip) (summarize report-files)])
-                   (if (eq? fail 0)
-                       (if (eq? skip 0)
-                           (format "PASSED all ~a tests." pass)
-                           (format "passed ~a tests (skipped ~a)" pass skip))
-                       (format "Failed ~a of ~a tests~a." fail (+ fail pass)
-                         (if (eq? skip 0) "" (format " (skipped ~a)" skip))))))
-            (table
-             (thead ,(make-row "Suite" "Name" "Message"))
-             (tbody
-              ,@(map
-                 (lambda (in-file)
-                   (let-values ([(pass fail skip) (summarize (list in-file))])
-                     (unless (and (> skip 0) (= pass fail 0))
-                       (match (sort results< (load-results in-file))
-                         [() (make-row (path-root in-file) "" "<no results>")]
-                         [,sorted
-                         `(begin
-                            ,(make-row (mat-result-test-file (car sorted)) "" "")
-                            ,@(map make-result sorted))]))))
-                 report-files)))))))))
+            (div (@ (class "header"))
+              (div (@ (id "summary")))
+              (div (@ (id "controls"))
+                (input (@ (type "checkbox") (id "showStatistics")))
+                (label (@ (for "showStatistics")) "Show Statistics")))
+            (div (@ (class "vscroll"))
+              (table (@ (id "content"))))))))))
 
-(define (console-summary report-files)
-  (let-values ([(pass fail skip) (summarize report-files)])
-    (printf "Tests run: ~s   Pass: ~s   Fail: ~s   Skip: ~s\n\n"
-      (+ pass fail) pass fail skip)))
+(define (console-summary mat-data* reporting?)
+  (let-values ([(pass fail skip completed attempted) (summarize-results mat-data*)])
+    (when reporting?
+      (printf "Tests run: ~s   Pass: ~s   Fail: ~s   Skip: ~s\n\n"
+        (+ pass fail) pass fail skip))
+    (let ([incomplete (- attempted completed)])
+      (unless (zero? incomplete)
+        (printf "*** Some test suite~p did not complete ***\n\n" incomplete)))))
 
 (define (if-exists fn) (and (regular-file? fn) fn))
 
@@ -245,26 +572,22 @@
 
 (define (path->file-uri path)
   (define (sanitize path)
-    (join (map http:percent-encode (pregexp-split "[\\\\/]" path)) "/"))
-  (match (pregexp-match "^([a-zA-Z]:)[\\\\/](.*)" path)
+    (join (map http:percent-encode (pregexp-split (re "[\\\\/]") path)) "/"))
+  (match (pregexp-match (re "^([a-zA-Z]:)[\\\\/](.*)") path)
     [(,_ ,anchor ,rest) (string-append "file://" anchor "/" (sanitize rest))]
     [#f (string-append "file://" (sanitize path))]))
 
 (define (->report-filename filename)
   (string-append filename ".mo"))
 
-(define-syntax foreach
-  (syntax-rules ()
-    [(_ ([var ls] ...) body0 body1 ...)
-     (for-each (lambda (var ...) body0 body1 ...) ls ...)]))
-
 (define (extract-suites specs)
   (let ([ht (make-hashtable string-hash string=?)])
     (define (add-suite suite)
-      (hashtable-update! ht suite
-        (lambda (old)
-          (or old (make-hashtable string-hash string=?)))
-        #f))
+      (when (may-have-mats? suite)
+        (hashtable-update! ht suite
+          (lambda (old)
+            (or old (make-hashtable string-hash string=?)))
+          #f)))
     (let lp ([specs specs])
       (cond
        [(null? specs)
@@ -301,29 +624,45 @@
        [else
         (fail "expected directory or suite: ~s" (car specs))]))))
 
+(define (harvest from*)
+  (let ([ht (make-hashtable string-hash string=?)])
+    (define (get-results from)
+      (match (catch (load-results from))
+        [#(EXIT ,reason)
+         (fail "cannot load mat results from ~a: ~a" from
+           (exit-reason->english reason))]
+        [,results results]))
+    (define (add! from)
+      (if (directory? from)
+          (for-each add! (find-files from "mo"))
+          (hashtable-set! ht from #t)))
+    (for-each add! from*)
+    (vector->list (vector-map get-results (hashtable-keys ht)))))
+
 (define (option-named name)
   (format-spec
    (or (find (lambda (x) (equal? name (<arg-spec> name x))) any-cli)
        (fail "[internal] no option named ~s" name))
-   '(or long short)))
+   '(or long short args)))
 
 (define (try-parse)
   (define problem #f)
   (define repl-opt
     (parse-command-line-arguments
-     (append shared-cli misc-cli repl-cli)
+     (append repl-cli testing-cli) ;; ensure repl's 'files option comes before testing's 'specs option
      (command-line-arguments)
      (lambda x (unless problem (set! problem x)))))
-  (if (repl-opt "repl")
+  (if (repl-opt 'repl)
       (if problem
           (apply fail problem)
           repl-opt)
-      (parse-command-line-arguments (append shared-cli testing-cli))))
+      (parse-command-line-arguments
+       (append testing-cli report-only-cli))))
 
 (define opt (try-parse))
 
 (cond
- [(opt "srcdirs") =>
+ [(opt 'srcdirs) =>
   (lambda (srcdirs)
     (source-directories (append srcdirs (source-directories))))])
 
@@ -332,126 +671,164 @@
   (lambda (x acc)
     (append (parse-library x) acc))
   (library-directories)
-  (or (opt "libdirs") '())))
+  (or (opt 'libdirs) '())))
 
-;; We define main to prevent the collector from discarding the code in the body,
-;; and the corresponding profile counts, before saving profile data, i.e., when
-;; we run "make coverage".
-(define (main)
-  (cond
-   [(zero? (hashtable-size (opt))) (usage #t '() #f)]
-   [(opt "help") =>
-    (lambda (sections)
-      (usage #f (map string->symbol sections) (opt)))]
-   [(hashtable-ref (opt) "repl" #f)
-    (let ([ignored
-           (remq #f
-             (map (lambda (x)
-                    (and (opt (<arg-spec> name x))
-                         (format-spec x '(or long short))))
-               misc-cli))])
-      (when (pair? ignored)
-        (printf "~@[Ignoring ~{~a~^, ~} in ~a mode\n~]" ignored
-          (option-named "repl"))))
-    (apply (scheme-start) (cons "--" (or (opt "files") '())))]
-   [else
-    (let ([incl-tags (map string->symbol (or (opt "incl-tags") '()))]
-          [excl-tags (map string->symbol (or (opt "excl-tags") '()))]
-          [exclude (or (opt "exclude") '())]
-          [include (or (opt "include") '())]
-          [save-prof (opt "save-prof")]
-          [load-prof (opt "load-prof")]
-          [progress (string->symbol (or (opt "progress") "test"))]
-          [report (opt "report")]
-          [coverage (opt "coverage")]
-          [suites (sort (lambda (s1 s2) (string<? (car s1) (car s2)))
-                    (extract-suites (or (opt "specs") '())))])
+(cond
+ [(zero? (hashtable-size (opt))) (usage #t '() #f)]
+ [(opt 'help) =>
+  (lambda (sections)
+    (usage #f (map string->symbol sections) (opt)))]
+ [(opt 'version)
+  (printf "~a Version ~a (~a)\n" who
+    (software-version 'swish)
+    (software-revision 'swish))]
+ [(hashtable-ref (opt) 'repl #f)
+  (let ([ignored
+         (remq #f
+           (map (lambda (x)
+                  (and (not (memq x shared-cli))
+                       (opt (<arg-spec> name x))
+                       (format-spec x '(or long short))))
+             testing-cli))])
+    (when (pair? ignored)
+      (printf "~@[Ignoring ~{~a~^, ~} in ~a mode\n~]" ignored
+        (option-named 'repl))))
+  (apply (scheme-start) (cons "--" (or (opt 'files) '())))]
+ [else
+  (let ([incl-tags (map string->symbol (or (opt 'incl-tags) '()))]
+        [excl-tags (map string->symbol (or (opt 'excl-tags) '()))]
+        [exclude (or (opt 'exclude) '())]
+        [include (or (opt 'include) '())]
+        [save-prof (opt 'save-prof)]
+        [load-prof (opt 'load-prof)]
+        [progress (string->symbol (or (opt 'progress) "test"))]
+        [report (opt 'report)]
+        [coverage (opt 'coverage)]
+        [suites (sort (lambda (s1 s2) (string<? (car s1) (car s2)))
+                  (extract-suites (or (opt 'specs) '())))])
+    (check-report-format report 'report)
+    (cond
+     [(and load-prof (not (or save-prof coverage)))
+      (fail "~a requires ~a or ~a"
+        (option-named 'load-prof)
+        (option-named 'save-prof)
+        (option-named 'coverage))]
+     [(and coverage (not (or load-prof save-prof)))
+      (fail "~a requires ~a or ~a"
+        (option-named 'coverage)
+        (option-named 'load-prof)
+        (option-named 'save-prof))]
+     [(and report (not (or (opt 'harvest) (opt 'load-results) (pair? suites))))
+      (fail "~a requires ~a or ~a or a set of tests to run (~a)"
+        (option-named 'report)
+        (option-named 'harvest)
+        (option-named 'load-results)
+        (option-named 'files))]
+     [(and (opt 'harvest) (pair? suites))
+      (fail "~a conflicts with ~a"
+        (option-named 'harvest)
+        (option-named 'files))]
+     [(and (opt 'load-results) (pair? suites))
+      (fail "~a conflicts with ~a"
+        (option-named 'load-results)
+        (option-named 'files))])
+    (let ([test-files (map car suites)]
+          [test-run
+           (uuid->string ;; normalize to swish's format
+            (cond
+             [(opt 'test-run) =>
+              (lambda (s)
+                (match (catch (string->uuid s))
+                  [#(EXIT ,reason)
+                   (fail "invalid ~a UUID ~a" (option-named 'test-run) s)]
+                  [,uuid uuid]))]
+             [else (osi_make_uuid)]))])
+      (define report-files (map ->report-filename test-files))
+      (define status 0)
+      (define no-tests '())
+      (define full-load-filenames
+        (map
+         (lambda (load-fn)
+           (match (catch (get-real-path load-fn))
+             [#(EXIT ,reason)
+              (fail "~a ~a: file not found" (option-named 'load-prof) load-fn)]
+             [,full-load-fn full-load-fn]))
+         (or load-prof '())))
+      (define (truncate-profile)
+        (match (catch (open-file-to-replace save-prof))
+          [#(EXIT ,reason)
+           (fail "~a ~a failed (~a)" (option-named 'save-prof) save-prof
+             (exit-reason->english reason))]
+          [,op (close-port op)]))
       (cond
-       [(and load-prof (not (or save-prof coverage)))
-        (fail "~a requires ~a or ~a"
-          (option-named "load-prof")
-          (option-named "save-prof")
-          (option-named "coverage"))]
-       [(and coverage (not (or load-prof save-prof)))
-        (fail "~a requires ~a or ~a"
-          (option-named "coverage")
-          (option-named "load-prof")
-          (option-named "save-prof"))])
-      (let ([test-files (map car suites)])
-        (define to-file (and (or report coverage) #t))
-        (define report-files (map ->report-filename test-files))
-        (define status 0)
-        (define no-tests '())
-        (define full-load-filenames
-          (map
-           (lambda (load-fn)
-             (match (catch (get-real-path load-fn))
-               [#(EXIT ,reason)
-                (fail "~a ~a: file not found" (option-named "load-prof") load-fn)]
-               [,full-load-fn full-load-fn]))
-           (or load-prof '())))
-        (define (truncate-profile)
-          (match (catch (open-file-to-replace save-prof))
-            [#(EXIT ,reason)
-             (fail "~a ~a failed (~a)" (option-named "save-prof") save-prof
-               (exit-reason->english reason))]
-            [,op (close-port op)]))
-        (cond
-         [(and load-prof save-prof)
-          (let ([add-to-profile
-                 (match (catch (get-real-path save-prof))
-                   [#(EXIT ,reason) #f]
-                   [,full-save-fn
-                    (and (member full-save-fn full-load-filenames) full-save-fn)])])
-            (unless add-to-profile (truncate-profile))
-            ;; mute the console-event-handler
-            (parameterize ([console-output-port (open-output-string)])
-              (match-let* ([#(ok ,pid) (profile:start add-to-profile save-prof #t)])
-                (foreach ([to-load (map cons full-load-filenames load-prof)])
-                  (match-let* ([(,full-name . ,user-supplied-name) to-load])
-                    (unless (equal? full-name add-to-profile)
-                      (match (catch (profile:merge full-name))
-                        [ok (void)]
-                        [#(EXIT ,reason)
-                         (fail "cannot load profile data from ~a" user-supplied-name)]))))
-                (profile:stop))))]
-         [save-prof (truncate-profile)])
-        (when to-file
-          (foreach ([file report-files])
-            (catch (remove-file file))))
-        (foreach ([suite/test suites] [report-file report-files])
-          (let ([suite (car suite/test)]
-                [tests (cdr suite/test)])
-            (match (run-test-spec swish
-                     (<test-spec> make
-                       [test-file suite]
-                       [report-file (and to-file report-file)]
-                       [tests (and (pair? tests) tests)]
-                       [incl-tags incl-tags]
-                       [excl-tags excl-tags]
-                       [profile save-prof]
-                       [progress progress]
-                       [lib-dirs (library-directories)]
-                       [src-dirs (source-directories)]))
-              [#f (void)]
-              [fail (set! status 1)]
-              [skip (set! status 1)]
-              [no-tests (set! no-tests (cons suite no-tests))])))
-        (let ([report-files (filter file-exists? report-files)])
-          (when report
-            (html-report report report-files)
-            (printf "see ~a\n" (path->file-uri (get-real-path report))))
-          (when coverage
-            (if (profile:dump-html (or save-prof load-prof) coverage include exclude)
-                (printf "see ~a\n" (path->file-uri (get-real-path coverage)))
-                (printf "no profile to dump\n")))
-          (when (or report coverage)
-            (console-summary report-files))
-          (match (filter (lambda (fn) (string=? "ms" (path-extension fn))) no-tests)
-            [() (exit status)]
-            [,expected-tests
-             (unless (eq? progress 'none)
-               (printf "No tests found in~{\n ~a~}\n" expected-tests))
-             (exit (if (> status 0) status 3))]))))]))
-
-(main)
+       [(and load-prof save-prof)
+        (let ([add-to-profile
+               (match (catch (get-real-path save-prof))
+                 [#(EXIT ,reason) #f]
+                 [,full-save-fn
+                  (and (member full-save-fn full-load-filenames) full-save-fn)])])
+          (unless add-to-profile (truncate-profile))
+          ;; mute the console-event-handler
+          (parameterize ([console-error-port (open-output-string)])
+            (match-let* ([#(ok ,pid) (profile:start add-to-profile save-prof #t)])
+              (foreach ([to-load (map cons full-load-filenames load-prof)])
+                (match-let* ([(,full-name . ,user-supplied-name) to-load])
+                  (unless (equal? full-name add-to-profile)
+                    (match (catch (profile:merge full-name))
+                      [ok (void)]
+                      [#(EXIT ,reason)
+                       (fail "cannot load profile data from ~a" user-supplied-name)]))))
+              (profile:stop))))]
+       [save-prof (truncate-profile)])
+      (foreach ([suite/test suites] [report-file report-files])
+        ($init-mat-output-file report-file (car suite/test) test-run))
+      (foreach ([suite/test suites] [report-file report-files])
+        (let ([suite (car suite/test)]
+              [tests (cdr suite/test)])
+          (match (run-test-spec swish
+                   (<test-spec> make
+                     [test-file suite]
+                     [test-run test-run]
+                     [report-file report-file]
+                     [tests (and (pair? tests) tests)]
+                     [incl-tags incl-tags]
+                     [excl-tags excl-tags]
+                     [profile save-prof]
+                     [progress progress]
+                     [lib-dirs (library-directories)]
+                     [src-dirs (source-directories)]))
+            [ran (void)]
+            [fail (set! status 1)]
+            [skip (set! status 1)]
+            [no-tests (set! no-tests (cons suite no-tests))])))
+      (let ([summary
+             (cond
+              [(opt 'load-results) =>
+               (lambda (filename)
+                 (match (catch (json:bytevector->object (read-file filename)))
+                   [#(EXIT ,reason)
+                    (fail "cannot load results from ~a: ~a" filename
+                      (exit-reason->english reason))]
+                   [,results results]))]
+              [(opt 'harvest) => harvest]
+              [else (map load-results (filter file-exists? report-files))])])
+        (when report
+          (match (assoc (path-extension report) report-formats)
+            [(,_ . json)
+             (let ([op (open-file-to-replace report)])
+               (on-exit (close-port op)
+                 (json:write op summary 0)))]
+            [(,_ . html)
+             (html-report report summary)
+             (printf "see ~a\n" (path->file-uri (get-real-path report)))]))
+        (when coverage
+          (if (profile:dump-html (or save-prof load-prof) coverage include exclude)
+              (printf "see ~a\n" (path->file-uri (get-real-path coverage)))
+              (printf "no profile to dump\n")))
+        (console-summary summary (or report coverage (opt 'load-results) (opt 'harvest)))
+        (match (filter (lambda (fn) (string=? "ms" (path-extension fn))) no-tests)
+          [() (exit status)]
+          [,expected-tests
+           (unless (eq? progress 'none)
+             (printf "No tests found in~{\n ~a~}\n" expected-tests))
+           (exit (if (> status 0) status 3))]))))])

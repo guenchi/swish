@@ -61,5 +61,14 @@
     ["#(<point> 1 2)"                   ; tuple
      (let ()
        (define-tuple <point> x y)
-       (coerce (<point> make [x 1] [y 2])))])
+       (coerce (<point> make [x 1] [y 2])))]
+    ["{\"bar\":[1,\"two\",{\"zip\":true}],\"foo\":123}"
+     (coerce
+      (json:make-object
+       [foo 123]
+       [bar (list 1 "two" (json:make-object [zip #t]))]))]
+    ["#0=(1 . #0#)"
+     (coerce '#0=(1 . #0#))]
+    ["#(error \"Exception occurred with condition components:\\n  0. &irritants: #0=(1 . #0#).\")"
+     (coerce (make-irritants-condition '#1=(1 . #1#)))])
    'ok))

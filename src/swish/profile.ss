@@ -38,6 +38,7 @@
    (swish app-io)
    (swish erlang)
    (swish gen-server)
+   (swish html)
    (swish io)
    (swish meta)
    (swish pregexp)
@@ -184,7 +185,7 @@
     ht)
 
   (define ($profile-load filename add!)
-    (let ([ip (open-file filename O_RDONLY #o777 'binary-input)])
+    (let ([ip (open-binary-file-to-read filename)])
       (on-exit (close-port ip)
         (let lp ()
           (let ([x (fasl-read ip)])
@@ -207,8 +208,7 @@
                ls))))))
 
   (define (profile-save filename context sfd-table)
-    (let ([op (open-file (make-directory-path filename)
-                (+ O_WRONLY O_CREAT O_TRUNC) #o777 'binary-output)])
+    (let ([op (open-binary-file-to-replace (make-directory-path filename))])
       (on-exit (close-port op)
         (fasl-write (current-profile-config) op)
         (let-values ([(keys vals) (hashtable-entries sfd-table)])
@@ -344,20 +344,28 @@
         (vector->list
          (vector-sort (lambda (a b) (string<? (car a) (car b)))
            (vector-map (lambda (k v) (cons (sfd-source-path k values) v))
-            keys vals)))))
+             keys vals)))))
     (unless (list-of-strings? inputs) (bad-arg 'profile:dump-html profile-in))
     (unless (string? output-fn) (bad-arg 'profile:dump-html output-fn))
     (unless (list-of-strings? include-globs) (bad-arg 'profile:dump-html include-globs))
     (unless (list-of-strings? exclude-globs) (bad-arg 'profile:dump-html exclude-globs))
     (let ([results (load-profiles)]
           [op (open-file-to-replace (make-directory-path output-fn))])
+      (fprintf op "<!DOCTYPE html>\n")
       (fprintf op "<html>\n")
+      (html->string op
+        `(head
+          (meta (@ (charset "UTF-8")))
+          (title "Test Coverage")
+          (style
+            "td { text-align: right; }"
+            "td:first-child { text-align: left; }")))
       (fprintf op "<body style='font-family:monospace;'>\n")
       (let-values ([(hits sites percentage) (summarize-coverage results)])
         (fprintf op
           "<h2>Overall ~a% coverage with ~a of ~a sites covered.\n</h2>"
           percentage hits sites))
-      (fprintf op "<table>\n")
+      (fprintf op "<table style=\"font-size: 1em;\">\n")
       (output-row op "filename" "hits" "sites" "coverage" "max-count")
       (parameterize ([source-directories (current-source-dirs)])
         (let ([root (path-parent (get-real-path output-fn))])
@@ -494,7 +502,7 @@ SPAN
       (html-encode (stringify c3))
       (cond
        [(fixnum? c4)
-        (format "<p style='color:~a'>~d%</p>"
+        (format "<span style='color:~a'>~d%</span>"
           (cond
            [(<= c4 50) "#FF0000"]
            [(< c4 80) "#FF8800"]
@@ -642,6 +650,7 @@ SPAN
                 '()))]))]))
 
   (profile:exclude "swish/mat.ss")
+  (profile:exclude "src/swish/script-testing.ss")
 
   )
 
@@ -713,4 +722,3 @@ SPAN
     [hit (check "gz")])
    'ok)
   )
-

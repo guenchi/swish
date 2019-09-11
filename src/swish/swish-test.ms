@@ -20,7 +20,6 @@
 ;;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 ;;; DEALINGS IN THE SOFTWARE.
 
-(include "swish/script-testing.ss")
 (import
  (chezscheme)
  (swish mat)
@@ -57,41 +56,61 @@
 (isolate-mat installation ()
   ;; We use the relative path to make the coverage report tidier.
   ;; This test makes sure we're still testing what we installed.
-  (equal?
-   (read-file (path-combine (prereq-path) "swish-test"))
-   (read-file swish-test-src)))
+  (assert
+   (equal?
+    (read-file (path-combine (prereq-path) "swish-test"))
+    (read-file swish-test-src))))
 
 (isolate-mat help ()
   (zero-exit (swish-test)
     '("Usage:"))
   (zero-exit (swish-test "--help")
     '("Usage:"
+      seek
       "progress <mode>"
+      seek
       "<spec> .* directory .* suite"))
   (zero-exit (swish-test "-h all")
     '("Usage:"
+      seek
       "progress <mode>"
+      seek
       "<spec> .* directory .* suite"
+      seek
       "By default,"
+      seek
       "Examples:"))
   (nonzero-exit (swish-test "--help me-obi-wan")
     '()
     "swish-test: unrecognized help section: me-obi-wan")
   )
 
+(isolate-mat version ()
+  (zero-exit (swish-test "--version")
+   '("swish-test Version (?:\\d+\\.){2}\\d+ \\([[:xdigit:]dirty-]+\\)")))
+
 (isolate-mat check-options ()
   (nonzero-exit (swish-test "--coverage foo")
     '() "--coverage requires --load-profile or --save-profile")
   ;; check for required options before complaining about missing file
   (nonzero-exit (swish-test "--load-profile file-that-does-not-exist")
-    '() "--load-profile requires --save-profile or --coverage"))
+    '() "--load-profile requires --save-profile or --coverage")
+  (nonzero-exit (swish-test "--report foo.html")
+    '()
+    (pregexp-quote
+     "--report requires --harvest or --load-results \
+      or a set of tests to run (<file> ...)"))
+  (nonzero-exit (swish-test "--harvest . --progress none .")
+    '() "--harvest conflicts with <file> ...")
+  (nonzero-exit (swish-test "--load-results foo.json .")
+    '() "--load-results conflicts with <file> ..."))
 
 (isolate-mat load-this ()
   (write-test-file "test-load-this.ss"
     (lambda ()
       (display "#!chezscheme\n")
       (for-each pretty-print
-       '((define a 1)
+        '((define a 1)
           (define-syntax b (identifier-syntax 2))))
       (display "#!eof mats\n")
       (for-each pretty-print
@@ -103,7 +122,7 @@
     `("--progress" "test"
       ,(path-combine (output-dir) "test-load-this.ss"))
     ""
-    '("Tests run: 2   Pass: 2   Fail: 0   Skip: 0")))
+    '(seek "Tests run: 2   Pass: 2   Fail: 0   Skip: 0")))
 
 (isolate-mat load-this-exposing ()
   (write-test-file "test-exposing.ss"
@@ -165,7 +184,9 @@
       ,(path-combine (output-dir) "test-exposing.ss")
       ,(path-combine (output-dir) "test-reexpose.ss"))
     ""
-    '("Tests run: 5   Pass: 5   Fail: 0   Skip: 0"
+    '(seek
+      "Tests run: 5   Pass: 5   Fail: 0   Skip: 0"
+      seek
       "Tests run: 2   Pass: 2   Fail: 0   Skip: 0")))
 
 (isolate-mat swish-test-repl ()
@@ -183,7 +204,8 @@
         (for-each pretty-print (sort string<? (map symbol->string (library-exports '(swish mat)))))
         (profile:save)
         (exit)))
-    `("" ,(swish-version) "okay" "add-mat" "mat" "run-mats" "summarize"))
+    `(,(format "~a Version ~a" (software-product-name 'swish) (software-version 'swish))
+      "okay" seek "add-mat" "mat" seek "run-mats" seek "summarize"))
   (script-test swish-test-src
     `("--repl" "--load-profile" "foo" "bar" "--save-profile" "chowder" "-s" "luke" "--progress" "ion" "--tag" "RFID" "--not" "really")
     (format "~{~s\n~}"
@@ -191,7 +213,9 @@
         (pretty-print (source-directories))
         (profile:save)
         (exit)))
-    `("Ignoring --tag, --not, --load-profile, --save-profile, --progress in --repl mode"
+    `(seek
+      "Ignoring --tag, --not, --progress, --load-profile, --save-profile in --repl mode"
+      seek
       "(\"luke\" \"\\.\")"))
   (when (whereis 'profiler)
     (profile:merge tmp-prof))
@@ -211,63 +235,77 @@
   ;; run entire suite, yet skip all tests
   (nonzero-exit
    (swish-test "--progress test --tag NONE " test-file)
-   '("SKIP *a1"
+   '(seek
+     "SKIP *a1"
      "SKIP *a2"
      "SKIP *a3"
      "SKIP *a4"
      "SKIP *a5"
+     "[-]+"
      "Tests run: 0   Pass: 0   Fail: 0   Skip: 5"))
   ;; run test selected by name, yet skip all tests
   (nonzero-exit
    (swish-test "--progress test --tag NONE " test-file " a1 a5")
-   '("SKIP *a1"
+   '(seek
+     "SKIP *a1"
      "SKIP *a5"
+     "[-]+"
      "Tests run: 0   Pass: 0   Fail: 0   Skip: 2"))
   ;; run tests selected by tag, all tests run pass
   (nonzero-exit
    (swish-test "--progress test --tag triv " test-file)
-   '("pass *a1"
+   '(seek
+     "pass *a1"
      "pass *a2"
      "SKIP *a3"
      "SKIP *a4"
      "SKIP *a5"
+     "[-]+"
      "Tests run: 2   Pass: 2   Fail: 0   Skip: 3"))
   ;; run tests excluding by tag
   (nonzero-exit
    (swish-test "--progress test --not broken " test-file)
-   '("pass *a1"
+   '(seek
+     "pass *a1"
      "pass *a2"
      "SKIP *a3"
      "pass *a4"
      "pass *a5"
+     "[-]+"
      "Tests run: 4   Pass: 4   Fail: 0   Skip: 1"))
   ;; tags are additive
   (nonzero-exit
    (swish-test "--progress test --tag triv --tag broken " test-file)
-   '("pass *a1"
+   '(seek
+     "pass *a1"
      "pass *a2"
      "FAIL *a3"
      "SKIP *a4"
      "SKIP *a5"
+     "[-]+"
      "Tests run: 3   Pass: 2   Fail: 1   Skip: 2"))
   ;; exclusion tags are additive
   (nonzero-exit
    (swish-test "--progress test --not triv --not silly " test-file)
-   '("SKIP *a1"
+   '(seek
+     "SKIP *a1"
      "SKIP *a2"
      "FAIL *a3"
      "pass *a4"
      "SKIP *a5"
+     "[-]+"
      "Tests run: 2   Pass: 1   Fail: 1   Skip: 3"))
   ;; filter first by tags and then by exclusion tags
   ;; order on command-line doesn't matter
   (nonzero-exit
    (swish-test "--progress test --tag silly --not broken --tag triv --tag broken --tag triv " test-file)
-   '("pass *a1"
+   '(seek
+     "pass *a1"
      "pass *a2"
      "SKIP *a3" ;; since --not broken
      "SKIP *a4" ;; since it doesn't match any included tags
      "pass *a5"
+     "[-]+"
      "Tests run: 3   Pass: 3   Fail: 0   Skip: 2"))
   ;; if any test fails, suite summary shows fail
   (nonzero-exit
@@ -280,7 +318,7 @@
   ;; failure exit code if specified test not found
   (nonzero-exit
    (swish-test "--progress test " test-file " this-test-does-not-exist")
-   '("Exception in run-mat: mat this-test-does-not-exist is not defined"))
+   '(seek "Exception in run-mat: mat this-test-does-not-exist is not defined"))
   ;; if all *specified* tests pass, show pass, exit code zero
   (zero-exit
    (swish-test "--progress suite " test-file " a1 a2 a4")
@@ -316,12 +354,17 @@
    (swish-test "--progress test " (path-combine (output-dir) test-dir0))
    (list
     (pregexp-quote file1)
+    "[-]+" " Result * Test name * Message *" "[-]+"
     " *pass *t1"
     " *pass *t2"
+    'seek
     (pregexp-quote file2)
+    "[-]+" " Result * Test name * Message *" "[-]+"
     " *pass *a1"
     " *pass *a2"
+    'seek
     (pregexp-quote file3)
+    "[-]+" " Result * Test name * Message *" "[-]+"
     " *pass *a1"
     " *pass *a2"
     " *FAIL *bad"))
@@ -330,7 +373,13 @@
    (list
     (format "~a *pass$" (pregexp-quote file1))
     (format "~a *pass$" (pregexp-quote file2))
-    (format "~a *fail$" (pregexp-quote file3)))))
+    (format "~a *fail$" (pregexp-quote file3))))
+  ;; test --harvest directory processing
+  (let ([combined.json (path-combine (output-dir) "combined.json")])
+    (zero-exit
+     (swish-test "--report " combined.json " --harvest "
+       (path-combine (output-dir) test-dir0))
+     '("Tests run: 7   Pass: 6   Fail: 1   Skip: 0"))))
 
 (isolate-mat spec-processing ()
   (define common-name-file
@@ -354,16 +403,22 @@
    ;; common-name interpreted as a suite since there is a file of that name
    (swish-test "--progress test " test-file " " common-name)
    (list
+    'seek
     ;; suites appear in sorted order
     (pregexp-quote common-name-file)
+    "[-]+" " Result * Test name * Message *" "[-]+"
     " *pass *t1"
     " *FAIL *t2"
+    "[-]+"
     "Tests run: 2   Pass: 1   Fail: 1   Skip: 0"
+    'seek
     (pregexp-quote test-file)
+    "[-]+" " Result * Test name * Message *" "[-]+"
     (format " *pass *~a" (pregexp-quote (symbol->string common-name)))
     " *pass *a1"
     " *FAIL *a2"
     " *FAIL *a3"
+    "[-]+"
     "Tests run: 4   Pass: 2   Fail: 2   Skip: 0"))
   (zero-exit
    ;; common-name explicitly identified as a test
@@ -372,8 +427,11 @@
    ;;  2. we ran only the test named common-name
    (swish-test "--progress test " test-file " -t " common-name)
    (list
+    'seek
     (pregexp-quote test-file)
+    "[-]+" " Result * Test name * Message *" "[-]+"
     (format " *pass *~a" (pregexp-quote (symbol->string common-name)))
+    "[-]+"
     "Tests run: 1   Pass: 1   Fail: 0   Skip: 0"))
   (nonzero-exit
    ;; -t expects a value
@@ -401,15 +459,54 @@
             (mat TEST1 (good) (assert #t))
             (mat TEST2 (tag1 tag2) (assert #f))
             (mat TEST3 () (cdr 17)))))))
+  (define incomplete
+    ;; create incomplete test suite output
+    (write-test-file "incomplete.ms.mo"
+      (lambda ()
+        (let ([op (current-output-port)])
+          ;; keep in sync w/ write-meta-data in mat.ss to avoid export
+          (json:write-object op #f json:write
+            [_type_ "meta-kv"]
+            [key "completed"]
+            [value #f])
+          (json:write-object op #f json:write
+            [_type_ "meta-kv"]
+            [key "test-file"]
+            [value "incomplete.ms"])))))
   (define test-file2 (write-test-file "test-report2.ms" void))
-  (define (check results test-name type tags message)
+  (define test-file3
+    (write-test-file "test-report3.ms"
+      (lambda ()
+        (for-each pretty-print
+          `((import (swish mat))
+            ;; raise error with a stack to dump
+            (define (bug n)
+              (if (= n 0)
+                  (errorf 'bug "didn't handle zero")
+                  (cons n (bug (- n 1)))))
+            (mat zero ()
+              (assert (list? (bug 10)))))))))
+  (define (check results test-name type tags message stack)
     (match-let*
      ([,mr (find (lambda (mr) (equal? test-name (mat-result-test mr))) results)]
       [#t (mat-result? mr)]
       [,@type (mat-result-type mr)]
       [,@tags (mat-result-tags mr)]
-      [,@message (mat-result-message mr)])
+      [,@message (mat-result-message mr)]
+      [,@stack (and stack (mat-result-stack mr))])
      'ok))
+  (define mo-path1 (string-append test-file ".mo"))
+  (define mo-path2 (string-append test-file2 ".mo"))
+  (define mo-path3 (string-append test-file3 ".mo"))
+  (define (get-data content)
+    (match-let* ([(,_ ,data) (pregexp-match "<script>var data = (.*);</script><script>\n  function escapeHtml" content)])
+      (json:string->object data)))
+  (define (results-of-type t obj)
+    (filter (lambda (r) (eq? t (mat-result-type r)))
+      (mat-data-results obj)))
+  (define (find-test name obj)
+    (find (lambda (r) (eq? name (mat-result-test r)))
+      (mat-data-results obj)))
   (nonzero-exit
    (swish-test "--progress none --report " report-file " " test-file)
    '())
@@ -417,19 +514,90 @@
   (match-let*
    ([#t (file-exists? report-file)]
     [,content (utf8->string (read-file report-file))]
-    [(,_ ,rest) (pregexp-match ".*<tr>[<td/>]*<td>TEST1</td><td>.*PASS(.*)" content)]
-    [(,_ ,rest) (pregexp-match ".*<tr>[<td/>]*<td>TEST2</td><td>.*Exception: failed assertion #f at line 3(.*)" rest)]
-    [(,_) (pregexp-match ".*<tr>[<td/>]*<td>TEST3</td><td>.*Exception in cdr: 17 is not a pair" rest)])
+    [(,obj) (get-data content)]
+    [,test1-result (find-test 'TEST1 obj)]
+    [,test2-result (find-test 'TEST2 obj)]
+    [,test3-result (find-test 'TEST3 obj)]
+    ["pass" (json:ref test1-result 'type #f)]
+    ["fail" (json:ref test2-result 'type #f)]
+    [(,_) (pregexp-match "Exception: failed assertion #f at line 3,.*" (json:ref test2-result 'message #f))]
+    ["fail" (json:ref test3-result 'type #f)]
+    ["Exception in cdr: 17 is not a pair" (json:ref test3-result 'message #f)])
    'ok)
   ;; check .mo results file
-  (match-let*
-   ([,mo-path (string-append test-file ".mo")]
-    [,results (load-results mo-path)])
-   (check results 'TEST1 'pass '(good) "")
-   (check results 'TEST2 'fail '(tag1 tag2)
-     (format "Exception: failed assertion #f at line 3, char 32 of ~a" test-file))
-   (check results 'TEST3 'fail '() "Exception in cdr: 17 is not a pair")
-   'ok)
+  (let ([data (load-results mo-path1)])
+    (let ([results (mat-data-results data)])
+      (check results 'TEST1 'pass '(good) "" "")
+      (check results 'TEST2 'fail '(tag1 tag2)
+        (format "Exception: failed assertion #f at line 3, char 32 of ~a" test-file)
+        #f)
+      (check results 'TEST3 'fail '() "Exception in cdr: 17 is not a pair" #f))
+    (match-let*
+     ([,meta (mat-data-meta-data data)]
+      ;; (meta-data completed)
+      [#t (json:ref meta 'completed #f)]
+      ;; (meta-data software-info)
+      [,ignore-swish-revision
+       (lambda (x)
+         (json:object->string
+          (let ([copy (json:string->object (json:object->string x))])
+            (json:set! copy '(swish revision) "ignored")
+            copy)))]
+      [,expected (ignore-swish-revision (software-info))]
+      [,@expected (ignore-swish-revision (json:ref meta 'software-info #f))]
+      ;; (meta-data date)
+      [,date-regexp  "([^ ]+ [^ ]+ [^ ]+ [^ ]+) ([^:]+):([^:]+)"]
+      [(,_ ,exp-day ,exp-hour ,exp-min)
+       (pregexp-match date-regexp (format-rfc2822 (current-date)))]
+      [(,_ ,act-day ,act-hour ,act-min)
+       (pregexp-match date-regexp (json:ref meta 'date ""))]
+      [#t (or (string=? exp-day act-day)
+              (string=? act-hour "23"))]
+      ;; (meta-data timestamp)
+      [,then (json:ref meta 'timestamp (expt 2 64))]
+      [,now (erlang:now)]
+      [#t (< then now)]
+      ;; (meta-data test-file)
+      [,test-file (path-last test-file)]
+      [,@test-file (path-last (json:ref meta 'test-file "fail"))]
+      ;; (meta-data test-run)
+      [,test-run (json:ref meta 'test-run "fail")]
+      [ok (and (string->uuid test-run) 'ok)]
+      ;; (meta-data hostname)
+      [,hostname (osi_get_hostname)]
+      [,@hostname (json:ref meta 'hostname #f)]
+      ;; (meta-data machine-type)
+      [,arch (machine-type)]
+      [,@arch (string->symbol (json:ref meta 'machine-type ""))])
+     'ok))
+  ;; specify explicit uuid
+  (let ([test-file
+         (write-test-file "explicit-uuid.ms"
+           (lambda ()
+             (for-each pretty-print
+               `((import (swish mat))
+                 (mat good () (assert #t))
+                 (mat bad () (assert #f))))))]
+        [explicit.json (path-combine (output-dir) "explicit.json")]
+        [uuid (uuid->string (osi_make_uuid))])
+    (nonzero-exit
+     (swish-test "--test-run " (format "~(~a~)" uuid) " --report " explicit.json " " test-file)
+     '(seek
+       "Tests run: 2   Pass: 1   Fail: 1   Skip: 0"))
+    (match-let*
+     ([(,file1) (json:bytevector->object (read-file explicit.json))]
+      [,@uuid (json:ref file1 '(meta-data test-run) #f)])
+     'ok))
+  ;; check stack field
+  (nonzero-exit
+   (swish-test test-file3)
+   '(seek "Exception in bug: didn't handle zero"))
+  (let* ([data (load-results mo-path3)]
+         [results (mat-data-results data)])
+    (check results 'zero 'fail '() "Exception in bug: didn't handle zero"
+      (format "~:{#<continuation in bug> at line 5, char 15 of ~a\n  n: ~a\n~}Stack dump truncated due to max-depth = 10.\n"
+        (map (lambda (n) (list test-file3 (+ n 1)))
+          (iota 10)))))
   ;; all pass, but some skipped so nonzero exit
   (nonzero-exit
    (swish-test "--progress none --tag good --report " report-file1 " " test-file)
@@ -438,7 +606,10 @@
   (match-let*
    ([#t (file-exists? report-file1)]
     [,content (utf8->string (read-file report-file1))]
-    [(,_) (pregexp-match (pregexp-quote "passed 1 tests (skipped 2)") content)])
+    [(,obj) (get-data content)]
+    [1 (length (results-of-type 'pass obj))]
+    [2 (length (results-of-type 'skip obj))]
+    [0 (length (results-of-type 'fail obj))])
    'ok)
   ;; all pass, some skipped, but test specified explicitly so zero exit
   (zero-exit
@@ -448,7 +619,10 @@
   (match-let*
    ([#t (file-exists? report-file2)]
     [,content (utf8->string (read-file report-file2))]
-    [(,_) (pregexp-match (pregexp-quote "PASSED all 1 tests") content)])
+    [(,obj) (get-data content)]
+    [1 (length (results-of-type 'pass obj))]
+    [0 (length (results-of-type 'skip obj))]
+    [0 (length (results-of-type 'fail obj))])
    'ok)
   ;; some skipped so nonzero exit, no results for test-file2
   (nonzero-exit
@@ -458,10 +632,22 @@
   (match-let*
    ([#t (file-exists? report-file3)]
     [,content (utf8->string (read-file report-file3))]
-    [(,_ ,rest)
-     (pregexp-match (string-append (pregexp-quote "passed 1 tests (skipped 2)") "(.*)") content)]
-    [(,_ ,rest) (pregexp-match ".*<tr>[<td/>]*<td>TEST1</td><td>.*PASS(.*)" rest)]
-    [(,_) (pregexp-match ".*<tr><td>.*test-report2.ms</td><td></td><td>.*no results" rest)])
+    [(,obj1 ,obj2) (get-data content)]
+    ["test-report.ms" (path-last (json:ref obj1 '(meta-data test-file) #f))]
+    ["test-report2.ms" (path-last (json:ref obj2 '(meta-data test-file) #f))]
+    [1 (length (results-of-type 'pass obj1))]
+    [2 (length (results-of-type 'skip obj1))]
+    [0 (length (results-of-type 'fail obj1))]
+    [,test1-result (find-test 'TEST1 obj1)]
+    ["pass" (json:ref test1-result 'type #f)]
+    [() (json:ref obj2 'results #f)])
+   'ok)
+  ;; check summary
+  (match-let*
+   ([(1 0 2 2 3)
+     (call-with-values
+       (lambda () (summarize (list mo-path1 mo-path2 incomplete)))
+       list)])
    'ok)
   ;; tests fail, some skipped
   (nonzero-exit
@@ -471,7 +657,159 @@
   (match-let*
    ([#t (file-exists? report-file4)]
     [,content (utf8->string (read-file report-file4))]
-    [(,_) (pregexp-match (pregexp-quote "Failed 2 of 2 tests (skipped 1)") content)])
+    [(,obj) (get-data content)]
+    [0 (length (results-of-type 'pass obj))]
+    [1 (length (results-of-type 'skip obj))]
+    [2 (length (results-of-type 'fail obj))])
+   'ok)
+  ;; check summary
+  (match-let*
+   ([(0 2 1 2 2)
+     (call-with-values
+       (lambda () (summarize (list mo-path1 mo-path2)))
+       list)])
+   'ok)
+  (let ([aggregate.json (path-combine (output-dir) "aggregate.json")]
+        [aggregate.html (path-combine (output-dir) "aggregate.html")]
+        [alt.html (path-combine (output-dir) "alt.html")]
+        [summary-output
+         '("Tests run: 3   Pass: 1   Fail: 2   Skip: 1"
+           seek
+           "Some test suite did not complete")])
+    ;; re-run test-file for harvest tests, skipping 1
+    (nonzero-exit
+     (swish-test "--progress none --not tag1 " test-file)
+     '())
+    ;; --harvest alone prints summary and incomplete notice
+    (zero-exit
+     (swish-test "--harvest " mo-path1 " " mo-path2 " " mo-path3 " " incomplete)
+     summary-output)
+    ;; --harvest for report also prints summary and incomplete notice
+    (zero-exit
+     (swish-test
+      "--harvest " mo-path1 " " mo-path2 " " mo-path3 " " incomplete
+      " --report " aggregate.json)
+     summary-output)
+    ;; --load-results alone prints summary and incomplete notice
+    (zero-exit
+     (swish-test "--load-results " aggregate.json)
+     summary-output)
+    ;; --load-results and --report generating HTML output prints same summary
+    (zero-exit
+     (swish-test "--load-results " aggregate.json " --report " aggregate.html)
+     (cons "see file:.*aggregate.html" summary-output))
+    ;; can generate same HTML report via --harvest and --report
+    (zero-exit
+     (swish-test
+      "--harvest " mo-path1 " " mo-path2 " " mo-path3 " " incomplete
+      " --report " alt.html)
+     (cons "see file:.*alt.html" summary-output))
+    ;; check the HTML report output
+    (match-let*
+     ([,expected (read-file aggregate.html)]
+      [,_ ;; we get the same HTML output both ways
+       (assert (equal? expected (read-file alt.html)))]
+      [,content (utf8->string expected)]
+      [,mat-data* (get-data content)]
+      [,find-suite
+       (lambda (test-file)
+         (find (lambda (x)
+                 (equal? test-file (json:ref (mat-data-meta-data x) 'test-file #f)))
+           mat-data*))]
+      [,mo1 (find-suite test-file)]
+      [,test1-result (find-test 'TEST1 mo1)]
+      [,test2-result (find-test 'TEST2 mo1)]
+      [,test3-result (find-test 'TEST3 mo1)]
+      ["pass" (json:ref test1-result 'type #f)]
+      ["skip" (json:ref test2-result 'type #f)]
+      ["fail" (json:ref test3-result 'type #f)]
+      [,mo2 (find-suite test-file2)]
+      [() (mat-data-results mo2)]
+      [,mo3 (find-suite test-file3)]
+      [,zero-result (find-test 'zero mo3)]
+      ["fail" (json:ref zero-result 'type #f)]
+      ["Exception in bug: didn't handle zero" (json:ref zero-result 'message #f)]
+      [(,_)
+       (pregexp-match "continuation in bug.*at line 5, char 15"
+         (json:ref zero-result 'stack "no stack"))]
+      [,mo4 (find-suite "incomplete.ms")]
+      [#f (json:ref mo4 '(meta-data completed) "bupkis")]
+      [() (mat-data-results mo4)])
+     'ok))
+  ;; try harvesting from the wrong place
+  (nonzero-exit
+   (swish-test "--harvest " mo-path1 " " report-file1)
+   '()
+   "swish-test: cannot load mat results from.*report1.html: Unexpected input at position")
+  ;; try loading results from the wrong place
+  (nonzero-exit
+   (swish-test "--load-results " report-file1)
+   '()
+   "swish-test: cannot load results from.*report1.html: Unexpected input at position")
+  )
+
+(isolate-mat incomplete ()
+  (define abort.ms
+    (write-test-file "abort.ms"
+      (lambda ()
+        (pretty-print '(abort)))))
+  (define no-tests.ms (write-test-file "no-tests.ms" void))
+  (define pass.ms
+    (write-test-file "pass.ms"
+      (lambda ()
+        (for-each pretty-print
+          `((import (swish mat))
+            (mat good () (assert #t)))))))
+  (nonzero-exit
+   ;; complain if test suite does not complete
+   (swish-test abort.ms)
+   `("Some test suite did not complete"))
+  (nonzero-exit
+   ;; complain if test suite does not complete
+   (swish-test abort.ms " " no-tests.ms)
+   `(seek
+     "Tests run: 0   Pass: 0   Fail: 0   Skip: 0"
+     seek
+     "Some test suite did not complete"
+     seek
+     "No tests found in"
+     "no-tests.ms"))
+  (nonzero-exit
+   ;; complain if test suite does not complete
+   (swish-test abort.ms " " no-tests.ms " " pass.ms)
+   `(seek
+     "Tests run: 1   Pass: 1   Fail: 0   Skip: 0"
+     seek
+     "Some test suite did not complete"
+     seek
+     "No tests found in"
+     "no-tests.ms"))
+  ;; check summary
+  (match-let*
+   ([(1 0 0 2 3)
+     (call-with-values
+       (lambda ()
+         (summarize
+          (map (lambda (fn) (string-append fn ".mo"))
+            (list abort.ms pass.ms no-tests.ms))))
+       list)])
+   'ok)
+  ;; check available meta-data for incomplete .mo
+  (match-let*
+   ([,abort-result (load-results (string-append abort.ms ".mo"))]
+    [() (mat-data-results abort-result)]
+    [,abort-meta (mat-data-meta-data abort-result)]
+    ;; (meta-data completed)
+    [#f (json:ref abort-meta 'completed "oops")]
+    ;; (meta-data test-file)
+    [,expected (path-last abort.ms)]
+    [,@expected (path-last (json:ref abort-meta 'test-file ""))]
+    ;; (meta-data hostname)
+    [,hostname (osi_get_hostname)]
+    [,@hostname (json:ref abort-meta 'hostname #f)]
+    ;; (meta-data machine-type)
+    [,arch (symbol->string (machine-type))]
+    [,@arch (json:ref abort-meta 'machine-type #f)])
    'ok)
   )
 
@@ -481,13 +819,20 @@
   (nonzero-exit
    ;; complain if .ms file contains no tests
    (swish-test test-file)
-   `("Tests run: 0   Pass: 0   Fail: 0   Skip: 0"
+   `(seek
+     "Tests run: 0   Pass: 0   Fail: 0   Skip: 0"
+     seek
      "No tests found in"
      ,(pregexp-quote test-file)))
   (zero-exit
    ;; don't complain if non-.ms file contains no tests
    (swish-test source-file)
-   '()))
+   '())
+  (nonzero-exit
+   (swish-test "--report foobar")
+   '()
+   "cannot determine output format from --report foobar, expected .json, .html, or .htm extension")
+  )
 
 ;; We shut down the profiler temporarily in some places to avoid interfering
 ;; with the profile:start call in swish-test; this means the coverage report
@@ -554,13 +899,14 @@
       (list (format "~a *pass" (pregexp-quote test-file))))
      (zero-exit
       (swish-test "--load-profile " profile-file " --coverage " coverage-file)
-      '("see file:.*cov/summary.html"
+      '(seek ;; needed for make coverage, due to "Skipping ..."
+        "see file:.*cov/summary.html"
         "Tests run: 0   Pass: 0   Fail: 0   Skip: 0")))
     (match-let*
      ([#t (file-regular? coverage-file)]
       [,cov (utf8->string (read-file coverage-file))]
-      [(,_) (pregexp-match "Overall 71% coverage with 15 of 21 sites covered" cov)]
-      [(,_) (pregexp-match (summary-row source-file-rel 15 21 71 12) cov)]
+      [(,_) (pregexp-match "Overall 74% coverage with 17 of 23 sites covered" cov)]
+      [(,_) (pregexp-match (summary-row source-file-rel 17 23 74 12) cov)]
       [,ss.html (path-combine (path-parent coverage-file) (string-append source-file-rel ".html"))]
       [#t (file-regular? ss.html)]
       [,ss (utf8->string (read-file ss.html))]
@@ -572,13 +918,14 @@
   (without-profiler
    (zero-exit
     (swish-test "--save-profile " profile1-file " --coverage " coverage1-file " " source-file-rel " test0")
-    '("see file:.*cov1/summary.html"
+    '(seek
+      "see file:.*cov1/summary.html"
       "Tests run: 1   Pass: 1   Fail: 0   Skip: 0")))
   (match-let*
    ([#t (file-regular? coverage1-file)]
     [,cov1 (utf8->string (read-file coverage1-file))]
-    [(,_) (pregexp-match "Overall 35% coverage with 12 of 34 sites covered" cov1)]
-    [(,_) (pregexp-match (summary-row source-file-rel 12 34 35 1) cov1)]
+    [(,_) (pregexp-match "Overall 45% coverage with 18 of 40 sites covered" cov1)]
+    [(,_) (pregexp-match (summary-row source-file-rel 18 40 45 1) cov1)]
     [,ss.html (path-combine (path-parent coverage1-file) (string-append source-file-rel ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
@@ -593,17 +940,20 @@
   (without-profiler
    (zero-exit
     (swish-test "--save-profile " profile2-file " " source-file-rel " test5")
-    '(" pass *test5"
+    '(seek
+      " pass *test5"
+      seek
       "Tests run: 1   Pass: 1   Fail: 0   Skip: 0"))
    (zero-exit
     (swish-test "--load-profile " profile2-file " --coverage " coverage1-file)
-    '("see file:.*cov1/summary.html"
+    '(seek ;; needed for make coverage, due to "Skipping ..."
+      "see file:.*cov1/summary.html"
       "Tests run: 0   Pass: 0   Fail: 0   Skip: 0")))
   (match-let*
    ([#t (file-regular? coverage1-file)]
     [,cov1 (utf8->string (read-file coverage1-file))]
-    [(,_) (pregexp-match "Overall 65% coverage with 22 of 34 sites covered" cov1)]
-    [(,_) (pregexp-match (summary-row source-file-rel 22 34 65 6) cov1)]
+    [(,_) (pregexp-match "Overall 70% coverage with 28 of 40 sites covered" cov1)]
+    [(,_) (pregexp-match (summary-row source-file-rel 28 40 70 6) cov1)]
     [,ss.html (path-combine (path-parent coverage1-file) (string-append source-file-rel ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
@@ -617,13 +967,14 @@
   ;; --load-profile multiple profiles via --coverage
   (zero-exit
    (swish-test "--load-profile " profile1-file " " profile2-file " --coverage " coverage1-file)
-   '("see file:.*cov1/summary.html"
+   '(seek ;; needed for make coverage, due to "Skipping ..."
+     "see file:.*cov1/summary.html"
      "Tests run: 0   Pass: 0   Fail: 0   Skip: 0"))
   (match-let*
    ([#t (file-regular? coverage1-file)]
     [,cov1 (utf8->string (read-file coverage1-file))]
-    [(,_) (pregexp-match "Overall 82% coverage with 28 of 34 sites covered" cov1)]
-    [(,_) (pregexp-match (summary-row source-file-rel 28 34 82 7) cov1)]
+    [(,_) (pregexp-match "Overall 85% coverage with 34 of 40 sites covered" cov1)]
+    [(,_) (pregexp-match (summary-row source-file-rel 34 40 85 7) cov1)]
     [,ss.html (path-combine (path-parent coverage1-file) (string-append source-file-rel ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
@@ -642,18 +993,23 @@
      " --save-profile " profile-file
      " --coverage " coverage-file
      " " test-file " " source-file-rel)
-    '(" pass *a1"
+    '(seek
+      " pass *a1"
+      "[-]+"
       "Tests run: 1   Pass: 1   Fail: 0   Skip: 0"
+      seek
       " pass *test0"
       " pass *test5"
+      "[-]+"
       "Tests run: 2   Pass: 2   Fail: 0   Skip: 0"
+      seek
       "see file:.*cov/summary.html"
       "Tests run: 3   Pass: 3   Fail: 0   Skip: 0")))
   (match-let*
    ([#t (file-regular? coverage-file)]
     [,cov (utf8->string (read-file coverage-file))]
-    [(,_) (pregexp-match "Overall 82% coverage with 28 of 34 sites covered" cov)]
-    [(,_) (pregexp-match (summary-row source-file-rel 28 34 82 31) cov)]
+    [(,_) (pregexp-match "Overall 85% coverage with 34 of 40 sites covered" cov)]
+    [(,_) (pregexp-match (summary-row source-file-rel 34 40 85 31) cov)]
     [,ss.html (path-combine (path-parent coverage-file) (string-append source-file-rel ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
@@ -668,13 +1024,14 @@
      "--load-profile " profile-file " " profile1-file " " profile2-file
      " --save-profile " profile-file
      " --coverage " coverage-file)
-    '("see file:.*cov/summary.html"
+    '(seek ;; needed for make coverage, due to "Skipping ..."
+      "see file:.*cov/summary.html"
       "Tests run: 0   Pass: 0   Fail: 0   Skip: 0")))
   (match-let*
    ([#t (file-regular? coverage-file)]
     [,cov (utf8->string (read-file coverage-file))]
-    [(,_) (pregexp-match "Overall 82% coverage with 28 of 34 sites covered" cov)]
-    [(,_) (pregexp-match (summary-row source-file-rel 28 34 82 (+ 31 7)) cov)]
+    [(,_) (pregexp-match "Overall 85% coverage with 34 of 40 sites covered" cov)]
+    [(,_) (pregexp-match (summary-row source-file-rel 34 40 85 (+ 31 7)) cov)]
     [,ss.html (path-combine (path-parent coverage-file) (string-append source-file-rel ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
@@ -717,11 +1074,14 @@
                'ok)))))))
   (zero-exit
    (swish-test "-L " (path-combine (output-dir) lib-dir) " " test-file)
-   '(" pass *b9"
+   '(seek
+     " pass *b9"
+     seek
      "Tests run: 1   Pass: 1   Fail: 0   Skip: 0"))
   (nonzero-exit
    (swish-test test-file)
    (map pregexp-quote
      (list
       "Exception: library (help) not found"
+      ""
       (format "Test Failed: ~a" test-file)))))

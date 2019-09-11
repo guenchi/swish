@@ -82,10 +82,7 @@
     osi-bytes-used
     sqlite-memory
     sqlite-memory-highwater
-    databases
-    listeners
-    ports
-    watchers
+    foreign-handles
     cpu
     real
     bytes
@@ -103,7 +100,8 @@
   (define-tuple <system-attributes>
     timestamp
     date
-    software-version
+    software-info
+    machine-type
     computer-name)
   (define-tuple <transaction-retry>
     timestamp

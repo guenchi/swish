@@ -27,12 +27,11 @@
    )
   (import
    (chezscheme)
+   (swish app-core)
    (swish erlang)
    (swish gen-server)
    (swish osi)
    )
-
-  (define application-exit-code 2)
 
   (define (init starter)
     (process-trap-exit #t)
@@ -46,7 +45,7 @@
       (kill process 'shutdown)
       (receive
        [#(DOWN ,_ ,@process ,_) 'ok]))
-    (exit-process application-exit-code))
+    ($exit-process))
 
   (define (handle-call msg from process) (match msg))
 
@@ -57,23 +56,11 @@
       [#(EXIT ,p ,reason)
        `#(stop ,reason ,(and (not (eq? p process)) process))]))
 
-  (define (exit-process exit-code)
-    (catch (flush-output-port (console-output-port)))
-    (osi_exit exit-code))
-
   (define (application:start starter)
     (match (gen-server:start 'application starter)
       [#(ok ,_) 'ok]
       [#(error ,reason)
        (console-event-handler `#(application-start-failed ,reason))
-       (exit-process 1)]))
+       (exit 1)]))
 
-  (define application:shutdown
-    (case-lambda
-     [() (application:shutdown 0)]
-     [(exit-code)
-      (cond
-       [(whereis 'application) =>
-        (lambda (p) (set! application-exit-code exit-code) (kill p 'shutdown))]
-       [else (exit-process exit-code)])]))
   )

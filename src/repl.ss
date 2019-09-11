@@ -5,10 +5,10 @@
                   (if (equal? (getenv "PROFILE_MATS") "yes")
                       (library-directories '(("." . "../build/profile/lib")))
                       (library-directories '(("." . "../build/release/lib"))))
+                  (include "osi-bootstrap.ss")
                   void)])
   (void))
 
 (import (swish imports))
 (base-dir (path-parent (cd)))
-app:name ;; force initialization of (swish app) library, which sets scheme-start
-(apply (scheme-start) (command-line-arguments))
+(apply swish-start (command-line-arguments))

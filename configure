@@ -20,7 +20,7 @@ checkerrs() {
 }
 
 # minimal sanity check that we're being run from the right place
-if [ ! -d src/swish ] || [ ! -f src/swish/Makefile.in ]; then
+if [ ! -d src/swish ] || [ ! -f src/swish/Mf-base ]; then
   err "Must run $(basename "$0") at the root of the swish source distribution"
 fi
 
@@ -31,9 +31,19 @@ SCHEME=
 CUSTOMPATH=
 CUSTOMHEAPDIRS=
 CONFIG_UNAME="$(uname -s)"
+MYCC=
+MYCPPFLAGS=
+MYCFLAGS=
+MYLDFLAGS=
+FSROOT=
 
 case "${CONFIG_UNAME}" in
   CYGWIN_NT-*)
+    Windows=yes
+    NORMALIZE_PATH="cygpath -au"
+    FSROOT="/cygdrive"
+    ;;
+  MINGW64_NT-* | MSYS_NT-*)
     Windows=yes
     NORMALIZE_PATH="cygpath -au"
     ;;
@@ -45,8 +55,14 @@ esac
 
 if [ "${Windows}" = "yes" ]; then
   EXESUFFIX=.exe
+  DLLSUFFIX=.dll
 else
   EXESUFFIX=
+  if [ "${CONFIG_UNAME}" = "Darwin" ]; then
+    DLLSUFFIX=.dylib
+  else
+    DLLSUFFIX=.so
+  fi
 fi
 
 quote () { printf %s\\n "$1" | sed "s/'/'\\\\''/g;1s/^/'/;\$s/\$/'/" ; }
@@ -57,7 +73,7 @@ setoption() {
   _val="${3#${_opt}}"
   if [ -z "${_val}" ]; then
     err "Option requires value: ${_opt}"
-  elif [ ! -z "$(eval "\$${_var}")" ]; then
+  elif [ -n "$(eval "echo \$${_var}")" ]; then
     err "Repeated option ${_opt}=${_val}"
   else
     eval "${_var}=$(quote "${_val}")"
@@ -78,11 +94,29 @@ while [ $# != 0 ]; do
     --scheme=*)
       setoption "SCHEME" "--scheme=" "$1"
       ;;
+    CC=*)
+      setoption "MYCC" "CC=" "$1"
+      ;;
+    CPPFLAGS=*)
+      setoption "MYCPPFLAGS" "CPPFLAGS=" "$1"
+      ;;
+    CFLAGS=*)
+      setoption "MYCFLAGS" "CFLAGS=" "$1"
+      ;;
+    LDFLAGS=*)
+      setoption "MYLDFLAGS" "LDFLAGS=" "$1"
+      ;;
     *)
       err "Unrecognized option ${1}"
   esac
   shift
 done
+
+: "${PREFIX:=/usr/local}"
+: "${MYCC:=${CC:-gcc}}"
+: "${MYCPPFLAGS:=${CPPFLAGS:-}}"
+: "${MYCFLAGS:=${CFLAGS:-}}"
+: "${MYLDFLAGS:=${LDFLAGS:-}}"
 
 deref() { eval printf '%s' "$(printf '"%s"' "\$$1")"; }
 weak_tilde_expansion() { printf %s\\n "$1" | sed "s_^~/_${HOME}/_" ; }
@@ -106,18 +140,17 @@ resolve() {
 
 
 if [ "${Windows}" = "yes" ]; then
-  resolve "PYTHON" "--python=" "/cygdrive/c/Python27/python.exe"
+  resolve "PYTHON" "--python=" "${FSROOT}/c/Python27/python.exe"
 else
   resolve "PYTHON" "--python=" "python2.7"
 fi
 resolve "SCHEME" "--scheme=" "scheme"
 
 if no_errors; then
+  SCHEME="$(realpath "${SCHEME}")"
   if [ "${Windows}" = "yes" ]; then
-    SCHEME="$(cygpath -au "${SCHEME}")"
-    PYTHON="$(cygpath -aw "${PYTHON}")"
     set +e
-    ACTUAL="$(cmd /A /E:OFF /F:OFF /V:OFF /D /S /C "${PYTHON}" -c "import sys; print sys.version_info.major, sys.version_info.minor, sys.platform;" 2>&1)"
+    ACTUAL="$("${PYTHON}" -c "import sys; print sys.version_info.major, sys.version_info.minor, sys.platform;" 2>&1)"
     case "${ACTUAL}" in
       2\ 7\ win*)
       set -e
@@ -128,12 +161,11 @@ if no_errors; then
       err "Got: ${ACTUAL}"
       ;;
     esac
-  else
-    SCHEME="$(realpath -s "${SCHEME}")"
+    PYTHON="$(cygpath -aw "${PYTHON}")"
   fi
 fi
 
-if [ ! -z "${PREFIX}" ]; then
+if [ -n "${PREFIX}" ]; then
   # use absolute path, after limited tilde expansion, since "make install"
   # runs in src/swish where a relative path would cause confusion
   PREFIX="$(realpath -m "$(weak_tilde_expansion "${PREFIX}")")"
@@ -160,6 +192,10 @@ if [ "${help}" = "yes" ]; then
   echo " --prefix=<pathname>  install directory base (${PREFIX})"
   echo " --python=<pathname>  python 2.7 executable for libuv build (${PYTHON})"
   echo " --scheme=<pathname>  Chez Scheme executable (${SCHEME})"
+  echo " CC=<C compiler name>             optional C compiler name (${MYCC})"
+  echo " CPPFLAGS=<C preprocessor flags>  additional C preprocessor flags (${MYCPPFLAGS})"
+  echo " CFLAGS=<C compiler flags>        additional C compiler flags (${MYCFLAGS})"
+  echo " LDFLAGS=<linker flags>           additional linker flags (${MYLDFLAGS})"
   checkerrs
   exit 0
 fi
@@ -183,9 +219,9 @@ try_custom() {
       # be ./bin/swish.exe, so insert absolute Windows path to the directory
       # containing scheme.exe in place of %x.
       _bindir="$(cygpath -w "${_bindir}")"
-      SCHEMEHEAPDIRS="${_bindir};${_bindir}\\..\\boot\\%m;"
+      SCHEMEHEAPDIRS="${_bindir};${_bindir}\\..\\..\\boot\\%m;${_bindir}\\..\\lib\\csv%v\\%m"
     else
-      SCHEMEHEAPDIRS="$(realpath "${_bindir}/../boot")/%m:"
+      SCHEMEHEAPDIRS="$(realpath "${_bindir}/../../boot")/%m:$(realpath "${_bindir}/../lib")"/csv%v/%m
     fi
     CUSTOMHEAPDIRS="${SCHEMEHEAPDIRS}"
   fi
@@ -203,45 +239,6 @@ noscheme() {
   fi
   checkerrs
 }
-
-# find .lib file and .dll for Windows build; ensure .dll is in PATH
-if [ "${Windows}" = "yes" ]; then
-  SchemeLib="$(find "$(dirname "${SCHEME}")" -type f -name 'csv*.lib' | head -1)"
-  if [ -z "${SchemeLib}" ]; then
-    err "Cannot find csv*.lib for ${SCHEME}."
-    checkerrs
-  fi
-  SchemeDLL="$(find "$(dirname "${SCHEME}")" -type f -name 'csv*.dll' | head -1)"
-  if [ -z "${SchemeDLL}" ]; then
-    err "Cannot find csv*.dll for ${SCHEME}."
-    checkerrs
-  fi
-  set +e
-  DLLNAME="$(basename "${SchemeDLL}")"
-  DLLFOUND="$(command -v "${DLLNAME}")"
-  if [ "${DLLFOUND}" != "${SchemeDLL}" ]; then
-    # try_custom since we likely need to set SCHEMEHEAPDIRS
-    set +e
-    try_custom
-    set -e
-    CUSTOMPATH="$(dirname "${SchemeDLL}")"
-    export PATH
-    PATH="${CUSTOMPATH}:${PATH}"
-    if [ -z "${DLLFOUND}" ]; then
-      echo "* ${DLLNAME} is not in PATH; building with custom PATH"
-    else
-      echo "* found another ${DLLNAME} in PATH; building with custom PATH"
-    fi
-    echo ""
-    echo "  To run swish applications, either set"
-    echo "    PATH=\"${CUSTOMPATH}:\${PATH}\""
-    echo "  or"
-    echo "    copy ${DLLNAME} to the directory containing"
-    echo "    the swish executable"
-    echo ""
-  fi
-  set -e
-fi
 
 # try to determine machine type, setting custom SCHEMEHEAPDIRS if necessary
 set +e
@@ -299,12 +296,57 @@ find_boot_file() {
 # try to find boot file, setting custom SCHEMEHEAPDIRS if necessary
 find_boot_file || try_custom || find_boot_file
 
+# find .lib file and .dll for Windows build; ensure .dll is in PATH
+if [ "${Windows}" = "yes" ]; then
+  SchemeLibPrefix="$(echo '(printf "csv~{~a~}" (call-with-values scheme-version-number list))' | "${SCHEME}" -q)"
+  SchemeLib="$(find "$(dirname "${SCHEME}")" -type f -name "${SchemeLibPrefix}.lib" | head -1)"
+  if [ -z "${SchemeLib}" ]; then
+    err "Cannot find ${SchemeLibPrefix}.lib for ${SCHEME}."
+    checkerrs
+  fi
+  SCHEME_LIBPATH="$(dirname "${SchemeLib}")"
+  SCHEME_LIBPATH="$(cygpath -w "${SCHEME_LIBPATH}")"
+
+  SchemeDLL="$(find "$(dirname "${SCHEME}")" -type f -name "${SchemeLibPrefix}.dll" | head -1)"
+  if [ -z "${SchemeDLL}" ]; then
+    err "Cannot find ${SchemeLibPrefix}.dll for ${SCHEME}."
+    checkerrs
+  fi
+  set +e
+  DLLNAME="$(basename "${SchemeDLL}")"
+  DLLFOUND="$(command -v "${DLLNAME}")"
+  if [ "${DLLFOUND}" != "${SchemeDLL}" ]; then
+    # try_custom since we likely need to set SCHEMEHEAPDIRS
+    set +e
+    try_custom
+    set -e
+    CUSTOMPATH="$(dirname "${SchemeDLL}")"
+    export PATH
+    PATH="${CUSTOMPATH}:${PATH}"
+    if [ -z "${DLLFOUND}" ]; then
+      echo "* ${DLLNAME} is not in PATH; building with custom PATH"
+    else
+      echo "* found another ${DLLNAME} in PATH; building with custom PATH"
+    fi
+    echo ""
+    echo "  To run swish applications, either set"
+    echo "    PATH=\"${CUSTOMPATH}:\${PATH}\""
+    echo "  or"
+    echo "    copy ${DLLNAME} to the directory containing"
+    echo "    the swish executable"
+    echo ""
+  fi
+  set -e
+else
+  SCHEME_LIBPATH="$(dirname "${PETITE_BOOT}")"
+fi
+
 # In cygwin, this is already a Windows path as needed by Mf-a6nt and Mf-i3nt.
 SchemeInclude="$(dirname "${PETITE_BOOT}")"
 
 check_missing() {
   if [ ! -f "$2/$1" ]; then
-    err "Missing $1 at ${SchemeInclude}"
+    err "Missing $1 at $2"
     checkerrs
   fi
 }
@@ -317,45 +359,141 @@ else
   check_missing "kernel.o" "${SchemeInclude}"
 fi
 
-SWISH_VERSION=$(cd src; "${SCHEME}" --script get-software-info software-version)
+SWISH_VERSION=$(sed -n 's/^#define SWISH_VERSION \([0-9a-z."]*\)/\1/p' src/swish/swish.h)
 
 escape_backslash() { printf "%s" "$1" | sed 's_\\_\\\\_g' ; }
+ADD_TO=
 add() {
   if [ "$1" = '-t' ]; then
     shift;
-    printf "\\t%s\\n" "$@" >> src/swish/Makefile
+    printf "\\t%s\\n" "$@" >> "${ADD_TO}"
   else
-    printf %s\\n "$@" >> src/swish/Makefile
+    printf %s\\n "$@" >> "${ADD_TO}"
   fi
 }
-rm -f src/swish/Makefile
-add "# DO NOT EDIT this file"
-add "# Instead, edit Makefile.in and re-run configure"
-add ""
-add "BASE_MACHINE_TYPE:=${BASE_MACHINE_TYPE}"
+
+set_output() {
+  COMMENT="$1"
+  ADD_TO="$2"
+  rm -f "${ADD_TO}"
+  add "${COMMENT} DO NOT EDIT this file"
+  add "${COMMENT} automatically generated by top-level configure script"
+  add ""
+}
+
+BASE="$(git rev-parse --show-toplevel)"
+
+SWISH_INCLUDE="${BASE}/src/swish"
+SWISH_LIBPATH="${BASE}/build/release/bin"
+LIBUV_INCLUDE="${BASE}/libuv/include"
+case "${CONFIG_UNAME}" in
+  CYGWIN_NT-* | MINGW64_NT-* | MSYS_NT-*)
+    UvLib=libuv/Release
+    ;;
+  Darwin)
+    UvLib=libuv/build/Release
+    ;;
+  *)
+    UvLib=libuv/out/Release/obj.target
+    ;;
+esac
+LIBUV_LIBPATH="${BASE}/${UvLib}"
+if [ "${Windows}" = "yes" ]; then
+    SCHEME="$(cygpath -au "${SCHEME}")"
+    SWISH_INCLUDE="$(cygpath -aw "${SWISH_INCLUDE}")"
+    SWISH_LIBPATH="$(cygpath -aw "${SWISH_LIBPATH}")"
+    LIBUV_INCLUDE="$(cygpath -aw "${LIBUV_INCLUDE}")"
+    LIBUV_LIBPATH="$(cygpath -aw "${LIBUV_LIBPATH}")"
+fi
+
+set_output "#" src/swish/sh-config
+add "export SCHEME='${SCHEME}'"
+if [ -n "${SCHEMEHEAPDIRS:-}" ]; then
+  add "export SCHEMEHEAPDIRS='${SCHEMEHEAPDIRS}'"
+fi
+if [ "${Windows}" = "yes" ]; then
+  add "export SCHEME_WIN='$(cygpath -aw "${SCHEME}")'"
+  add "export PATH='${PATH}'"
+fi
+
+set_output "#" src/swish/Mf-config
 add "EXESUFFIX:=${EXESUFFIX}"
+add "DLLSUFFIX:=${DLLSUFFIX}"
 add "INSTALLROOT:=${PREFIX}"
+add "BASE_MACHINE_TYPE:=${BASE_MACHINE_TYPE}"
 add "MACHINE_TYPE:=${MACHINE_TYPE}"
 add "PYTHON:=${PYTHON}"
 add "SCHEME:=${SCHEME}"
+if [ -n "${SCHEMEHEAPDIRS:-}" ]; then
+  add "SCHEMEHEAPDIRS:=${SCHEMEHEAPDIRS:-}"
+fi
+add "SCHEME_INCLUDE:=${SchemeInclude}"
+add "SCHEME_LIBPATH:=${SCHEME_LIBPATH}"
+if [ "${Windows}" = "yes" ]; then
+  add "SCHEME_LIB_PREFIX:=${SchemeLibPrefix}"
+  add "SCHEME_REVISION_PATH:=$(cygpath -u "${SchemeInclude}")"
+else
+  add "SCHEME_REVISION_PATH:=${SchemeInclude}"
+fi
+add "SWISH_INCLUDE:=${SWISH_INCLUDE}"
+add "SWISH_LIBPATH:=${SWISH_LIBPATH}"
 add "SWISH_VERSION:=${SWISH_VERSION}"
-add "SchemeInclude:=${SchemeInclude}"
+add "LIBUV_INCLUDE:=${LIBUV_INCLUDE}"
+add "LIBUV_LIBPATH:=${LIBUV_LIBPATH}"
 add "NORMALIZE_PATH:=${NORMALIZE_PATH}"
 if [ "${CONFIG_UNAME}" = "Darwin" ]; then
   add "GNU_INSTALL:=ginstall"
 else
   add "GNU_INSTALL:=install"
 fi
+
+set_output ";;" src/osi-bootstrap.ss
 if [ "${Windows}" = "yes" ]; then
-  add "SchemeLib:=$(cygpath -w "${SchemeLib:-}")"
-  if [ ! -z "${CUSTOMPATH}" ]; then
-    add "export PATH = ${PATH}"
+  ROOT="$(cygpath -am "${BASE}")"
+else
+  ROOT="$(realpath -m "${BASE}")"
+fi
+add "(let ()"
+add "  (define (path-combine . paths) (format \"~{~a~^/~}\" paths))"
+add "  (define dir"
+add "    (path-combine \"${ROOT}\""
+add "      (if (equal? \"yes\" (getenv \"PROFILE_MATS\"))"
+add "          \"build/profile\""
+add "          \"build/release\")"
+add "      \"bin\"))"
+if [ "${Windows}" = "yes" ]; then
+add "  (load-shared-object (path-combine dir \"libuv${DLLSUFFIX}\"))"
+add "  (load-shared-object (path-combine dir \"sqlite3${DLLSUFFIX}\"))"
+add "  (load-shared-object (path-combine dir \"osi${DLLSUFFIX}\"))"
+else
+add "  (load-shared-object (path-combine dir \"libosi${DLLSUFFIX}\"))"
+fi
+add ")"
+
+set_output "#" src/swish/Makefile
+add "CC:=${MYCC}"
+add "CPPFLAGS:=${MYCPPFLAGS}"
+add "CFLAGS:=${MYCFLAGS}"
+add "LDFLAGS:=${MYLDFLAGS}"
+if [ "${Windows}" = "yes" ]; then
+  if [ -n "${CUSTOMPATH}" ]; then
+    case "${CONFIG_UNAME}" in
+      MINGW64_NT-* | MSYS_NT-*)
+        add "export PATH=$(cygpath -pw "${PATH}")"
+        ;;
+      *)
+        add "export PATH=${PATH}"
+        ;;
+    esac
   fi
 fi
-if [ ! -z "${SCHEMEHEAPDIRS:-}" ]; then
+if [ -n "${SCHEMEHEAPDIRS:-}" ]; then
    add "export SCHEMEHEAPDIRS = ${SCHEMEHEAPDIRS}"
 fi
-if [ ! -z "${CUSTOMPATH}${CUSTOMHEAPDIRS}" ]; then
+add ""
+add "UvInclude=../../libuv/include"
+add "UvLib=../../${UvLib}"
+if [ -n "${CUSTOMPATH}${CUSTOMHEAPDIRS}" ]; then
   echo "* $(basename "$0") set these environment variables in src/swish/Makefile:"
   add ""
   add ".PHONY: reminders"
@@ -363,11 +501,11 @@ if [ ! -z "${CUSTOMPATH}${CUSTOMHEAPDIRS}" ]; then
   add "reminders:"
   add -t "@echo \"----------------------------------------------------\""
   add -t "@echo \"You may need to set the following environment variables:\""
-  if [ ! -z "${CUSTOMPATH}" ]; then
+  if [ -n "${CUSTOMPATH}" ]; then
     echo "  PATH=\"${CUSTOMPATH}:\${PATH}\""
     add -t "@echo ' export PATH=\"$(escape_backslash "${CUSTOMPATH}"):\$\${PATH}\"'"
   fi
-  if [ ! -z "${CUSTOMHEAPDIRS}" ]; then
+  if [ -n "${CUSTOMHEAPDIRS}" ]; then
     echo "  SCHEMEHEAPDIRS=\"${SCHEMEHEAPDIRS}\""
     add -t "@echo \" export SCHEMEHEAPDIRS=\\\"$(escape_backslash "${CUSTOMHEAPDIRS}")\\\"\""
   fi
@@ -380,6 +518,11 @@ add "else"
 add "BUILD:=build/release"
 add "endif"
 add ""
+add "include Mf-config"
 add "include Mf-${BASE_MACHINE_TYPE}"
-add ""
-cat src/swish/Makefile.in >> src/swish/Makefile
+add "include Mf-base"
+
+git submodule update --init
+if [ ! -d libuv/build/gyp ]; then
+    git clone --depth 1 https://github.com/chromium/gyp.git libuv/build/gyp
+fi

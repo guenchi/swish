@@ -54,6 +54,7 @@
    osi_get_ip_address*
    osi_get_last_insert_rowid
    osi_get_last_insert_rowid*
+   osi_get_pid
    osi_get_real_path
    osi_get_real_path*
    osi_get_sqlite_status
@@ -64,16 +65,13 @@
    osi_get_statement_columns*
    osi_get_statement_expanded_sql
    osi_get_statement_expanded_sql*
-   osi_get_statement_sql
-   osi_get_statement_sql*
-   osi_get_stdin
    osi_get_tcp_listener_port
    osi_get_tcp_listener_port*
    osi_get_temp_directory
    osi_get_temp_directory*
    osi_get_time
    osi_interrupt_database
-   osi_is_tick_over
+   osi_is_quantum_over
    osi_kill
    osi_kill*
    osi_list_directory
@@ -87,6 +85,8 @@
    osi_make_uuid*
    osi_open_database
    osi_open_database*
+   osi_open_fd
+   osi_open_fd*
    osi_open_file
    osi_open_file*
    osi_prepare_statement
@@ -99,7 +99,11 @@
    osi_rename*
    osi_reset_statement
    osi_reset_statement*
-   osi_set_tick
+   osi_set_quantum
+   osi_start_signal
+   osi_start_signal*
+   osi_stop_signal
+   osi_stop_signal*
    osi_spawn
    osi_spawn*
    osi_step_statement
@@ -115,22 +119,7 @@
    )
   (import (chezscheme))
 
-  (define _init_
-    (begin
-      (unless (foreign-entry? "osi_init")
-        (let ([build-type
-               (if (equal? (getenv "PROFILE_MATS") "yes")
-                   "profile"
-                   "release")])
-          (meta-cond
-           [(memq (machine-type) '(a6le ta6le i3le ti3le arm32le))
-            (load-shared-object (format "../build/~a/bin/libosi.so" build-type))]
-           [(memq (machine-type) '(a6nt ta6nt i3nt ti3nt))
-            (load-shared-object (format "..\\build\\~a\\bin\\osi.dll" build-type))]
-           [(memq (machine-type) '(a6osx ta6osx i3osx ti3osx))
-            (load-shared-object (format "../build/~a/bin/libosi.dylib" build-type))]
-           [else (error #f "Unsupported machine type")])))
-      ((foreign-procedure "osi_init" () void))))
+  (define _init_ ((foreign-procedure "osi_init" () void)))
 
   (define-syntax fdefine
     (syntax-rules ()
@@ -162,11 +151,14 @@
   (fdefine osi_get_error_text (err int) string)
   (define-osi osi_get_hostname)
   (fdefine osi_get_hrtime unsigned-64)
+  (fdefine osi_get_pid int)
   (fdefine osi_get_time unsigned-64)
-  (fdefine osi_is_tick_over boolean)
+  (fdefine osi_is_quantum_over boolean)
   (fdefine osi_list_uv_handles ptr)
   (define-osi osi_make_uuid)
-  (fdefine osi_set_tick (nanoseconds unsigned-64) void)
+  (fdefine osi_set_quantum (nanoseconds unsigned-64) void)
+  (define-osi osi_start_signal (signum int))
+  (define-osi osi_stop_signal (handler uptr))
 
   ;; Ports
   (define-osi osi_read_port (port uptr) (buffer ptr) (start-index size_t) (size unsigned-32) (offset integer-64) (callback ptr))
@@ -179,11 +171,11 @@
   (define-osi osi_kill (pid int) (signum int))
 
   ;; File System
+  (define-osi osi_open_fd (fd int) (close? boolean))
   (define-osi osi_open_file (path string) (flags int) (mode int) (callback ptr))
   (define-osi osi_get_executable_path)
   (define-osi osi_get_file_size (port uptr) (callback ptr))
   (define-osi osi_get_real_path (path string) (callback ptr))
-  (fdefine osi_get_stdin uptr)
   (define-osi osi_get_temp_directory)
   (define-osi osi_chmod (path string) (mode int) (callback ptr))
   (define-osi osi_make_directory (path string) (mode int) (callback ptr))
@@ -256,7 +248,6 @@
   (define-osi osi_get_last_insert_rowid (database uptr))
   (define-osi osi_get_statement_columns (statement uptr))
   (define-osi osi_get_statement_expanded_sql (statement uptr))
-  (define-osi osi_get_statement_sql (statement uptr))
   (define-osi osi_reset_statement (statement uptr))
   (define-osi osi_step_statement (statement uptr) (callback ptr))
   (fdefine osi_interrupt_database (database uptr) void)

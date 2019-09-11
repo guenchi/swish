@@ -1,44 +1,36 @@
-UvInclude=../../libuv/include
-UvLib=../../libuv/out/Release/obj.target
-C = gcc -std=gnu99 -fPIC -Wall -Wextra -Werror -O2
-OsiObj=osi.o sqlite.o sqlite3.o
+C = ${CC} -std=gnu99 -fPIC -Wall -Wextra -Werror -O2 ${CPPFLAGS} ${CFLAGS} ${LDFLAGS}
+OsiObj=osi.o sha1.o sqlite.o sqlite3.o
 SystemLibs=-lm -ldl -lncurses -luuid -lpthread
 SwishLibs := ../../${BUILD}/bin/libosi.so ../../${BUILD}/lib/swish_kernel.o
-
-clibs: ${SwishLibs}
 
 ../../${BUILD}/bin/swish: main.o ../../${BUILD}/lib/swish_kernel.o
 	$C -o $@ $^ -Wl,-E ${SystemLibs}
 
 ../../${BUILD}/bin/libosi.so: ${OsiObj} ${UvLib}/libuv.a
-	$C -shared -L${UvLib} -o ../../${BUILD}/bin/libosi.so ${OsiObj} -luv -luuid -lpthread
+	$C -shared -L"${LIBUV_LIBPATH}" -o ../../${BUILD}/bin/libosi.so ${OsiObj} -luv -luuid -lpthread
 
 ../../${BUILD}/lib/swish_kernel.o: ${UvLib}/libuv.a run.o ${OsiObj}
-	ld -r -X -o $@ run.o ${OsiObj} "${SchemeInclude}"/kernel.o ${UvLib}/libuv.a
+	ld -r -X -o $@ run.o ${OsiObj} "${SCHEME_LIBPATH}"/kernel.o -L"${LIBUV_LIBPATH}" -luv
 
-%.o: %.c osi.h ${UvInclude}
-	$C -I"${SchemeInclude}" -I${UvInclude} -c $<
+%.o: %.c osi.h swish.h ${UvInclude}
+	$C -I"${SCHEME_INCLUDE}" -I"${LIBUV_INCLUDE}" -c $<
 
 sqlite3.o: sqlite3.h sqlite3.c
-	$C -DSQLITE_ENABLE_JSON1 -DSQLITE_THREADSAFE=2 -c sqlite3.c
-
-io-constants: io-constants.c ${UvInclude}
-	$C -I${UvInclude} io-constants.c -o io-constants
+	$C -DSQLITE_ENABLE_JSON1 -DSQLITE_THREADSAFE=2 -DSQLITE_USE_URI=1 -c sqlite3.c
 
 ${UvLib}/libuv.a: ${UvInclude}
 	  cd ../../libuv; "${PYTHON}" gyp_uv.py -Duv_library=static_library -Dtarget_arch="arm" -f make
 	  BUILDTYPE=Release CFLAGS="-fPIC" make -C ../../libuv/out
 
+io-constants: io-constants.c ${UvInclude}
+	$C -I"${LIBUV_INCLUDE}" io-constants.c -o io-constants
+
+SHLIBTEST := shlibtest.so
+${SHLIBTEST}: shlibtest.c
+	$C -shared -o $@ $^ -I"${LIBUV_INCLUDE}" -I"${SCHEME_INCLUDE}" -I"${SWISH_INCLUDE}"
+
 platform-clean:
-	rm -f osi.o sqlite.o io-constants io-constants.ss
-	rm -f swish main.o run.o swish.boot
-	rm -f ${SwishLibs}
-	rm -f ../../${BUILD}/bin/swish
-	rm -f ../../${BUILD}/bin/swish.boot
-	rm -f ../../${BUILD}/bin/swish.library
-	rm -f ../../${BUILD}/bin/swish.wpo
-	rm -f ../../${BUILD}/lib/swish/*.so
-	rm -f ../../${BUILD}/lib/swish/*.wpo
+	rm -f main.o osi.o run.o sha1.o sqlite.o
 
 pristine: clean
 	rm -rf sqlite3.o ../../libuv/out/Release

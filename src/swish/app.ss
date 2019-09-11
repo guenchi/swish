@@ -23,18 +23,19 @@
 #!chezscheme
 (library (swish app)
   (export
-   app-exception-handler
+   $init-main-sup
    app-sup-spec
-   app:name
    app:resume
    app:shutdown
    app:start
    app:suspend
-   init-main-sup
    make-swish-sup-spec
+   swish-start
    )
   (import
    (chezscheme)
+   (swish app-core)
+   (swish app-io)
    (swish application)
    (swish cli)
    (swish erlang)
@@ -51,14 +52,7 @@
    (swish supervisor)
    )
 
-  (define app:name
-    (make-parameter #f
-      (lambda (x)
-        (unless (or (not x) (string? x))
-          (bad-arg 'app:name x))
-        (and x (path-root (path-last x))))))
-
-  (define (app:start) (application:start init-main-sup))
+  (define (app:start) (application:start $init-main-sup))
 
   (alias app:shutdown application:shutdown)
 
@@ -66,7 +60,7 @@
 
   (alias app:resume statistics:resume)
 
-  (define (init-main-sup)
+  (define ($init-main-sup)
     ;; When one process at this level crashes, we want the supervisor
     ;; to shutdown which only happens during restart. Thus, each
     ;; process is marked permanent and the restart intensity is 0.
@@ -105,106 +99,82 @@
          (when reason (raise reason)))
        x)))
 
-  (define (set-random-seed)
-    (random-seed (+ (remainder (erlang:now) (- (ash 1 32) 1)) 1)))
-
   (define cli
     (cli-specs
      default-help
-     ["verbose" --verbose bool "trace boot file search"]
-     ["version" --version bool "print version information"]
-     ["quiet" -q bool "suppress startup message and prompt string"]
-     ["args" -- (list . "arg") "remaining arguments are files to load"]
-     ["files" (list . "file") "execute file with remaining arguments"]))
+     [verbose --verbose bool "trace boot file search"]
+     [version --version bool "print version information"]
+     [quiet -q bool "suppress startup message and prompt string"]
+     [args -- (list . "arg") "remaining arguments are files to load"]
+     [files (list . "file") "execute file with remaining arguments"]))
+
+  (define (try-import)
+    ;; Try to import the available swish libraries, since that is convenient for
+    ;; interactive use and for quick one-off scripts.
+    ;;
+    ;; We guard against the possibility that the libraries are present but not
+    ;; visible, which can happen if a stand-alone program is compiled without
+    ;; --libs-visible and invokes the swish-start exported by this library.
+    ;;
+    ;; Since a stand-alone program might include a subset of the swish
+    ;; libraries, we consult library-list rather than trying to directly import
+    ;; (swish imports), which may not be available at run time, as it has no
+    ;; exports of its own.
+    (for-each
+     (lambda (library)
+       (match library
+         [(swish . ,_) (catch (eval `(import ,library)))]
+         [,_ #f]))
+     (library-list)))
+
+  (define (print-banner revision)
+    (let-values ([(name version)
+                  (cond
+                   [(software-product-name) =>
+                    (lambda (name)
+                      (values name (software-version)))]
+                   [else
+                    (values
+                     (software-product-name 'swish)
+                     (software-version 'swish))])])
+      (printf "~a~@[ Version ~a~]~@[ (~a)~]\n" name version revision)))
 
   (define (run)
-    (eval '(import (swish imports)))
     (let* ([opt (parse-command-line-arguments cli)]
-           [files (or (opt "files") '())])
-      (when (opt "quiet") (waiter-prompt-string ""))
+           [files (or (opt 'files) '())])
       (cond
-       [(opt "help")
+       [(opt 'help)
         (display-help (path-last (osi_get_executable_path)) cli (opt))
         (values)]
-       [(opt "version")
-        (printf "~a (~a)\n" (swish-version) (software-revision 'swish))
+       [(opt 'version)
+        (print-banner (software-revision))
         (values)]
        [(null? files)                   ; repl
-        (app:name #f)
-        (let ([filenames (or (opt "args") '())])
-          (unless (opt "quiet")
-            (printf "\n~a Version ~a\n" software-product-name software-version)
+        (let ([filenames (or (opt 'args) '())])
+          (unless (opt 'quiet)
+            (print-banner #f)
             (flush-output-port))
-          (hook-console-input)
-          (set-random-seed)
-          (for-each load filenames)
-          (new-cafe))]
+          (try-import)
+          (parameterize ([waiter-prompt-string (if (opt 'quiet) "" ">")])
+            (for-each load filenames)
+            (new-cafe)))]
        [else                            ; script
-        (let ([script-file (car files)])
-          (command-line (command-line-arguments))
-          (command-line-arguments (cdr (command-line)))
-          (app:name script-file)
-          (set-random-seed)
-          ;; use exit handler installed by the script, if any
-          (match (catch (load script-file))
-            [#(EXIT ,reason)
-             (app-exception-handler reason)
-             ((exit-handler) 1)]
-            [,_ ((exit-handler))]))])))
+        (let ([script-file (car files)]
+              [cmdline (command-line-arguments)])
+          (parameterize ([command-line cmdline]
+                         [command-line-arguments (cdr cmdline)]
+                         [app:name script-file]
+                         [app:path script-file]
+                         [app:config #f])
+            (try-import)
+            ;; use exit handler installed by the script, if any
+            (match (catch (load script-file))
+              [#(EXIT ,reason)
+               (app-exception-handler reason)
+               (exit 1)]
+              [,_ (exit)])))])))
 
-    (define (int32? x) (and (or (fixnum? x) (bignum? x)) (<= #x-7FFFFFFF x #x7FFFFFFF)))
-    (define (->exit-status exit-code)
-      (cond
-       [(int32? exit-code) exit-code]
-       [(eq? exit-code (void)) 0]
-       [else
-        (console-event-handler (format "application shutdown due to (exit ~s)" exit-code))
-        1]))
-    (define quit
-      (case-lambda
-       [() (quit 0)]
-       [(exit-code . _)
-        (app:shutdown (->exit-status exit-code))
-        (receive)]))
+  (define (swish-start . args)
+    ($swish-start #f args run))
 
-  (define (claim-exception who c)
-    (define stderr (console-error-port))
-    (define (fmt-condition c)
-      (let ([os (open-output-string)])
-        (cond
-         [(condition? c)
-          (display-condition (condition (make-who-condition #f) c) os)
-          (display (pregexp-replace "^(Warning|Exception): " (get-output-string os) "") os)]
-         [else (display (exit-reason->english c) os)])
-        (display "." os)
-        (get-output-string os)))
-    (fprintf stderr "~a: " who)
-    (match (catch (fmt-condition c))
-      [#(EXIT ,_) (display-condition c stderr)]
-      [,s (display s stderr)])
-    (fresh-line stderr)
-    (reset))
-
-  (define (app-exception-handler c)
-    (cond
-     [(app:name) => (lambda (who) (claim-exception who c))]
-     [else (default-exception-handler c)]))
-
-  (define swish-start
-   (lambda args
-     (let* ([argv (osi_get_argv)]
-            [who (if (= 0 (vector-length argv)) "scheme" (vector-ref argv 0))])
-       (command-line (cons who args))
-       (command-line-arguments args)
-       (with-exception-handler app-exception-handler
-         (lambda ()
-           (call-with-values run quit))))))
-
-  (suppress-greeting #t)
-
-  (scheme-start
-   (lambda args
-     (exit-handler quit)
-     (scheme-start swish-start)
-     (apply swish-start args)))
   )

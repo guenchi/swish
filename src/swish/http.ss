@@ -24,10 +24,14 @@
 (library (swish http)
   (export
    <request>
+   http-content-limit
+   http-header-limit
    http-port-number
+   http-request-limit
    http-sup:start&link
    http:find-header
    http:find-param
+   http:get-content-length
    http:get-header
    http:get-param
    http:get-port-number
@@ -57,10 +61,33 @@
    (swish watcher)
    )
 
-  (define request-limit 4096)
-  (define header-limit 1048576)
-  (define content-limit 4194304)
-  (define http-port-number (make-parameter #f))
+  (define http-port-number
+    (make-parameter #f
+      (lambda (x)
+        (unless (or (not x) (and (fixnum? x) (fx<= 0 x 65535)))
+          (bad-arg 'http-port-number x))
+        x)))
+
+  (define http-request-limit
+    (make-parameter 4096
+      (lambda (x)
+        (unless (and (fixnum? x) (fx> x 0))
+          (bad-arg 'http-request-limit x))
+        x)))
+
+  (define http-header-limit
+    (make-parameter 1048576
+      (lambda (x)
+        (unless (and (fixnum? x) (fx> x 0))
+          (bad-arg 'http-header-limit x))
+        x)))
+
+  (define http-content-limit
+    (make-parameter 4194304
+      (lambda (x)
+        (unless (and (fixnum? x) (fx> x 0))
+          (bad-arg 'http-content-limit x))
+        x)))
 
   (define (http-sup:start&link)
     (if (not (http-port-number))
@@ -134,17 +161,17 @@
           state
           (let ([state (load-watchers state)])
             ($state copy [mime-types (read-mime-types)]))))
-    (define (url->abs-paths path)
-      (map
-       (lambda (x) (path-combine (web-dir) x))
-       (cond
-        [(char=? (string-ref path (- (string-length path) 1)) #\/)
-         (list (string-append path "index.ss"))]
-        [(string=? (path-extension path) "")
-         (list path
-           (string-append path ".ss")
-           (path-combine path "index.ss"))]
-        [else (list path)])))
+    (define (url->abs-paths path) ;; path starts with "/"
+      (let ([path (path-combine (web-dir)
+                    (substring path 1 (string-length path)))])
+        (cond
+         [(directory-separator? (string-ref path (- (string-length path) 1)))
+          (list (string-append path "index.ss"))]
+         [(string=? (path-extension path) "")
+          (list path
+            (string-append path ".ss")
+            (path-combine path "index.ss"))]
+         [else (list path)])))
     (define (lookup-handler pages paths)
       (exists (lambda (path) (ht:ref pages path #f)) paths))
     (define (make-static-file-handler path)
@@ -311,13 +338,14 @@
          [else (lp s (fx+ e 1) n)]))))
 
   (define (bv-next-non-lws bv i)
-    (and (fx< i (bytevector-length bv))
-         (let ([c (bytevector-u8-ref bv i)])
-           (cond
-            [(or (fx= c (char->integer #\space))
-                 (fx= c (char->integer #\tab)))
-             (bv-next-non-lws bv (fx+ i 1))]
-            [else i]))))
+    (or (and (fx< i (bytevector-length bv))
+             (let ([c (bytevector-u8-ref bv i)])
+               (cond
+                [(or (fx= c (char->integer #\space))
+                     (fx= c (char->integer #\tab)))
+                 (bv-next-non-lws bv (fx+ i 1))]
+                [else i])))
+        i))
 
   (define (bv-extract-string bv start end)
     (let* ([len (fx- end start)]
@@ -398,45 +426,75 @@
             (http:read-header ip (fx- limit (bytevector-length line))))]
          [,_ (raise 'invalid-header)])]))
 
-  (define multipart/form-data-regexp
-    (pregexp "^multipart/form-data;\\s*boundary=(.+)$"))
+  (define (multipart/form-data-boundary type)
+    (match (pregexp-match (re "^multipart/form-data;\\s*boundary=(.+)$") type)
+      [(,_ ,boundary) boundary]
+      [#f #f]))
 
-  (define (http:get-content-params ip header)
+  (define (get-chunk! ip bv n)
+    (let ([count (get-bytevector-n! ip bv 0 n)])
+      (when (or (eof-object? count) (not (= count n)))
+        (raise 'unexpected-eof))))
+
+  (define (advance! ip ipos op opos)
+    (when ipos
+      (let ([remaining (- ipos (port-position ip))])
+        (when (< remaining 0)
+          (when (= opos (port-position op))
+            (internal-server-error op))
+          (raise 'http-violation))
+        (do ([n remaining (fx- n 1)] [b #f (get-u8 ip)])
+            ((fx= n 0)
+             (when (eof-object? b)
+               (raise 'unexpected-eof)))))))
+
+  (define (http:get-content-length header)
     (cond
      [(http:find-header "Content-Length" header) =>
       (lambda (x)
-        (let ([len (or (string->number x)
-                       (raise `#(invalid-content-length ,x)))]
-              [type (or (http:find-header "Content-Type" header) "none")])
-          (match (pregexp-match multipart/form-data-regexp type)
-            [(,_ ,boundary) ;; multipart/form-data
-             (parse-multipart/form-data ip (string-append "--" boundary))]
-            [#f
-             (when (> len content-limit)
-               (raise 'content-limit-exceeded))
-             (let* ([content (make-bytevector len)]
-                    [n (get-bytevector-n! ip content 0 len)])
-               (when (or (eof-object? n) (not (= n len)))
-                 (raise 'unexpected-eof))
-               (if (starts-with? type "application/x-www-form-urlencoded")
-                   (parse-encoded-kv content 0 len)
-                   `(("unhandled-content" . ,content))))])))]
-     [else '()]))
+        (unless (pregexp-match (re "^[0-9]+$") x)
+          (raise `#(invalid-content-length ,x)))
+        (string->number x))]
+     [else #f]))
+
+  (define (http:get-content-params&pos ip header)
+    (cond
+     [(http:get-content-length header) =>
+      (lambda (len)
+        (let ([type (or (http:find-header "Content-Type" header) "none")]
+              [pos (+ (port-position ip) len)])
+          (cond
+           [(multipart/form-data-boundary type) =>
+            (lambda (boundary)
+              (values
+               (parse-multipart/form-data ip (string-append "--" boundary))
+               pos))]
+           [(starts-with? type "application/x-www-form-urlencoded")
+            (when (> len (http-content-limit))
+              (raise 'content-limit-exceeded))
+            (let ([content (make-bytevector len)])
+              (get-chunk! ip content len)
+              (values (parse-encoded-kv content 0 len) pos))]
+           [else (values '() pos)])))]
+     [else (values '() #f)]))
 
   (define (http:handle-input ip op)
-    (let ([x (read-line ip request-limit)])
+    (let ([x (read-line ip (http-request-limit))])
       (cond
        [(eof-object? x) (raise 'normal)]
        [(http:parse-request x) =>
         (lambda (request)
           (match request
             [`(<request> ,query)
-             (let* ([header (http:read-header ip header-limit)]
-                    [params (http:get-content-params ip header)])
+             (define header (http:read-header ip (http-header-limit)))
+             (let-values ([(params ipos)
+                           (http:get-content-params&pos ip header)])
+               (define opos (port-position op))
                (on-exit (delete-tmp-files params)
                  (http:file-handler ip op request header
                    (append query params)))
                (when (keep-alive? header)
+                 (advance! ip ipos op opos)
                  (http:handle-input ip op)))]))]
        [else
         (raise `#(unhandled-input ,x))])))
@@ -585,11 +643,13 @@
         ,(wrap-3D-include path exprs))))
 
   (define (validate-path path)
-    (let ([first (path-first path)])
-      (cond
-       [(string=? first "") #t]
-       [(string=? first "..") #f]
-       [else (validate-path (path-rest path))])))
+    (and (string=? (path-first path) "/")
+         (let lp ([path (path-rest path)])
+           (let ([first (path-first path)])
+             (cond
+              [(string=? first "") #t]
+              [(string=? first "..") #f]
+              [else (lp (path-rest path))])))))
 
   (define (not-found op)
     (http:respond op 404 '()
@@ -609,7 +669,7 @@
           (meta (@ (charset "UTF-8")))
           (title "Internal server error"))
          (body
-          (h1 "The server encountered an unexpected condition which prevented it from fullfilling the request."))))))
+          (h1 "The server was unable to complete the request."))))))
 
   (define (http:file-handler ip op request header params)
     (<request> open request (method path))
@@ -684,7 +744,7 @@
           '()]
          [else (raise 'invalid-multipart-boundary)])))
     (define (parse-next limit)
-      (define header (http:read-header ip header-limit))
+      (define header (http:read-header ip (http-header-limit)))
       (define data
         (parse-form-data-disposition
          (http:get-header "Content-Disposition" header)))
@@ -703,7 +763,7 @@
                     (format "~36r.tmp"
                       (bytevector-uint-ref (osi_make_uuid) 0 'little 16))))]
              [op (parameterize ([custom-port-buffer-size (ash 1 16)])
-                   (open-file fn (+ O_WRONLY O_CREAT) #o666 'binary-output))])
+                   (open-binary-file-to-write fn))])
         (match (catch
                 (copy-until-match ip op #f)
                 (close-port op)
@@ -718,17 +778,15 @@
         [(= i (bytevector-length bv))]
       (unless (eqv? (next-u8 ip) (bytevector-u8-ref bv i))
         (raise 'invalid-multipart-boundary)))
-    (parse-end content-limit))
-
-  (define form-data-regexp (pregexp "^form-data;\\s*(.*)$"))
-  (define key-value-regexp (pregexp "^([^=]+)=\"([^\"]*)\"(?:;\\s*(.*))?$"))
+    (parse-end (http-content-limit)))
 
   (define (parse-form-data-disposition d)
-    (match (pregexp-match form-data-regexp d)
+    (match (pregexp-match (re "^form-data;\\s*(.*)$") d)
       [(,_ ,params)
        (let lp ([params params])
          (if params
-             (match (pregexp-match key-value-regexp params)
+             (match (pregexp-match (re "^([^=]+)=\"([^\"]*)\"(?:;\\s*(.*))?$")
+                      params)
                [(,_ ,key ,val ,params)
                 (cons (cons key val) (lp params))]
                [#f (raise `#(invalid-content-disposition ,d))])
@@ -789,5 +847,4 @@
                       (fxvector-set! partial pos (fxvector-ref partial cnd))
                       (fxvector-set! partial pos cnd))
                   (build (fx+ pos 1) cnd))))
-          copy-until-match)))
-  )
+          copy-until-match))))

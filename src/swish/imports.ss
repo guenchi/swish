@@ -26,14 +26,18 @@
   (export
    (import
     (swish app)
+    (swish app-core)
     (swish app-io)
     (swish application)
+    (swish base64)
     (swish cli)
     (swish db)
+    (swish digest)
     (swish erlang)
     (swish errors)
     (swish event-mgr)
     (swish events)
+    (swish foreign)
     (swish gatekeeper)
     (swish gen-server)
     (swish ht)

@@ -20,27 +20,44 @@ case $# in
   *) fail;;
 esac
 
+LIBSEP="::"
+DIR="${PWD}"
+GITTOP="$(git rev-parse --show-toplevel)"
+case "$(uname -s)" in
+  CYGWIN_NT-*)
+    LIBSEP=";;"
+    ;;
+  MINGW64_NT-* | MSYS_NT-*)
+    LIBSEP=";;"
+    GITTOP="$(cygpath -u "$GITTOP")"
+    ;;
+  *)
+    DIR="$(realpath "${DIR}")"
+    ;;
+esac
+if [ "$DIR" != "$GITTOP" ]; then
+  echo "${this} expected to be run from the repository root"
+  fail
+fi
+
 if [ ! -d "${LIBDIR}" ]; then
   echo "${this} expected to find $LIBDIR"
   echo ""
   fail
 fi
 
-if [ "$PWD" != "$(git rev-parse --show-toplevel)" ]; then
-  echo "${this} expected to be run from the repository root"
-  fail
-fi
-
 rm -f data/TestLog.db3
 mkdir -p data
+
+. src/swish/sh-config
 
 # Windows can't handle symbolic links, so point to LIBDIR
 PATH="${LIBDIR}:${PATH}"
 
 if [ "$PROFILE_MATS" = "yes" ]; then
   # shellcheck disable=SC2086
-  "${LIBDIR}"/swish-test -s src --report "${REPORT}" --progress "${PROGRESS}" --coverage "${COVERAGE}" --save-profile "${PROFILE}" --exclude '**mat-output**' ${TESTARGS}
+  "${LIBDIR}"/swish-test -s src -L src${LIBSEP}${LIBDIR}/lib --report "${REPORT}" --progress "${PROGRESS}" --coverage "${COVERAGE}" --save-profile "${PROFILE}" --exclude '**mat-output**' ${TESTARGS}
 else
   # shellcheck disable=SC2086
-  "${LIBDIR}"/swish-test -s src --report "${REPORT}" --progress "${PROGRESS}" ${TESTARGS}
+  "${LIBDIR}"/swish-test -s src -L src${LIBSEP}${LIBDIR}/lib --report "${REPORT}" --progress "${PROGRESS}" ${TESTARGS}
 fi

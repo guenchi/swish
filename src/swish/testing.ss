@@ -33,9 +33,11 @@
    isolate-mat
    match-prefix
    match-regexps
+   may-have-mats?
    process-alive?
    run-os-process
    run-test-spec
+   scheme-exe
    sleep-ms
    start-event-mgr
    start-silent-event-mgr
@@ -50,11 +52,13 @@
    (swish gatekeeper)
    (swish gen-server)
    (swish io)
+   (swish json)
    (swish log-db)
    (swish mat)
    (swish osi)
    (swish pregexp)
    (swish profile)
+   (swish software-info)
    (swish string-utils)
    (swish supervisor)
    (swish watcher)
@@ -62,14 +66,26 @@
 
   (profile:exclude)
 
+  (define scheme-exe
+    (or (getenv (if (memq (machine-type) '(a6nt i3nt ta6nt ti3nt)) "SCHEME_WIN" "SCHEME"))
+        "scheme"))
+
   (define-syntax assert-syntax-error
     (syntax-rules ()
-      [(_ e expected) ($assert-syntax-error 'e expected)]))
+      [(_ e expected) ($assert-syntax-error 'e expected #f)]
+      [(_ e expected match-form) ($assert-syntax-error 'e expected match-form)]))
 
-  (define ($assert-syntax-error e expected)
+  (define ($assert-syntax-error e expected match-form)
+    (define (matches? msg)
+      (cond
+       [(string? expected) (string=? msg expected)]
+       [(procedure? expected) (expected msg)]
+       [(list? expected) (pregexp-match expected msg)]))
     (guard
      (x
-      [(and (syntax-violation? x) (string=? (condition-message x) expected))
+      [(and (syntax-violation? x) (matches? (condition-message x)))
+       (when match-form
+         (match-form e (syntax-violation-form x)))
        'ok])
      (eval e)
      (errorf 'assert-syntax-error "failed to raise syntax error: ~s" e)))
@@ -135,7 +151,7 @@
 
   (define (boot-system)
     (log-file (path-combine (data-dir) "TestLog.db3"))
-    (match (init-main-sup)
+    (match ($init-main-sup)
       [#(ok ,pid) pid]))
 
   (define (shutdown-system)
@@ -152,7 +168,7 @@
        (mat name tags ($system-mat (lambda () (boot-system) e1 e2 ...)))]))
 
   (define ($system-mat thunk)
-    (parameterize ([console-output-port (open-output-string)])
+    (parameterize ([console-error-port (open-output-string)])
       (let* ([pid (spawn thunk)]
              [m (monitor pid)])
         (on-exit (shutdown-system)
@@ -201,24 +217,30 @@
               `#(os-process-timeout
                  #(stdout ,(receive (after 100 '()) [#(stdout ,@os-pid ,lines) lines]))
                  #(stderr ,(receive (after 100 '()) [#(stderr ,@os-pid ,lines) lines])))))
-           [#(<process-terminated> ,@os-pid ,exit-status ,_)
+           [#(process-terminated ,@os-pid ,exit-status ,_)
             (<os-result> make
               [stdout (receive [#(stdout ,@os-pid ,lines) lines])]
               [stderr (receive [#(stderr ,@os-pid ,lines) lines])]
               [exit-status exit-status])])))))
 
   (define (match-regexps patterns ls)
-    (let check ([patterns patterns] [lines ls])
+    (let check ([patterns patterns] [remaining-lines ls])
       (match patterns
-        [() lines]
-        [(,pattern . ,patterns)
-         (let search ([re (pregexp pattern)] [lines lines])
+        [() remaining-lines]
+        [(seek ,pattern . ,patterns)
+         (let search ([re (pregexp pattern)] [lines remaining-lines])
            (match lines
-             [() (raise `#(pattern-not-found ,pattern ,ls))]
+             [() (raise `#(pattern-not-found seek ,pattern ,remaining-lines))]
              [(,line . ,lines)
               (if (pregexp-match re line)
                   (check patterns lines)
-                  (search re lines))]))])))
+                  (search re lines))]))]
+        [(,pattern . ,patterns)
+         (match remaining-lines
+           [(,line . ,lines)
+            (guard (pregexp-match pattern line))
+            (check patterns lines)]
+           [,_ (raise `#(pattern-not-found ,pattern ,remaining-lines))])])))
 
   (define (delete-tree path)
     (if (file-directory? path)
@@ -230,7 +252,7 @@
               (delete-directory path)))
         (delete-file path)))
 
-  (define-tuple <test-spec> test-file report-file tests incl-tags excl-tags profile progress src-dirs lib-dirs)
+  (define-tuple <test-spec> test-file test-run report-file tests incl-tags excl-tags profile progress src-dirs lib-dirs)
 
   (define (run-test-spec swish trspec)
     (<test-spec> open trspec [test-file lib-dirs])
@@ -244,7 +266,7 @@
          (match (run-os-process swish '("-q") write-stdin 'infinity '(stdout stderr))
            [`(<os-result> ,exit-status)
             (case exit-status
-              [(0) #f]
+              [(0) 'ran]
               [(1) 'fail]
               [(2) 'skip]
               [(3) 'no-tests]
@@ -253,7 +275,7 @@
   ;; expects to run in a separate OS process.
   ;; expects test-file to contain tests since file has been screened by may-have-mats?.
   (define ($run-test-spec trspec)
-    (<test-spec> open trspec [test-file report-file tests incl-tags excl-tags profile progress src-dirs lib-dirs])
+    (<test-spec> open trspec [test-file test-run report-file tests incl-tags excl-tags profile progress src-dirs lib-dirs])
     (reset-handler (lambda () (printf "\nTest Failed: ~a\n" test-file) (exit 1)))
     (base-dir (cd))
     (library-directories lib-dirs)
@@ -269,11 +291,11 @@
       [#(EXIT ,reason) (raise reason)]
       [none (exit 3)]
       [ok
-       (let ([mo-op (and report-file (open-file-to-replace report-file))])
+       (let ([mo-op (open-file-to-append report-file)])
          (on-exit
           (begin
             (when profile (profile:save))
-            (when mo-op (close-port mo-op)))
+            (close-port mo-op))
           (match ($run-mats tests test-file incl-tags excl-tags mo-op progress)
             [(,_ (fail ,fail) ,_)
              (guard (> fail 0))

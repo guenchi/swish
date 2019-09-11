@@ -21,6 +21,7 @@
 % SOFTWARE.
 
 \usepackage{sagian}
+\makedecl{binding}
 \makedecl{constructor}
 \makedecl{event}
 \makedecl{function}
@@ -39,7 +40,27 @@
   {\end{argtbl}}
 \newenvironment{tupledef}[1]{\begin{tuple}\codeindex{#1}\end{tuple}\antipar
   \begin{argtbl}}{\end{argtbl}}
-\newcommand{\concern}[1]{\textbf{Concern:} #1}
-\newcommand{\mitigation}{\textbf{Mitigation: }}
+\newcommand{\concern}[1]{\textsf{Concern:} #1}
+\newcommand{\mitigation}{\textsf{Mitigation:} }
 \newenvironment{impl}{\textbf{Implementation:} }{}
 \newcommand{\implementation}[1]{\begin{impl}#1\end{impl}}
+
+% For long options (--help) we want to explicitly see two hyphen characters
+% rather than an en-dash. For normal text use sopt and lopt. Inside
+% codebegin/end blocks Emacs may convert the characters but LaTeX will
+% still render them properly.
+
+\newcommand{\sopt}[1]{\code{{-}#1}}
+\newcommand{\lopt}[1]{\code{{-}{-}#1}}
+\newcommand{\str}[1]{\code{"#1"}}
+
+% the default \textasciitilde looks too much like a dash
+\newcommand{\schtilde}{{\fontfamily{phv}\selectfont\textasciitilde}}
+% use this within an environment to map ~ to \schtilde
+\begingroup
+\catcode`~=\active
+\gdef\fixtilde{%
+  \catcode`~=\active
+  \def~{\schtilde}%
+}
+\endgroup

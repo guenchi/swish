@@ -20,18 +20,8 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifdef _WIN32
-#define WINVER 0x0601 // Windows 7
-#define _WIN32_WINNT WINVER
-#include "uv.h"
-#define SCHEME_IMPORT
-#include "scheme.h"
-#define strdup _strdup
-#undef EXPORT
-#define EXPORT extern __declspec (dllexport)
-#else
-#include "uv.h"
-#include "scheme.h"
+#include "swish.h"
+#ifndef _WIN32
 #include <stdlib.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
@@ -42,15 +32,14 @@
 #include <malloc.h>
 #endif
 #include <string.h>
+#include "sha.h"
 #include "sqlite3.h"
 
-uv_loop_t* g_loop;
-
-void add_callback1(ptr callback, ptr arg);
-void add_callback2(ptr callback, ptr arg1, ptr arg2);
-void add_callback3(ptr callback, ptr arg1, ptr arg2, ptr arg3);
-ptr make_error_pair(const char* who, int error);
-char* string_to_utf8(ptr s, size_t* utf8_len);
+typedef struct {
+  ptr (*close)(uptr port, ptr callback);
+  ptr (*read)(uptr port, ptr buffer, size_t start_index, uint32_t size, int64_t offset, ptr callback);
+  ptr (*write)(uptr port, ptr buffer, size_t start_index, uint32_t size, int64_t offset, ptr callback);
+} osi_port_vtable_t;
 
 // System
 EXPORT ptr osi_get_argv(void);
@@ -59,13 +48,14 @@ EXPORT ptr osi_get_callbacks(uint64_t timeout);
 EXPORT const char* osi_get_error_text(int err);
 EXPORT ptr osi_get_hostname(void);
 EXPORT uint64_t osi_get_hrtime(void);
+EXPORT int osi_get_pid(void);
 EXPORT uint64_t osi_get_time(void);
 EXPORT void osi_init(void);
-EXPORT int osi_is_tick_over(void);
+EXPORT int osi_is_quantum_over(void);
 EXPORT ptr osi_list_uv_handles(void);
 EXPORT ptr osi_make_uuid(void);
-EXPORT void osi_set_argv(int argc, const char *argv[]);
-EXPORT void osi_set_tick(uint64_t nanoseconds);
+EXPORT void osi_set_argv(int argc, const char* argv[]);
+EXPORT void osi_set_quantum(uint64_t nanoseconds);
 
 // Ports
 EXPORT ptr osi_read_port(uptr port, ptr buffer, size_t start_index, uint32_t size, int64_t offset, ptr callback);
@@ -76,13 +66,15 @@ EXPORT ptr osi_close_port(uptr port, ptr callback);
 EXPORT void osi_exit(int status);
 EXPORT ptr osi_spawn(const char* path, ptr args, ptr callback);
 EXPORT ptr osi_kill(int pid, int signum);
+EXPORT ptr osi_start_signal(int signum);
+EXPORT ptr osi_stop_signal(uptr signal);
 
 // File System
+EXPORT ptr osi_open_fd(int fd, int close);
 EXPORT ptr osi_open_file(const char* path, int flags, int mode, ptr callback);
 EXPORT ptr osi_get_executable_path(void);
 EXPORT ptr osi_get_file_size(uptr port, ptr callback);
 EXPORT ptr osi_get_real_path(const char* path, ptr callback);
-EXPORT uptr osi_get_stdin(void);
 EXPORT ptr osi_get_temp_directory(void);
 EXPORT ptr osi_chmod(const char* path, int mode, ptr callback);
 EXPORT ptr osi_make_directory(const char* path, int mode, ptr callback);
@@ -95,12 +87,17 @@ EXPORT ptr osi_watch_path(const char* path, ptr callback);
 EXPORT void osi_close_path_watcher(uptr watcher);
 
 // TCP/IP
-
 EXPORT ptr osi_connect_tcp(const char* node, const char* service, ptr callback);
 EXPORT ptr osi_listen_tcp(const char* address, uint16_t port, ptr callback);
 EXPORT void osi_close_tcp_listener(uptr listener);
 EXPORT ptr osi_get_tcp_listener_port(uptr listener);
 EXPORT ptr osi_get_ip_address(uptr port);
+
+// Message Digest
+EXPORT ptr osi_open_SHA1();
+EXPORT ptr osi_hash_data(SHA1Context* ctxt, ptr bv, size_t start_index, uint32_t size);
+EXPORT ptr osi_get_SHA1(SHA1Context* ctxt);
+EXPORT void osi_close_SHA1(SHA1Context* ctxt);
 
 // SQLite
 EXPORT ptr osi_open_database(const char* filename, int flags, ptr callback);
@@ -112,7 +109,6 @@ EXPORT ptr osi_clear_statement_bindings(uptr statement);
 EXPORT ptr osi_get_last_insert_rowid(uptr database);
 EXPORT ptr osi_get_statement_columns(uptr statement);
 EXPORT ptr osi_get_statement_expanded_sql(uptr statement);
-EXPORT ptr osi_get_statement_sql(uptr statement);
 EXPORT ptr osi_reset_statement(uptr statement);
 EXPORT ptr osi_step_statement(uptr statement, ptr callback);
 EXPORT void osi_interrupt_database(uptr database);
