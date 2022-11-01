@@ -23,14 +23,20 @@
 #!chezscheme
 (library (swish log-db)
   (export
+   $migrate-pid-columns
    <event-logger>
    coerce
+   create-prune-on-insert-trigger
    create-table
    define-simple-events
+   json-stack->string
+   log-db:event-logger
    log-db:get-instance-id
    log-db:setup
    log-db:start&link
    log-db:version
+   make-swish-event-logger
+   stack->json
    swish-event-logger
    )
   (import
@@ -38,10 +44,13 @@
    (swish app-io)
    (swish db)
    (swish erlang)
+   (swish errors)
    (swish event-mgr)
    (swish events)
+   (swish internal)
    (swish io)
    (swish json)
+   (swish options)
    (swish osi)
    (swish software-info)
    (swish string-utils)
@@ -49,26 +58,71 @@
 
   (define-tuple <event-logger> setup log)
 
-  (define (log-db:start&link)
-    (db:start&link 'log-db
-      (make-directory-path (log-file))
-      'create))
+  (define (succumb event) #f)
+
+  (define-options log-db:event-logger
+    (required
+     [setup (must-be (procedure/arity? #b1))]
+     [log (must-be (procedure/arity? #b10))])
+    (optional
+     [tolerate-fault?
+      (default succumb)
+      (must-be (procedure/arity? #b10))]))
+
+  (define log-db:start&link
+    (case-lambda
+     [() (log-db:start&link (db:options))]
+     [(options)
+      (arg-check 'log-db:start&link [options (db:options is?)])
+      (db:start&link 'log-db
+        (make-directory-path (log-file))
+        'create
+        options)]))
+
+  (define (->event-logger x)
+    (match x
+      [`(<log-db:event-logger>) x]
+      [`(<event-logger> ,setup ,log)
+       (log-db:event-logger [setup setup] [log log])]))
 
   (define (log-db:setup loggers)
-    (match (db:transaction 'log-db (lambda () (setup-db loggers)))
+    (define event-loggers (map ->event-logger loggers))
+    (module (log-event endure-logger-fault?)
+      (define (->vec f) (list->vector (map f event-loggers)))
+      (define log* (->vec (log-db:event-logger log)))
+      (define endure* (->vec (log-db:event-logger tolerate-fault?)))
+      (define tolerate-fault? succumb)
+      (define (endure-logger-fault? e) (tolerate-fault? e))
+      (define (log-event e)
+        (set! tolerate-fault? succumb)
+        (vector-for-each
+         (lambda (log endure?)
+           (set! tolerate-fault? endure?)
+           (log e))
+         log* endure*)))
+    (match (db:transaction 'log-db (lambda () (setup-db event-loggers)))
       [#(ok ,_)
        (match (event-mgr:set-log-handler
-               (lambda (event) (log-event loggers event))
-               (whereis 'log-db))
+               log-event
+               (whereis 'log-db)
+               endure-logger-fault?)
          [ok
-          (let ([now (current-date)])
-            (event-mgr:flush-buffer)
-            (system-detail <system-attributes>
-              [date (current-date)]
-              [software-info (software-info)]
-              [machine-type (symbol->string (machine-type))]
-              [computer-name (osi_get_hostname)])
-            'ignore)]
+          (event-mgr:flush-buffer)
+          (match (get-uname)
+            [`(<uname> ,system ,release ,version ,machine)
+             (system-detail <system-attributes>
+               [date (current-date)]
+               [software-info (software-info)]
+               [machine-type (symbol->string (machine-type))]
+               [computer-name (osi_get_hostname)]
+               [os-pid (osi_get_pid)]
+               [os-system system]
+               [os-release release]
+               [os-version version]
+               [os-machine machine]
+               [os-total-memory (osi_get_total_memory)])])
+          (db:expire-cache 'log-db)
+          'ignore]
          [,error error])]
       [,error error]))
 
@@ -83,16 +137,6 @@
       (execute "insert or replace into version (name, version) values (?, ?)"
         (symbol->string name) version)]))
 
-  (define next-child-id 1)
-
-  (define process->child-id
-    (let ([ht (make-weak-eq-hashtable)])
-      (lambda (x)
-        (let ([id (cdr (eq-hashtable-cell ht x next-child-id))])
-          (when (= next-child-id id)
-            (set! next-child-id (+ id 1)))
-          id))))
-
   (define log-db:instance-id #f)
 
   (define (log-db:get-instance-id)
@@ -103,18 +147,15 @@
       (log-db:version 'instance id)
       (set! log-db:instance-id id)))
 
-  (define (setup-db loggers)
+  (define (setup-db event-loggers)
     (create-table version
       (name text primary key)
       (version text))
     (match (log-db:version 'instance)
       [#f (create-instance-id!)]
       [,id (set! log-db:instance-id id)])
-    (for-each (lambda (l) ((<event-logger> setup l))) loggers)
+    (for-each (lambda (l) ((log-db:event-logger setup l))) event-loggers)
     'ok)
-
-  (define (log-event loggers e)
-    (for-each (lambda (l) ((<event-logger> log l) e)) loggers))
 
   (meta define (make-sql-name x)
     (let ([ip (open-input-string (symbol->string (syntax->datum x)))]
@@ -185,25 +226,99 @@
      [(real? x) (inexact x)]
      [(bytevector? x) x]
      [(symbol? x) (symbol->string x)]
-     [(process? x) (process->child-id x)]
+     [(process? x) (global-process-id x)]
      [(date? x) (format-rfc2822 x)]
      [(condition? x)
-      (parameterize ([print-graph #t])
+      (parameterize ([print-graph #t] [print-level 3] [print-length 6])
         (let ([op (open-output-string)])
-          (display-condition x op)
-          (write-char #\. op)
-          (let ([reason-string (get-output-string op)]
-                [stack-string
-                 (and (continuation-condition? x)
-                      (let ([op (open-output-string)])
-                        (dump-stack (condition-continuation x) op 'default)
-                        (get-output-string op)))])
-            (format "~s"
-              (if stack-string
-                  `#(error ,reason-string ,stack-string)
-                  `#(error ,reason-string))))))]
+          (json:write-object op #f json:write
+            [message (exit-reason->english x)]
+            [stacks (map stack->json (exit-reason->stacks x))])
+          (get-output-string op)))]
      [(json:object? x) (json:object->string x)]
      [else (parameterize ([print-graph #t]) (format "~s" x))]))
+
+  (define stack->json
+    (case-lambda
+     [(k) (stack->json k 'default)]
+     [(k max-depth)
+      (define who 'stack->json)
+      (define (set-source! obj field x)
+        (when (source-object? x)
+          (let ([sfd (source-object-sfd x)])
+            (json:set! obj field
+              (json:make-object
+               [bfp (source-object-bfp x)]
+               [efp (source-object-efp x)]
+               [path (source-file-descriptor-path sfd)]
+               [checksum (source-file-descriptor-checksum sfd)])))))
+      (define (var->json var)
+        (json:make-object
+         [name (format "~s" (car var))]
+         [value (format "~s" (cdr var))]))
+      (define obj (inspect/object k))
+      (unless (eq? 'continuation (obj 'type))
+        (bad-arg who k))
+      (parameterize ([print-graph #t])
+        (let ([stack (json:make-object [type "stack"] [depth (obj 'depth)])])
+          (json:set! stack 'frames
+            (walk-stack k '()
+              (lambda (description source proc-source free)
+                (let ([frame
+                       (json:make-object
+                        [type "stack-frame"]
+                        [description description])])
+                  (set-source! frame 'source source)
+                  (set-source! frame 'procedure-source proc-source)
+                  (when free (json:set! frame 'free (map var->json free)))
+                  frame))
+              (lambda (frame base depth next)
+                (json:set! frame 'depth depth)
+                (cons frame (next base)))
+              who
+              max-depth
+              (lambda (base depth)
+                (json:set! stack 'truncated depth)
+                base)))
+          stack))]))
+
+  (define json-stack->string
+    (let ()
+      (define who 'json-stack->string)
+      (define ($json-stack->string op x)
+        (define (dump-src prefix)
+          (lambda (src)
+            (fprintf op "~@[ ~a~] at offset ~a of ~a" prefix
+              (json:ref src 'bfp "?")
+              (json:ref src 'path "?"))))
+        (define (dump-frame x)
+          (fprintf op "~a" (json:ref x 'description "?"))
+          (cond
+           [(json:ref x 'source #f) => (dump-src #f)]
+           [(json:ref x 'procedure-source #f) => (dump-src "in procedure")])
+          (newline op)
+          (for-each
+           (lambda (free)
+             (fprintf op "  ~a: ~a\n"
+               (json:ref free 'name "?")
+               (json:ref free 'value "?")))
+           (json:ref x 'free '())))
+        (unless (and (json:object? x) (equal? "stack" (json:ref x 'type #f)))
+          (bad-arg who x))
+        (for-each dump-frame (json:ref x 'frames '()))
+        (cond
+         [(json:ref x 'truncated #f) =>
+          (lambda (max-depth)
+            (fprintf op "Stack dump truncated due to max-depth = ~a.\n"
+              max-depth))]))
+      (case-lambda
+       [(op x)
+        (arg-check who [op output-port? textual-port?])
+        ($json-stack->string op x)]
+       [(x)
+        (let-values ([(op get) (open-string-output-port)])
+          ($json-stack->string op x)
+          (get))])))
 
   (define-syntax (log-sql x)
     (syntax-case x ()
@@ -213,20 +328,80 @@
                        [(arg ...) args])
            #'(db:log 'log-db query (coerce arg) ...)))]))
 
-  (module (swish-event-logger)
+  (define (change-column-type table old-type new-type columns convert-column)
+    (define (get-column-specs table)
+      (map (lambda (x)
+             (match x
+               [#(,cid ,name ,type ,notnull ,dflt_value ,pk ,hidden)
+                ;; we don't handle complicated cases
+                (match-let* ([#f dflt_value] [0 pk] [0 notnull] [0 hidden])
+                  (list name type))]))
+        (execute (format "pragma table_xinfo([~a])" table))))
+    (define (create-table name col-specs)
+      (format "create table [~a] (~:{[~a] ~a~:^, ~})" name col-specs))
+    (define (change-type col-specs)
+      (map (lambda (x)
+             (match x
+               [(,column ,type)
+                (guard (member column columns))
+                (assert (equal? type old-type))
+                (list column new-type)]
+               [,x x]))
+        col-specs))
+    (define (convert col-specs)
+      (map (lambda (x)
+             (match x
+               [(,column ,_)
+                (guard (member column columns))
+                (convert-column column)]
+               [(,col ,type) (format "[~a]" col)]))
+        col-specs))
+    (let ([col-specs (get-column-specs table)])
+      (execute (format "alter table [~a] rename to [~a_orig]" table table))
+      (execute (create-table table (change-type col-specs)))
+      (execute (format "insert into [~a] select ~{~a~^, ~} from [~a_orig] order by rowid"
+                 table (convert col-specs) table))
+      (execute (format "drop table [~a_orig]" table))))
+
+  (define ($migrate-pid-columns table . columns)
+    (change-column-type table "INTEGER" "TEXT" columns
+      (lambda (column)
+        (format "case when [~a] is null then null else ':' || [~a] end"
+          column column))))
+
+  (define (check-prune-args who prune-max-days prune-limit)
+    (arg-check who
+      [prune-max-days fixnum? fxnonnegative?]
+      [prune-limit fixnum? fxpositive?]))
+
+  (define (create-prune-on-insert-trigger table column prune-max-days prune-limit)
+    (check-prune-args 'create-prune-on-insert-trigger prune-max-days prune-limit)
+    (execute
+     (format
+      (ct:join #\newline
+        "create temporary trigger prune_~a after insert on ~:*~a"
+        "begin"
+        "  delete from ~:*~a"
+        "  where rowid in"
+        "   (select rowid from ~:*~a where ~a < new.~:*~a - ~d limit ~d);"
+        "end")
+      table column (* prune-max-days 24 60 60 1000) prune-limit)))
+
+  (module (make-swish-event-logger swish-event-logger)
     (define schema-name 'swish)
-    (define schema-version "2019-06-26")
+    (define schema-version "2021-10-01")
 
     (define-simple-events create-simple-tables log-simple-event
       (<child-end>
        (timestamp integer)
-       (pid integer)
+       (pid text)
        (killed integer)
-       (reason text))
+       (reason text)
+       (details text))
       (<child-start>
        (timestamp integer)
-       (supervisor integer)
-       (pid integer)
+       (supervisor text)
+       (pid text)
        (name text)
        (restart-type text)
        (type text)
@@ -235,20 +410,22 @@
        (timestamp integer)
        (duration integer)
        (type integer)
-       (client integer)
-       (server integer)
+       (client text)
+       (server text)
        (message text)
        (state text)
        (reply text))
       (<gen-server-terminating>
        (timestamp integer)
        (name text)
+       (pid text)
        (last-message text)
        (state text)
-       (reason text))
+       (reason text)
+       (details text))
       (<http-request>
        (timestamp integer)
-       (pid integer)
+       (pid text)
        (host text)
        (method text)
        (path text)
@@ -259,6 +436,8 @@
        (date text)
        (reason text)
        (bytes-allocated integer)
+       (current-memory-bytes integer)
+       (maximum-memory-bytes integer)
        (osi-bytes-used integer)
        (sqlite-memory integer)
        (sqlite-memory-highwater integer)
@@ -269,20 +448,28 @@
        (gc-count integer)
        (gc-cpu real)
        (gc-real real)
-       (gc-bytes integer))
+       (gc-bytes integer)
+       (os-free-memory integer))
       (<supervisor-error>
        (timestamp integer)
-       (supervisor integer)
+       (supervisor text)
        (error-context text)
        (reason text)
-       (child-pid integer)
+       (details text)
+       (child-pid text)
        (child-name text))
       (<system-attributes>
        (timestamp integer)
        (date text)
        (software-info text)
        (machine-type text)
-       (computer-name text))
+       (computer-name text)
+       (os-pid integer)
+       (os-system text)
+       (os-release text)
+       (os-version text)
+       (os-machine text)
+       (os-total-memory integer))
       (<transaction-retry>
        (timestamp integer)
        (database text)
@@ -291,29 +478,28 @@
        (sql text))
       )
 
-    (define (create-db)
-      (define max-days 90)
-      (define (create-prune-on-insert-trigger table column)
-        (execute
-         (format "create temporary trigger prune_~a after insert on ~:*~a begin delete from ~:*~a where rowid in (select rowid from ~:*~a where ~a < new.~:*~a - ~d limit 10); end"
-           table column (* max-days 24 60 60 1000))))
+    (define (init-db prune-max-days prune-limit)
 
       (define-syntax create-prune-on-insert-triggers
         (syntax-rules ()
           [(_ (table column) ...)
-           (begin (create-prune-on-insert-trigger 'table 'column) ...)]))
+           (begin
+             (create-prune-on-insert-trigger 'table 'column
+               prune-max-days prune-limit)
+             ...)]))
 
       (define (create-index name sql)
         (execute (format "create index if not exists ~a on ~a" name sql)))
 
       (create-simple-tables)
 
-      ;; next-child-id
-      (match-let* ([(#(,id)) (execute "select max(pid) from child_start")])
-        (set! next-child-id (+ (or id 0) 1)))
+      ;; session-id
+      (match-let* ([(#(,id)) (execute "select max(rowid) from system_attributes")])
+        ($import-internal set-session-id!)
+        (set-session-id! (+ (or id 0) 1)))
 
       (execute "drop view if exists child")
-      (execute "create view child as select T1.pid as id, T1.name, T1.supervisor, T1.restart_type, T1.type, T1.shutdown, T1.timestamp as start, T2.timestamp - T1.timestamp as duration, T2.killed, T2.reason from child_start T1 left outer join child_end T2 on T1.pid=T2.pid")
+      (execute "create view child as select T1.rowid as rowid, T1.pid as id, T1.name, T1.supervisor, T1.restart_type, T1.type, T1.shutdown, T1.timestamp as start, T2.timestamp - T1.timestamp as duration, T2.killed, T2.reason, T2.details from child_start T1 left outer join child_end T2 on T1.pid=T2.pid")
 
       (create-prune-on-insert-triggers
        (child_end timestamp)
@@ -354,7 +540,79 @@
 
     (define (upgrade-db)
       (match (log-db:version schema-name)
-        [,@schema-version (create-db)]
+        [,@schema-version 'ok]
+        ["2021-09-18"
+         (execute "alter table statistics add column os_free_memory integer default null")
+         (execute "alter table system_attributes add column os_total_memory integer default null")
+         (log-db:version schema-name "2021-10-01")
+         (upgrade-db)]
+        ["2020-10-01"
+         (execute "alter table statistics add column current_memory_bytes integer default null")
+         (execute "alter table statistics add column maximum_memory_bytes integer default null")
+         (execute "alter table system_attributes add column os_pid integer default null")
+         (log-db:version schema-name "2021-09-18")
+         (upgrade-db)]
+        ["2020-09-01"
+         (execute "alter table system_attributes add column os_system text default null")
+         (execute "alter table system_attributes add column os_release text default null")
+         (execute "alter table system_attributes add column os_version text default null")
+         (execute "alter table system_attributes add column os_machine text default null")
+         (log-db:version schema-name "2020-10-01")
+         (upgrade-db)]
+        ["2019-10-18"
+         (execute "drop view if exists child")
+         ($migrate-pid-columns "child_start" "pid" "supervisor")
+         ($migrate-pid-columns "child_end" "pid")
+         ($migrate-pid-columns "http_request" "pid")
+         ($migrate-pid-columns "supervisor_error" "child_pid" "supervisor")
+         ($migrate-pid-columns "gen_server_debug" "client" "server")
+         (execute "alter table gen_server_terminating add column pid text default null")
+         (log-db:version schema-name "2020-09-01")
+         (upgrade-db)]
+        ["2019-06-26"
+         (define chunk-size 1000)
+         (define op (open-output-string))
+         (define (convert reason)
+           (match (catch (read (open-input-string reason)))
+             [#(error ,r)
+              (json:write-object op #f json:write [message r])
+              (values "exception" (get-output-string op))]
+             [#(error ,r ,s)
+              (json:write-object op #f json:write [message r] [preformatted-stack s])
+              (values "exception" (get-output-string op))]
+             [#(EXIT ,_)
+              (json:write-object op #f json:write [message reason])
+              (values "exception" (get-output-string op))]
+             [,r
+              (let ([message (exit-reason->english r)])
+                (if (string=? message reason)
+                    (values reason #f)
+                    (begin
+                      (json:write-object op #f json:write [message message])
+                      (values reason (get-output-string op)))))]))
+         (define (update-reason&details table)
+           (define (fetch offset)
+             (execute (format "select rowid, reason from ~a order by rowid limit ? offset ?" table)
+               chunk-size offset))
+           (let lp ([offset 0])
+             (let ([rows (fetch offset)])
+               (unless (null? rows)
+                 (let cvt ([offset offset] [rows rows])
+                   (match rows
+                     [() (lp offset)]
+                     [(#(,rowid ,reason) . ,rows)
+                      (let-values ([(reason details) (convert reason)])
+                        (execute (format "update ~a set reason = ?, details = ? where rowid = ?" table)
+                          reason details rowid))
+                      (cvt (+ offset 1) rows)]))))))
+         (execute "alter table child_end add column details text")
+         (execute "alter table gen_server_terminating add column details text")
+         (execute "alter table supervisor_error add column details text")
+         (update-reason&details "child_end")
+         (update-reason&details "gen_server_terminating")
+         (update-reason&details "supervisor_error")
+         (log-db:version schema-name "2019-10-18")
+         (upgrade-db)]
         ["2019-05-24"
          (execute "alter table statistics rename to statistics_orig")
          (execute "create table statistics(timestamp integer, date text, reason text, bytes_allocated integer, osi_bytes_used integer, sqlite_memory integer, sqlite_memory_highwater integer, foreign_handles text, cpu real, real real, bytes integer, gc_count integer, gc_cpu real, gc_real real, gc_bytes integer)")
@@ -386,10 +644,21 @@
          (upgrade-db)]
         [#f
          (log-db:version schema-name schema-version)
-         (create-db)]
-        [,version (raise `#(unsupported-db-version ,schema-name ,version))]))
+         (upgrade-db)]
+        [,version (throw `#(unsupported-db-version ,schema-name ,version))]))
 
-    (define swish-event-logger
-      (<event-logger> make [setup upgrade-db] [log log-simple-event]))
-    )
+    (define make-swish-event-logger
+      (case-lambda
+       [() (make-swish-event-logger 90 10)]
+       [(prune-max-days prune-limit)
+        (check-prune-args 'make-swish-event-logger prune-max-days prune-limit)
+        (<event-logger> make
+          [setup
+           (lambda ()
+             (upgrade-db)
+             (init-db prune-max-days prune-limit))]
+          [log log-simple-event])]))
+
+    (define swish-event-logger (make-swish-event-logger)))
+
   )

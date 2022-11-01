@@ -22,6 +22,8 @@
 
 #include "osi.h"
 
+#include <assert.h>
+
 #ifdef _WIN32
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -31,6 +33,10 @@
 #pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ws2_32.lib")
+typedef DWORD osi_thread_t;
+#else
+#include <pthread.h>
+typedef pthread_t osi_thread_t;
 #endif
 
 typedef struct {
@@ -77,12 +83,27 @@ typedef struct {
   uv_connect_t connect;
 } tcp_connect_t;
 
+typedef struct {
+  uv_async_t async;
+  uv_mutex_t mutex;
+  void (*code)(void*);
+  void* payload;
+  uv_cond_t cond;
+  uv_cond_t* sender;
+} send_request_t;
+
 uv_loop_t* osi_loop;
+
+jmp_t g_exit;
 
 static uint64_t g_threshold;
 static ptr g_callbacks;
 
+static send_request_t g_send_request;
+static osi_thread_t g_scheme_thread;
+
 void osi_add_callback_list(ptr callback, ptr args) {
+  assert(g_callbacks); // must only be called via osi_get_callbacks
   g_callbacks = Scons(Scons(callback, args), g_callbacks);
 }
 
@@ -168,7 +189,7 @@ static ptr read_fs_port(uptr port, ptr buffer, size_t start_index, uint32_t size
   req->buffer = buffer;
   req->callback = callback;
   uv_buf_t buf = {
-    .base = (char*) &Sbytevector_u8_ref(buffer, start_index),
+    .base = (char*)& Sbytevector_u8_ref(buffer, start_index),
     .len = size
   };
   int rc = uv_fs_read(osi_loop, &req->fs, p->file, &buf, 1, offset, rw_fs_cb);
@@ -191,7 +212,7 @@ static ptr write_fs_port(uptr port, ptr buffer, size_t start_index, uint32_t siz
   req->buffer = buffer;
   req->callback = callback;
   uv_buf_t buf = {
-    .base = (char*) &Sbytevector_u8_ref(buffer, start_index),
+    .base = (char*)& Sbytevector_u8_ref(buffer, start_index),
     .len = size
   };
   int rc = uv_fs_write(osi_loop, &req->fs, p->file, &buf, 1, offset, rw_fs_cb);
@@ -233,10 +254,32 @@ static ptr close_fs_port(uptr port, ptr callback) {
   return Strue;
 }
 
+static void close_async_cb(uv_handle_t* handle) {
+  free(handle);
+}
+
+static void close_fd_cb(uv_async_t* async) {
+  ptr callback = (ptr)async->data;
+  Sunlock_object(callback);
+  uv_close((uv_handle_t*)async, close_async_cb);
+  osi_add_callback1(callback, Sfixnum(0));
+}
+
 static ptr close_fd_port(uptr port, ptr callback) {
+  // Use an async handle to add the callback in the proper context.
+  uv_async_t* async = malloc_container(uv_async_t);
+  if (!async)
+    return osi_make_error_pair("osi_close_fd_port", UV_ENOMEM);
+  int rc = uv_async_init(osi_loop, async, close_fd_cb);
+  if (rc < 0)
+    return osi_make_error_pair("uv_async_init", rc);
+  rc = uv_async_send(async);
+  if (rc < 0)
+    return osi_make_error_pair("uv_async_send", rc);
+  Slock_object(callback);
+  async->data = callback;
   fs_port_t* p = (fs_port_t*)port;
   free(p);
-  osi_add_callback1(callback, Sfixnum(0));
   return Strue;
 }
 
@@ -258,14 +301,18 @@ static void open_fs_cb(uv_fs_t* req) {
   uv_fs_req_cleanup(req);
   Sunlock_object(callback);
   free(req);
-  if (result < 0)
+  if (result < 0) {
     osi_add_callback1(callback, osi_make_error_pair("uv_fs_open", (int)result));
-  else {
-    fs_port_t* port = malloc_container(fs_port_t);
-    port->vtable = &file_vtable;
-    port->file = (uv_file)result;
-    osi_add_callback1(callback, Sunsigned((uptr)port));
+    return;
   }
+  fs_port_t* port = malloc_container(fs_port_t);
+  if (!port) {
+    osi_add_callback1(callback, osi_make_error_pair("uv_fs_open", UV_ENOMEM));
+    return;
+  }
+  port->vtable = &file_vtable;
+  port->file = (uv_file)result;
+  osi_add_callback1(callback, Sunsigned((uptr)port));
 }
 
 static void get_file_size_cb(uv_fs_t* req) {
@@ -409,7 +456,7 @@ static ptr write_stream_port(uptr port, ptr buffer, size_t start_index, uint32_t
   p->write_size = size;
   p->write_callback = callback;
   uv_buf_t buf = {
-    .base = (char*) &Sbytevector_u8_ref(p->write_buffer, start_index),
+    .base = (char*)& Sbytevector_u8_ref(p->write_buffer, start_index),
     .len = size
   };
   int rc = uv_write(&(p->write_req), &(p->h.stream), &buf, 1, write_stream_cb);
@@ -423,9 +470,19 @@ static ptr write_stream_port(uptr port, ptr buffer, size_t start_index, uint32_t
 }
 
 static void close_stream_cb(uv_handle_t* handle) {
+  // This code does not check and unlock the write_callback and
+  // write_buffer because LibUV explicitly cancels write operations
+  // with UV_ECANCELED before processing this callback.
   stream_port_t* p = container_of(handle, stream_port_t, h.stream);
   ptr callback = p->close_callback;
+  ptr read_callback = p->read_callback;
+  ptr read_buffer = p->read_buffer;
   free(p);
+  if (read_callback) {
+    Sunlock_object(read_buffer);
+    Sunlock_object(read_callback);
+    osi_add_callback1(read_callback, Sfixnum(UV_EOF));
+  }
   if (callback) {
     Sunlock_object(callback);
     osi_add_callback1(callback, Sfixnum(0));
@@ -564,9 +621,11 @@ static void free_argv(char** argv) {
 
 static void process_exit_cb(uv_process_t* process, int64_t exit_status, int term_signal) {
   ptr callback = (ptr)process->data;
-  osi_add_callback3(callback, Sinteger32(process->pid), Sinteger64(exit_status), Sinteger32(term_signal));
-  Sunlock_object(callback);
-  process->data = 0;
+  if (callback) {
+    osi_add_callback3(callback, Sinteger32(process->pid), Sinteger64(exit_status), Sinteger32(term_signal));
+    Sunlock_object(callback);
+    process->data = 0;
+  }
   uv_close((uv_handle_t*)process, close_handle_data_cb);
 }
 
@@ -592,11 +651,14 @@ ptr osi_get_argv() {
 
 size_t osi_get_bytes_used(void) {
 #if defined(__APPLE__)
-  malloc_zone_pressure_relief(NULL, 0);
   struct mstats ms = mstats();
   return ms.bytes_used;
 #elif defined(__GLIBC__)
+#if (__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33)
+  struct mallinfo2 hinfo = mallinfo2();
+#else
   struct mallinfo hinfo = mallinfo();
+#endif
   return hinfo.hblkhd + hinfo.uordblks;
 #elif defined(_WIN32)
   size_t used = 0;
@@ -700,8 +762,21 @@ ptr osi_make_uuid(void) {
   return r;
 }
 
+static uv_timer_t g_timer;
+
 void osi_exit(int status) {
-  uv_loop_close(osi_loop);
+  uv_cond_destroy(&g_send_request.cond);
+  uv_mutex_destroy(&g_send_request.mutex);
+  uv_timer_stop(&g_timer);
+  uv_close((uv_handle_t*)&g_timer, NULL);
+  uv_close((uv_handle_t*)&g_send_request.async, NULL);
+  osi_get_callbacks(0); // drop any callbacks since we're exiting
+  // force _exit if loop is still busy, since exit() may block
+  g_exit.force = uv_loop_close(osi_loop);
+  if (g_exit.initialized) {
+    g_exit.status = status;
+    longjmp(g_exit.buf, -1);
+  }
   _exit(status);
 }
 
@@ -821,6 +896,54 @@ ptr osi_spawn(const char* path, ptr args, ptr callback) {
   Svector_set(r, 2, Sunsigned((uptr)err_port));
   Svector_set(r, 3, Sinteger32(p->pid));
   return r;
+}
+
+ptr osi_spawn_detached(const char* path, ptr args) {
+  int argc = string_list_length(args);
+  if (argc < 0)
+    return osi_make_error_pair("osi_spawn_detached", UV_EINVAL);
+  // Build argument list
+  char** argv = (char**)malloc((argc + 2) * sizeof(char*));
+  if (!argv)
+    return osi_make_error_pair("osi_spawn_detached", UV_ENOMEM);
+  {
+    char** arg = argv;
+    *arg++ = (char*)path;
+    ptr x = args;
+    while (Spairp(x)) {
+      size_t l;
+      if (!(*arg++ = osi_string_to_utf8(Scar(x), &l)))
+        break;
+      x = Scdr(x);
+    }
+    *arg = NULL;
+  }
+  // Spawn the process
+  uv_process_t* p = malloc_container(uv_process_t);
+  if (!p) {
+    free_argv(argv);
+    return osi_make_error_pair("osi_spawn_detached", UV_ENOMEM);
+  }
+  uv_process_options_t options = {
+    .exit_cb = process_exit_cb,
+    .file = path,
+    .args = argv,
+    .env = NULL,
+    .cwd = NULL,
+    .flags = UV_PROCESS_DETACHED,
+    .stdio_count = 0,
+    .stdio = NULL,
+    .uid = 0,
+    .gid = 0
+  };
+  p->data = 0;
+  int rc = uv_spawn(osi_loop, p, &options);
+  free_argv(argv);
+  if (rc < 0) {
+    uv_close((uv_handle_t*)p, close_handle_data_cb);
+    return osi_make_error_pair("uv_spawn", rc);
+  }
+  return Sinteger32(p->pid);
 }
 
 ptr osi_kill(int pid, int signum) {
@@ -968,6 +1091,20 @@ uint64_t osi_get_hrtime(void) {
   return uv_hrtime();
 }
 
+ptr osi_get_uname(void) {
+  uv_utsname_t buf;
+  int rc = uv_os_uname(&buf);
+  if (rc)
+    return osi_make_error_pair("uv_os_uname", rc);
+  ptr v = Smake_vector(5, 0);
+  Svector_set(v, 0, Sstring_to_symbol("<uname>"));
+  Svector_set(v, 1, Sstring_utf8(buf.sysname, -1));
+  Svector_set(v, 2, Sstring_utf8(buf.release, -1));
+  Svector_set(v, 3, Sstring_utf8(buf.version, -1));
+  Svector_set(v, 4, Sstring_utf8(buf.machine, -1));
+  return v;
+}
+
 int osi_is_quantum_over(void) {
   return (uv_hrtime() >= g_threshold) ? 1 : 0;
 }
@@ -1066,7 +1203,7 @@ ptr osi_open_file(const char* path, int flags, int mode, ptr callback) {
   if (rc < 0) {
     Sunlock_object(callback);
     free(req);
-    return osi_make_error_pair("uv_fs_close", rc);
+    return osi_make_error_pair("uv_fs_open", rc);
   }
   return Strue;
 }
@@ -1101,6 +1238,15 @@ ptr osi_rename(const char* path, const char* new_path, ptr callback) {
   return Strue;
 }
 
+ptr osi_get_home_directory(void) {
+  static char buffer[32768];
+  size_t len = sizeof(buffer);
+  int rc = uv_os_homedir(buffer, &len);
+  if (rc < 0)
+    return osi_make_error_pair("uv_os_homedir", rc);
+  return Sstring_utf8(buffer, len);
+}
+
 ptr osi_get_temp_directory(void) {
   static char buffer[32768];
   size_t len = sizeof(buffer);
@@ -1131,18 +1277,17 @@ ptr osi_read_port(uptr port, ptr buffer, size_t start_index, uint32_t size, int6
   return (*(osi_port_vtable_t**)port)->read(port, buffer, start_index, size, offset, callback);
 }
 
-static uv_timer_t g_timer;
-
 static void get_callbacks_timer_cb(uv_timer_t* handle) {
   handle->data = handle;
   uv_stop(handle->loop);
 }
 
 ptr osi_get_callbacks(uint64_t timeout) {
+  g_callbacks = Snil;
   uv_update_time(osi_loop);
-  if ((0 == timeout) || (Snil != g_callbacks)) {
+  if (0 == timeout)
     uv_run(osi_loop, UV_RUN_NOWAIT);
-  } else {
+  else {
     g_timer.data = 0;
     uv_timer_start(&g_timer, get_callbacks_timer_cb, timeout, 0);
     uv_run(osi_loop, UV_RUN_ONCE);
@@ -1152,7 +1297,7 @@ ptr osi_get_callbacks(uint64_t timeout) {
     }
   }
   ptr callbacks = g_callbacks;
-  g_callbacks = Snil;
+  g_callbacks = 0;
   return callbacks;
 }
 
@@ -1260,13 +1405,71 @@ void osi_close_SHA1(SHA1Context* ctxt) {
   free(ctxt);
 }
 
+static void send_request_async_cb(uv_async_t* handle) {
+  (void)handle;
+  uv_mutex_lock(&g_send_request.mutex);
+  g_send_request.code(g_send_request.payload);
+  uv_cond_t* sender = g_send_request.sender;
+  g_send_request.code = NULL;
+  g_send_request.payload = NULL;
+  g_send_request.sender = NULL;
+  uv_cond_signal(sender);
+  uv_mutex_unlock(&g_send_request.mutex);
+}
+
+static osi_thread_t thread_self() {
+#ifdef _WIN32
+  return GetCurrentThreadId();
+#else
+  return pthread_self();
+#endif
+}
+
+int osi_send_request(handle_request_func code, void* payload) {
+  if (!code) return UV_EINVAL;
+  if (thread_self() == g_scheme_thread) return UV_EPERM;
+  uv_mutex_lock(&g_send_request.mutex);
+  // wait our turn, guarding against spurious wakeup
+  while (g_send_request.sender) {
+    uv_cond_wait(&g_send_request.cond, &g_send_request.mutex);
+  }
+  int rc = uv_async_send(&g_send_request.async);
+  if (rc) {
+    uv_mutex_unlock(&g_send_request.mutex);
+    return rc;
+  }
+  // add our work if async send succeeded
+  g_send_request.code = code;
+  g_send_request.payload = payload;
+  uv_cond_t self;
+  uv_cond_init(&self);
+  g_send_request.sender = &self;
+  // wait for async callback to consume work
+  while (&self == g_send_request.sender) {
+    uv_cond_wait(&self, &g_send_request.mutex);
+  }
+  uv_cond_destroy(&self);
+  // let the next thread in
+  uv_cond_signal(&g_send_request.cond);
+  uv_mutex_unlock(&g_send_request.mutex);
+  return 0;
+}
+
+// Cannot use exports of scheme.h here; the Scheme heap may not have
+// been initialized.
 void osi_init(void) {
+  if (osi_loop)
+    return;
   uv_disable_stdio_inheritance();
   static uv_loop_t g_loop;
   uv_loop_init(&g_loop);
   osi_loop = &g_loop;
   uv_timer_init(osi_loop, &g_timer);
-  g_callbacks = Snil;
+  g_callbacks = 0;
+  g_scheme_thread = thread_self();
+  uv_async_init(osi_loop, &g_send_request.async, send_request_async_cb);
+  uv_mutex_init(&g_send_request.mutex);
+  uv_cond_init(&g_send_request.cond);
 #ifdef _WIN32
   timeBeginPeriod(1); // Set timer resolution to 1 ms.
 #endif

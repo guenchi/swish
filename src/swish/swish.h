@@ -20,7 +20,7 @@
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#define SWISH_VERSION "0.0.0"
+#define SWISH_VERSION "2.4.0"
 
 #ifdef _WIN32
 #define WINVER 0x0601 // Windows 7
@@ -72,3 +72,14 @@ EXPORT ptr osi_make_error_pair(const char* who, int error);
 EXPORT char* osi_string_to_utf8(ptr s, size_t* utf8_len);
 
 EXPORT int swish_run(int argc, const char* argv[], void (*custom_init)(void));
+
+typedef void (*handle_request_func)(void*);
+EXPORT int osi_send_request(handle_request_func, void* payload);
+
+#ifdef __linux__
+EXPORT int swish_service(int argc, const char* argv[]);
+#endif
+
+#ifdef _WIN32
+EXPORT int swish_service(const wchar_t* service_name, const wchar_t* logfile, int argc, const char* argv[]);
+#endif

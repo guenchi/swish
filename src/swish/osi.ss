@@ -25,6 +25,10 @@
   (export
    osi_bind_statement
    osi_bind_statement*
+   osi_bind_statement_bindings
+   osi_bind_statement_bindings*
+   osi_bulk_execute
+   osi_bulk_execute*
    osi_chmod
    osi_chmod*
    osi_clear_statement_bindings
@@ -41,12 +45,17 @@
    osi_finalize_statement
    osi_finalize_statement*
    osi_get_argv
+   osi_get_bindings
+   osi_get_bindings*
    osi_get_bytes_used
    osi_get_callbacks
    osi_get_error_text
    osi_get_executable_path
    osi_get_file_size
    osi_get_file_size*
+   osi_get_free_memory
+   osi_get_home_directory
+   osi_get_home_directory*
    osi_get_hostname
    osi_get_hostname*
    osi_get_hrtime
@@ -70,6 +79,8 @@
    osi_get_temp_directory
    osi_get_temp_directory*
    osi_get_time
+   osi_get_total_memory
+   osi_get_uname
    osi_interrupt_database
    osi_is_quantum_over
    osi_kill
@@ -83,6 +94,8 @@
    osi_make_directory*
    osi_make_uuid
    osi_make_uuid*
+   osi_marshal_bindings
+   osi_marshal_bindings*
    osi_open_database
    osi_open_database*
    osi_open_fd
@@ -100,16 +113,20 @@
    osi_reset_statement
    osi_reset_statement*
    osi_set_quantum
-   osi_start_signal
-   osi_start_signal*
-   osi_stop_signal
-   osi_stop_signal*
    osi_spawn
    osi_spawn*
+   osi_spawn_detached
+   osi_spawn_detached*
+   osi_start_signal
+   osi_start_signal*
    osi_step_statement
    osi_step_statement*
+   osi_stop_signal
+   osi_stop_signal*
    osi_unlink
    osi_unlink*
+   osi_unmarshal_bindings
+   osi_unmarshal_bindings*
    osi_watch_path
    osi_watch_path*
    osi_write_port
@@ -117,7 +134,7 @@
    string->uuid
    uuid->string
    )
-  (import (chezscheme))
+  (import (chezscheme) (swish internal))
 
   (define _init_ ((foreign-procedure "osi_init" () void)))
 
@@ -126,6 +143,8 @@
       [(_ name (arg-name arg-type) ... ret-type)
        (define name
          (foreign-procedure (symbol->string 'name) (arg-type ...) ret-type))]))
+
+  ($import-internal throw)
 
   (define-syntax (define-osi x)
     (syntax-case x ()
@@ -142,7 +161,7 @@
               (let ([x (name* arg-name ...)])
                 (if (not (and (pair? x) (symbol? (car x))))
                     x
-                    (raise `#(osi-error name ,(car x) ,(cdr x))))))))]))
+                    (throw `#(osi-error name ,(car x) ,(cdr x))))))))]))
 
   ;; System
   (fdefine osi_get_argv ptr)
@@ -153,12 +172,17 @@
   (fdefine osi_get_hrtime unsigned-64)
   (fdefine osi_get_pid int)
   (fdefine osi_get_time unsigned-64)
+  (fdefine osi_get_uname ptr)
   (fdefine osi_is_quantum_over boolean)
   (fdefine osi_list_uv_handles ptr)
   (define-osi osi_make_uuid)
   (fdefine osi_set_quantum (nanoseconds unsigned-64) void)
   (define-osi osi_start_signal (signum int))
   (define-osi osi_stop_signal (handler uptr))
+  (define osi_get_free_memory
+    (foreign-procedure "uv_get_free_memory" () unsigned-64))
+  (define osi_get_total_memory
+    (foreign-procedure "uv_get_total_memory" () unsigned-64))
 
   ;; Ports
   (define-osi osi_read_port (port uptr) (buffer ptr) (start-index size_t) (size unsigned-32) (offset integer-64) (callback ptr))
@@ -168,6 +192,7 @@
   ;; Process
   (fdefine osi_exit (status int) void)
   (define-osi osi_spawn (path string) (args ptr) (callback ptr))
+  (define-osi osi_spawn_detached (path string) (args ptr))
   (define-osi osi_kill (pid int) (signum int))
 
   ;; File System
@@ -176,6 +201,7 @@
   (define-osi osi_get_executable_path)
   (define-osi osi_get_file_size (port uptr) (callback ptr))
   (define-osi osi_get_real_path (path string) (callback ptr))
+  (define-osi osi_get_home_directory)
   (define-osi osi_get_temp_directory)
   (define-osi osi_chmod (path string) (mode int) (callback ptr))
   (define-osi osi_make_directory (path string) (mode int) (callback ptr))
@@ -196,7 +222,7 @@
 
   (define (uuid->string uuid)
     (unless (and (bytevector? uuid) (= (bytevector-length uuid) 16))
-      (raise `#(bad-arg uuid->string ,uuid)))
+      (throw `#(bad-arg uuid->string ,uuid)))
     (format "~8,'0X-~4,'0X-~4,'0X-~4,'0X-~2,'0X~2,'0X~2,'0X~2,'0X~2,'0X~2,'0X"
       (#3%bytevector-u32-ref uuid 0 'little)
       (#3%bytevector-u16-ref uuid 4 'little)
@@ -210,7 +236,7 @@
       (#3%bytevector-u8-ref uuid 15)))
 
   (define (string->uuid s)
-    (define (err) (raise `#(bad-arg string->uuid ,s)))
+    (define (err) (throw `#(bad-arg string->uuid ,s)))
     (define (decode-digit c)
       (cond
        [(#3%char<=? #\0 c #\9)
@@ -244,12 +270,17 @@
   (define-osi osi_prepare_statement (database uptr) (sql ptr) (callback ptr))
   (define-osi osi_finalize_statement (statement uptr))
   (define-osi osi_bind_statement (statement uptr) (index int) (datum ptr))
+  (define-osi osi_bind_statement_bindings (statement uptr) (mbindings uptr))
   (define-osi osi_clear_statement_bindings (statement uptr))
+  (define-osi osi_get_bindings (mbindings uptr))
   (define-osi osi_get_last_insert_rowid (database uptr))
   (define-osi osi_get_statement_columns (statement uptr))
   (define-osi osi_get_statement_expanded_sql (statement uptr))
   (define-osi osi_reset_statement (statement uptr))
   (define-osi osi_step_statement (statement uptr) (callback ptr))
-  (fdefine osi_interrupt_database (database uptr) void)
+  (fdefine osi_interrupt_database (database uptr) ptr)
   (define-osi osi_get_sqlite_status (operation int) (reset? boolean))
+  (define-osi osi_bulk_execute (statements ptr) (mbindings ptr) (callback ptr))
+  (define-osi osi_marshal_bindings (ls ptr))
+  (define-osi osi_unmarshal_bindings (mbindings uptr))
   )

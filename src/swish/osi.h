@@ -31,6 +31,7 @@
 #else
 #include <malloc.h>
 #endif
+#include <setjmp.h>
 #include <string.h>
 #include "sha.h"
 #include "sqlite3.h"
@@ -41,6 +42,16 @@ typedef struct {
   ptr (*write)(uptr port, ptr buffer, size_t start_index, uint32_t size, int64_t offset, ptr callback);
 } osi_port_vtable_t;
 
+// Internal
+typedef struct {
+  jmp_buf buf;
+  int initialized;
+  int status;
+  int force;
+} jmp_t;
+
+EXPORT jmp_t g_exit;
+
 // System
 EXPORT ptr osi_get_argv(void);
 EXPORT size_t osi_get_bytes_used(void);
@@ -50,6 +61,7 @@ EXPORT ptr osi_get_hostname(void);
 EXPORT uint64_t osi_get_hrtime(void);
 EXPORT int osi_get_pid(void);
 EXPORT uint64_t osi_get_time(void);
+EXPORT ptr osi_get_uname(void);
 EXPORT void osi_init(void);
 EXPORT int osi_is_quantum_over(void);
 EXPORT ptr osi_list_uv_handles(void);
@@ -65,6 +77,7 @@ EXPORT ptr osi_close_port(uptr port, ptr callback);
 // Process
 EXPORT void osi_exit(int status);
 EXPORT ptr osi_spawn(const char* path, ptr args, ptr callback);
+EXPORT ptr osi_spawn_detached(const char* path, ptr args);
 EXPORT ptr osi_kill(int pid, int signum);
 EXPORT ptr osi_start_signal(int signum);
 EXPORT ptr osi_stop_signal(uptr signal);
@@ -75,6 +88,7 @@ EXPORT ptr osi_open_file(const char* path, int flags, int mode, ptr callback);
 EXPORT ptr osi_get_executable_path(void);
 EXPORT ptr osi_get_file_size(uptr port, ptr callback);
 EXPORT ptr osi_get_real_path(const char* path, ptr callback);
+EXPORT ptr osi_get_home_directory(void);
 EXPORT ptr osi_get_temp_directory(void);
 EXPORT ptr osi_chmod(const char* path, int mode, ptr callback);
 EXPORT ptr osi_make_directory(const char* path, int mode, ptr callback);
@@ -105,14 +119,19 @@ EXPORT ptr osi_close_database(uptr database, ptr callback);
 EXPORT ptr osi_prepare_statement(uptr database, ptr sql, ptr callback);
 EXPORT ptr osi_finalize_statement(uptr statement);
 EXPORT ptr osi_bind_statement(uptr statement, int index, ptr datum);
+EXPORT ptr osi_bind_statement_bindings(uptr statement, uptr mbindings);
 EXPORT ptr osi_clear_statement_bindings(uptr statement);
+EXPORT ptr osi_get_bindings(uptr mbindings);
 EXPORT ptr osi_get_last_insert_rowid(uptr database);
 EXPORT ptr osi_get_statement_columns(uptr statement);
 EXPORT ptr osi_get_statement_expanded_sql(uptr statement);
 EXPORT ptr osi_reset_statement(uptr statement);
 EXPORT ptr osi_step_statement(uptr statement, ptr callback);
-EXPORT void osi_interrupt_database(uptr database);
+EXPORT ptr osi_interrupt_database(uptr database);
 EXPORT ptr osi_get_sqlite_status(int operation, int resetp);
+EXPORT ptr osi_bulk_execute(ptr statements, ptr mbindings, ptr callback);
+EXPORT ptr osi_marshal_bindings(ptr bindings);
+EXPORT ptr osi_unmarshal_bindings(uptr mbindings);
 
 #define TRANSLATE_SQLITE_ERRNO(x) (-(6000000 + x))
 
@@ -201,3 +220,4 @@ EXPORT ptr osi_get_sqlite_status(int operation, int resetp);
 
 #define container_of(p, t, member) ((t*)((char*)(p)-offsetof(t, member)))
 #define malloc_container(t) ((t*)malloc(sizeof(t)))
+#define malloc_array(t, n) ((t*)malloc(sizeof(t) * n))

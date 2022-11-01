@@ -37,6 +37,7 @@
    (chezscheme)
    (swish app-io)
    (swish erlang)
+   (swish errors)
    (swish gen-server)
    (swish html)
    (swish io)
@@ -246,7 +247,7 @@
   (define (unwrap x)
     (match x
       [#(ok ,result) result]
-      [#(error ,reason) (raise reason)]))
+      [#(error ,reason) (throw reason)]))
 
   (define (init input-fn output-fn force-start?)
     (cond
@@ -290,7 +291,7 @@
           (no-reply ($state copy [waketime (next-waketime)]))]
          [#(EXIT #(io-error ,_ ,_ ,_))
           (no-reply ($state copy [waketime (+ (erlang:now) 1000)]))]
-         [#(EXIT ,reason) (raise reason)])]))
+         [#(EXIT ,reason) (throw reason)])]))
   (define (default-filename) (path-combine (data-dir) "server.profile"))
   (define (profile:start&link input-fn output-fn force-start?)
     (gen-server:start&link 'profiler input-fn output-fn force-start?))
@@ -336,8 +337,8 @@
          (lambda (profile-fn)
            (match (catch ($profile-load profile-fn (make-insert-filedata table)))
              [#(EXIT ,reason)
-              (let () (import (swish errors)) (printf "REASON: ~a\n" (exit-reason->english reason)))
-              (errorf 'profile:dump-html "cannot load profile data from ~a" profile-fn)]
+              (errorf 'profile:dump-html "cannot load profile data from ~a: ~a" profile-fn
+                (exit-reason->english reason))]
              [,_ (void)]))
          inputs))
       (let-values ([(keys vals) (hashtable-entries table)])

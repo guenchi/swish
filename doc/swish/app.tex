@@ -82,21 +82,24 @@ SomeCamelCaseIdentifiersAreHardToRead
 To provide arguments to the Swish executable before the script filename, add
 the \sopt{S} option to \code{env} and add the desired arguments after
 \code{swish}.
-Here the \lopt{} option tells Swish to start a REPL after loading the script.
-\codebegin
+Here the \code{-q} option suppresses the startup message and sets the prompt to
+the empty string, and the \lopt{} option tells Swish to start a REPL after
+loading the script.
+\codebegin\fixtilde
 $ cat howdy
-#!/usr/bin/env -S swish \lopt{}
+#!/usr/bin/env -S swish -q \lopt{}
 (printf "Howdy, Folks!{\textbackslash}n")
-(pretty-print (command-line-arguments))
+(printf "prompt: ~s{\textbackslash}n" (waiter-prompt-string))
+(printf "command-line: ~s{\textbackslash}n" (command-line-arguments))
 $ chmod +x howdy
 $ ./howdy
-
-Swish Version 0.0.0
 Howdy, Folks!
-("--" "./howdy")
-> (+ 2 3)
+prompt: ""
+command-line: ("-q" "--" "./howdy")
+(waiter-prompt-string "yes?")
+yes? (+ 2 3)
 5
-> (exit)
+yes? (exit)
 \codeend
 
 % to show boot search while loading script:
@@ -182,12 +185,31 @@ $ swish-build -o foo foo.ss -b petite
 
 \subsubsection {Limitations}
 
-On Windows, the Swish DLLs \code{osi.dll}, \code{libuv.dll}, and \code{sqlite3.dll}
+On Windows, the Swish DLLs \code{osi.dll}, \code{uv.dll}, and \code{sqlite3.dll}
 must be installed in the same directory as the program executable.
 These DLLs can be found in the directory containing the Swish executable.
 In addition, the program executable must be able to locate
 Microsoft's C Runtime Library \code{vcruntime140.dll}
 and the appropriate Chez Scheme DLL via the standard search order.
+
+\subsection {Services}
+
+On Linux and Windows, a Swish application can be started as a service
+that listens for system shutdown, suspend, and resume messages.
+To start a Swish application as a service, pass \code{/SERVICE} as
+the first command-line argument.
+On Windows, two additional command-line arguments are required:
+the service name and the path to the log file where stdout and
+stderr are redirected.
+See \hyperref[swishservice]{\code{swish\_service}} for details.
+
+% Rationale:
+% - /SERVICE is not likely to be a Swish script on Unix system
+% - /SERVICE is not likely to be a regular command-line argument
+%   since (swish cli) uses - and -- for options
+% - having a single executable
+%   - means fewer binaries to manage
+%   - makes it easy to start as a service or start interactively for debugging
 
 \section{Running Tests}
 
@@ -291,13 +313,13 @@ obtain an absolute path and stores the result.
 \end{parameter}
 \hasvalue{} a file-system path
 
-When called without arguments, \code{base-dir} returns the file-system path of
-the application's base directory.
-Otherwise, the base directory is set to \var{path}, which must specify the
-file-system path of a directory that exists and is writable by the application.
-Setting \code{base-dir} sets the values of \code{data-dir}, \code{log-file},
-\code{tmp-dir}, and \code{web-dir} so that they refer to locations within the
-base directory.
+When called without arguments, \code{base-dir} returns the file-system
+path of the application's base directory.  Otherwise, the base
+directory is set to \var{path}, which must specify the file-system
+path of a directory that exists and is writable by the application.
+Setting \code{base-dir} sets the values of \code{data-dir},
+\code{log-file}, and \code{tmp-dir} so that they refer to locations
+within the base directory.
 
 When the application starts, \code{base-dir} is set to the current directory.
 
@@ -337,17 +359,6 @@ in which the application can write ephemeral data.
 Applications should not assume that this directory exists, but should
 instead use \code{make-directory-path} when creating files under \code{tmp-dir}.
 Its initial value is the path to a \code{"tmp"} subdirectory of
-the directory specified by \code{base-dir}.
-
-\defineentry{web-dir}
-\begin{parameter}
-  \code{(web-dir \opt{\var{path}})}
-\end{parameter}
-\hasvalue{} a file-system path
-
-The \code{web-dir} parameter holds the file-system path of the directory
-used by the HTTP interface (see Chapter~\ref{chap:http}).
-Its initial value is the path to a \code{"web"} subdirectory of
 the directory specified by \code{base-dir}.
 
 \defineentry{include-line}
@@ -444,7 +455,7 @@ set for \var{key}, this procedure has no effect.
 When a Swish application starts, it sets the default value of the
 \code{base-exception-handler} parameter to \code{app-exception-handler}.
 This procedure expects a single argument, typically a condition or an object
-passed to \code{raise}, which it saves in the parameter \code{debug-condition}.
+passed to \code{throw} or \code{raise}, which it saves in the parameter \code{debug-condition}.
 
 If \code{app:name} is set, then \code{app-exception-handler} writes a
 message to the console error port, prefixed with the application name,
@@ -471,13 +482,6 @@ The initial value of \code{app-sup-spec} is constructed by calling
 \code{make-swish-sup-spec} with \code{swish-event-logger} as the
 sole logger.
 
-\defineentry{app:resume}
-\begin{syntax}
-  \code{(app:resume)}
-\end{syntax}
-
-This is an alias for \code{statistics:resume}.
-
 \defineentry{app:shutdown}
 \begin{syntax}
   \code{(app:shutdown \opt{\var{exit-code}})}
@@ -494,13 +498,6 @@ This is an alias for \code{application:shutdown}.
 The \code{app:start} procedure calls \code{application:start}
 with a \var{starter} thunk that calls \code{supervisor:start\&link}
 with the value of the \code{app-sup-spec} parameter.
-
-\defineentry{app:suspend}
-\begin{syntax}
-  \code{(app:suspend)}
-\end{syntax}
-
-This is an alias for \code{statistics:suspend}.
 
 \defineentry{make-swish-sup-spec}
 \begin{procedure}
@@ -561,6 +558,18 @@ When it starts a REPL, script, or linked program, \code{swish-start} attempts
 to import any libraries found in \code{library-list} whose library path begins
 with the symbol \code{swish}.
 
+\defineentry{repl-level}
+\begin{parameter}
+  \code{repl-level}
+\end{parameter}
+\hasvalue{} nonnegative fixnum
+
+The \code{repl-level} parameter returns the nesting depth of the
+\code{swish-start} REPL.
+The value of this parameter is initially zero; it is incremented when a
+process enters the \code{swish-start} REPL.
+It is not affected by \code{new-cafe}.
+
 \subsection{Foreign Interface}
 
 Scheme libraries that rely on shared objects must arrange
@@ -590,10 +599,9 @@ This simplifies a process that can otherwise be complicated
 by the fact that Chez Scheme invokes a library lazily as soon as
 one of its exports may be referenced.
 
-To see how these procedures are decoupled, consider the following REPL
+To see how these procedures are decoupled, consider the following Swish REPL
 transcript on a 64-bit Linux machine:
 \codebegin
-Swish Version 0.0.0
 > (provide-shared-object 'libc "/lib64/libc.so.6")
 > (foreign-entry? "fork")
 #f
@@ -611,7 +619,6 @@ without first calling \code{provide-shared-object}
 because we explicitly wrote the value of \code{app:config} to the location
 specified by \code{app:config-filename} before exiting the original REPL.
 \codebegin
-Swish Version 0.0.0
 > (foreign-entry? "fork")
 #f
 > (require-shared-object "libc")

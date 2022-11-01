@@ -25,6 +25,7 @@
   (export
    add-if-absent
    collect-clauses
+   combine-adjacent
    compound-id
    find-clause
    find-source
@@ -38,6 +39,8 @@
    scdr
    snull?
    syntax-datum-eq?
+   valid-fields?
+   windows?
    with-temporaries
    )
   (import (chezscheme))
@@ -167,6 +170,13 @@
           (rebuild x (annotation-expression ae)))]
        [else x])))
 
+  (define-syntax windows?
+    (meta-cond
+     [(memq (machine-type) '(i3nt ti3nt a6nt ta6nt))
+      (identifier-syntax #t)]
+     [else
+      (identifier-syntax #f)]))
+
   (define-syntax with-temporaries
     (syntax-rules ()
       [(_ (tmp ...) e0 e1 ...)
@@ -217,5 +227,39 @@
                   (display " " os)
                   (pretty (syntax->datum form) os))
                 (get-output-string os))))))))]))
+
+  (define (valid-fields? x f* known-fields forbidden)
+    (let valid? ([f* f*] [seen '()])
+      (syntax-case f* ()
+        [(fn . rest)
+         (let ([f (datum fn)])
+           (when (or (not (identifier? #'fn)) (memq f forbidden))
+             (syntax-violation #f "invalid field" x #'fn))
+           (when (memq f seen)
+             (syntax-violation #f "duplicate field" x #'fn))
+           (unless (or (not known-fields) (memq f known-fields))
+             (syntax-violation #f "unknown field" x #'fn))
+           (valid? #'rest (cons f seen)))]
+        [() #t]
+        [_ #f])))
+
+  ;; combine adjacent self-evaluating literals
+  (define (combine-adjacent pred? combine exprs)
+    (define (get-literal expr)
+      (if (identifier? expr)
+          (values #f #f)
+          (let ([datum (syntax->datum expr)])
+            (values (pred? datum) datum))))
+    (fold-right
+     (lambda (expr exprs)
+       (let-values ([(combine-first? first) (get-literal expr)])
+         (if (null? exprs)
+             (list (if combine-first? first expr))
+             (let-values ([(combine-second? second) (get-literal (car exprs))])
+               (if (and combine-first? combine-second?)
+                   (cons (combine first second) (cdr exprs))
+                   (cons expr exprs))))))
+     '()
+     (syntax->list exprs)))
 
   )

@@ -44,6 +44,7 @@
    [help -h --help (list "[<section>]" ...)
     (format "display help, <section>={~{~a~^|~}}" help-sections)]
    [version --version bool "print version information"]
+   [info --info bool "display software-info"]
    ))
 
 (define library-cli
@@ -125,7 +126,7 @@
 
 (define (wrap indent . texts)
   (wrap-text (current-output-port)
-    (- (help-wrap-width) indent) indent indent (join texts #\space)))
+    (- (help-wrap-width) indent) indent indent texts))
 
 (define-syntax example
   (syntax-rules ()
@@ -150,7 +151,7 @@
 
 (define (list-item item . texts)
   (printf "~4@a " item)
-  (wrap-text (current-output-port) (- (help-wrap-width) 6) 0 5 (join texts #\space))
+  (wrap-text (current-output-port) (- (help-wrap-width) 6) 0 5 texts)
   (newline))
 
 (define (usage short? sections ht)
@@ -176,6 +177,14 @@
      (wrap 0
        who "can make a compiled library, a component program, a stand-alone program, or a linked program."
        "By default," who "creates a linked program.\n"
+       "\n"
+       "When compiling a library, the <source> file must contain one or more library forms."
+       "When compiling a program," who "combines the forms from the <source> file"
+       "into a single top-level program and compiles the result:\n\n")
+     (parameterize ([pretty-initial-indent 2])
+       (display "  ")
+       (pretty-print '(top-level-program (import (scheme) (swish imports)) form ...)))
+     (wrap 0
        "\n"
        "To compile a library, specify --library. The resulting compiled library may"
        "be loaded explicitly or used as a" who "--rtlib argument when compiling other"
@@ -405,7 +414,9 @@
          [obj-fn (or obj-fn tmp-fn)])
     (on-exit (target-case target-type
                [(library) (when tmp-fn (rm-f tmp-fn))]
-               [(component linked stand-alone) (rm-f obj-fn)])
+               [(component linked stand-alone)
+                (unless (string=? obj-fn output-fn)
+                  (rm-f obj-fn))])
       (when (> (verbosity) 0) (printf "compiling ~a\n" (source-file)))
       (parameterize ([generate-inspector-information #f]
                      [generate-procedure-source-information #t]
@@ -571,6 +582,19 @@
  [(opt 'help) =>
   (lambda (sections)
     (usage #f (map string->symbol sections) (opt)))]
+ [(opt 'info)
+  (json:write (current-output-port)
+    (json:make-object
+     [software-info (software-info)]
+     [uname
+      (match (get-uname)
+        [`(<uname> ,system ,release ,version ,machine)
+         (json:make-object
+          [os-machine machine]
+          [os-release release]
+          [os-system system]
+          [os-version version])])])
+    0)]
  [(opt 'version)
   (printf "~a Version ~a (~a)\n" who
     (software-version 'swish)
@@ -621,13 +645,8 @@
                    (cons swish-core-library-filename rt-libs))]
               [_ (library-setup swish-wpo? libdirs rt-libs)]
               [other-libs
-               ;; load-compiled-from-port fails if given compressed
-               ;; - note that (port-file-compressed! ip) works only for file ports,
-               ;;   and does not work for bytevector-input-ports
-               ;; - not a problem because compile-to-file will compress us later
-               (parameterize ([compile-compressed #f])
-                 (resolve-missing-libs 'stand-alone rt-libs
-                   (do-compile source-fn output-fn swish-wpo? target-type)))]
+               (resolve-missing-libs 'stand-alone rt-libs
+                 (do-compile source-fn output-fn swish-wpo? target-type))]
               [app-boot (platform-boot-file output-fn)]
               [compiled-code
                (let ([ip (open-binary-file-to-read output-fn)])

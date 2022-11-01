@@ -173,8 +173,10 @@
     [,@s (wt 0 0 0 s)]
     [,s (join '("This will wrap" "and tab\twill" "fit as single" "character.") #\newline)]
     [,@s (wt 14 0 0 (join (split s #\newline) #\space))]
-    [,s (join '("0 1 2" "3 4 5" "6 7 8" "9") #\newline)]
+    [,ls '("0 1 2" "3 4 5" "6 7 8" "9")]
+    [,s (join ls #\newline)]
     [,@s (wt 5 0 0 "0 1 2 3 4 5 6 7 8 9")]
+    [,@s (wt 5 0 0 ls)]
     [,in "This      string contains    consecutive      spaces."]
     [,s (join '("This string" "contains" "consecutive" "spaces.") #\newline)]
     [,@s (wt 11 0 0 in)]
@@ -186,13 +188,13 @@
     ["" (wt 999 0 0 "                         ")]
     ["\r\na b c \r\n" ;; \r is just another character, not a line marker
      (wt 10 0 0 "\r\n    a    b    c    \r\n")]
-    [,in
-     (join
-      '("This did not need to wrap, since we had plenty of room."
-        "Even more text here that will also go on the same line."
-        "Wow, this is going to be a pretty long line.")
-      #\space)]
+    [,ls
+     '("This did not need to wrap, since we had plenty of room."
+       "Even more text here that will also go on the same line."
+       "Wow, this is going to be a pretty long line.")]
+    [,in (join ls #\space)]
     [,@in (wt 1000 0 0 in)]
+    [,@in (wt 1000 0 0 ls)]
     ["   Hi\nmom" (wt 0 3 0 "Hi mom")]
     ["   Hi\n mom" (wt 0 3 1 "Hi mom")]
     [" Hi\n   mom" (wt 0 1 3 "Hi mom")]
@@ -202,7 +204,11 @@
     ["  Hi\n  mom" (wt 0 2 2 "Hi mom")]
     ["  Hi\n  mom\n  and\n  dad" (wt 0 2 2 "Hi mom and dad")]
     ["     Hi\n  mom\n  and\n  dad\n  just\n  two?"
-     (wt 0 5 2 "Hi mom and\ndad\njust\ntwo?")])
+     (wt 0 5 2 "Hi mom and\ndad\njust\ntwo?")]
+    ["" (wt 10 0 0 "")]
+    ["" (wt 10 0 0 '())]
+    ["" (wt 10 0 0 "    ")]
+    ["" (wt 10 0 0 '("" " " "   " " " ""))])
    'ok))
 
 (mat oxford-comma ()
@@ -258,5 +264,67 @@
     ["try pressing control, alt, and delete before continuing"
      (format "try ~a ~? before continuing" 'pressing
        (oxford-comma "~@{" "~a" " and " "~}") '(control alt delete))])
+   'ok)
+  )
+
+(mat ct:join ()
+  (match-let*
+   (["combined" (expand '(ct:join "" "comb" "in" "e" "d"))]
+    ["comb--in--e--d" (expand '(ct:join "--" "comb" "in" "e" "d"))]
+    ["nu_cle_ar" (expand '(ct:join #\_ "nu" "cle" "ar"))]
+    ["okay" (expand '(ct:join #\! "okay"))]
+    ["someday-maybe" (expand '(ct:join #\- "someday" "maybe"))]
+    ["" (expand '(ct:join "xyz"))]
+    ["" (expand '(ct:join "" "" ""))]
+    [(#2%string-append "join-ed-" x "-o-the-r-" y)
+     (expand '(ct:join "-" "join" "ed" x "o" "the" "r" y))]
+    [(#2%string-append x "---ceptional")
+     (expand '(ct:join "---" x "ceptional"))]
+    ;; residualize call to string-append in case y evaluates to non-string
+    [(#2%string-append y)
+     (expand '(ct:join "phone" y))]
+    [(#2%string-append x "\nbr\nok\nen\n" y)
+     (expand '(ct:join #\newline x "br" "ok" "en" y))]
+    [(#2%string-append x "\nbr\nok\nen\n" y "\nzap")
+     (expand '(ct:join #\newline x "br" "ok" "en" y "zap"))])
+   'ok))
+
+(mat ct:string-append ()
+  (match-let*
+   (["combined" (expand '(ct:string-append "comb" "in" "e" "d"))]
+    ["xyz" (expand '(ct:string-append "xyz"))]
+    ["" (expand '(ct:string-append "" "" ""))]
+    [(#2%string-append "joined" x "other" y)
+     (expand '(ct:string-append "join" "ed" x "o" "the" "r" y))]
+    [(#2%string-append x "ceptional")
+     (expand '(ct:string-append x "ceptional"))]
+    [(#2%string-append "phone" y)
+     (expand '(ct:string-append "phone" y))]
+    [(#2%string-append 123 "broken" 777)
+     (expand '(ct:string-append 123 "br" "ok" "en" 777))]
+    [(#2%string-append 123 "broken" 777 "zap")
+     (expand '(ct:string-append 123 "br" "ok" "en" 777 "zap"))]
+    [(#2%string-append "abc" 123 "broken" 777 "zap")
+     (expand '(ct:string-append "abc" 123 "br" "ok" "en" 777 "zap"))]
+    [(#2%string-append "abc" 123 "broken" 777 "zap")
+     (expand '(ct:string-append "a" "" "bc" 123 "br" "ok" "en" 777 "za" "p" "" ""))]
+    [(#2%string-append "abc" (#2%string #\newline) "broken" (#2%string #\newline) "zap")
+     (expand
+      '(ct:string-append
+        "a" "bc" (string #\newline)
+        "br" "ok" "en" (string #\newline)
+        "za" "p" ""))]
+    [(#2%string-append "abc\nbr" ok "en\nzap")
+     (expand
+      '(ct:string-append
+        "a" "bc" "\n"
+        "br" ok "en" "\n"
+        "za" "p" ""))]
+    ["abc\nbroken\nzap"
+     (expand
+      '(ct:string-append
+        "a" "bc" "\n"
+        "br" "ok" "en" "\n"
+        "za" "p" ""))])
    'ok)
   )

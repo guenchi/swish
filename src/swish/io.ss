@@ -24,6 +24,7 @@
 (library (swish io)
   (export
    <stat>
+   <uname>
    binary->utf8
    close-osi-port
    close-path-watcher
@@ -39,6 +40,7 @@
    get-real-path
    get-source-offset
    get-stat
+   get-uname
    hook-console-input
    io-error
    list-directory
@@ -91,6 +93,7 @@
    signal-handler
    signal-handler-count
    spawn-os-process
+   spawn-os-process-detached
    stat-directory?
    stat-regular-file?
    tcp-listener-count
@@ -101,6 +104,7 @@
   (import
    (chezscheme)
    (swish erlang)
+   (swish meta)
    (swish osi)
    )
 
@@ -126,6 +130,7 @@
 
   (define-record-type osi-port
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable name)
      (immutable create-time)
@@ -135,7 +140,7 @@
     (unless (osi-port? p)
       (bad-arg who p))
     (or (osi-port-handle p)
-        (raise `#(osi-port-closed ,who ,p))))
+        (throw `#(osi-port-closed ,who ,p))))
 
   (define (read-osi-port port bv start n fp)
     (define result)
@@ -199,7 +204,7 @@
         [,_ (void)])))
 
   (define (io-error name who errno)
-    (raise `#(io-error ,name ,who ,errno)))
+    (throw `#(io-error ,name ,who ,errno)))
 
   (define (make-utf8-transcoder)
     (make-transcoder (utf-8-codec)
@@ -290,6 +295,7 @@
 
   (define-record-type %type-reporter
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable name)
      (immutable count)
@@ -309,7 +315,7 @@
          (sorted-cells table get-create-time cell->record cell->handle))]))
     (hashtable-update! foreign-handle-reporters name
       (lambda (prev)
-        (when prev (raise `#(type-already-registered ,name)))
+        (when prev (throw `#(type-already-registered ,name)))
         (make-%type-reporter name get-count print))
       #f))
 
@@ -405,6 +411,7 @@
 
   (define-record-type path-watcher
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable path)
      (immutable create-time)
@@ -439,7 +446,7 @@
     (unless (process? process)
       (bad-arg 'watch-path process))
     (with-interrupts-disabled
-     (match (osi_watch_path* path
+     (match (osi_watch_path* (tilde-expand path)
               (case-lambda
                [(filename events)
                 (send process
@@ -456,11 +463,93 @@
   (define (make-console-input)
     (binary->utf8 (make-osi-input-port (open-fd-port "stdin-nb" 0 #f))))
 
+  (define (make-interruptable-console-input)
+    ;; Provide CTRL-C for the repl with a custom binary input port
+    ;; that can be interrupted by CTRL-C to call the
+    ;; keyboard-interrupt-handler and then retry the read just as Chez
+    ;; Scheme does.
+    (define osip (open-fd-port "stdin-nb" 0 #f))
+    (define fp 0)
+    (define (r! bv start n)
+      (match (with-interrupts-disabled (@r! bv start n))
+        [,count
+         (guard (fixnum? count))
+         (set! fp (+ fp count))
+         count]
+        [interrupt
+         ((keyboard-interrupt-handler))
+         (r! bv start n)]
+        [`(catch ,r) (throw r)]))
+    (define (gp) fp)
+    (define (close) (close-osi-port osip))
+    (meta-cond
+     [windows?
+      ;; When CTRL-C or CTRL-BREAK is pressed in Windows, the read
+      ;; returns 0 immediately, and later the signal is processed.
+      ;; libuv could return UV_EINTR in this case, but it doesn't.
+      (define (@r! bv start n)
+        (match (try (read-osi-port osip bv start n -1))
+          [0 (call/1cc
+              (lambda (return)
+                ;; Give Windows time to deliver the signal before we
+                ;; close the input port.
+                (parameterize ([keyboard-interrupt-handler
+                                (lambda () (return 'interrupt))])
+                  (receive (after 100 0)))))]
+          [,r r]))]
+     [else
+      ;; When CTRL-C is pressed in Unix-like systems, the read
+      ;; returns EINTR, and libuv automatically retries. As a
+      ;; result, we spawn a separate reader process so that we can
+      ;; interrupt the read.
+      (define reader
+        (spawn
+         (lambda ()
+           (disable-interrupts)
+           (@read-loop #f))))
+      ;; cell: (pid . active?) is used to keep the reader process from
+      ;; responding to an interrupted read request.
+      (alias pid car)
+      (alias active? cdr)
+      (alias active?-set! set-cdr!)
+      (define (@read-loop r)
+        ;; r: result of read-osi-port or #f
+        (receive
+         [#(,bv ,start ,n ,cell)
+          (let ([r (or r (try (read-osi-port osip bv start n -1)))])
+            (cond
+             [(active? cell)
+              (active?-set! cell #f)
+              (send (pid cell) `#(,self ,r))
+              (@read-loop #f)]
+             [else
+              ;; We assume the next call will have the same bv,
+              ;; start & n, which the Chez Scheme transcoded-port
+              ;; appears to do.
+              (@read-loop r)]))]))
+      (define (@r! bv start n)
+        (define cell (cons self #t))
+        (send reader `#(,bv ,start ,n ,cell))
+        (call/1cc
+         (lambda (return)
+           (parameterize
+               ([keyboard-interrupt-handler
+                 (lambda ()
+                   ;; Ignore when the reader has already responded.
+                   (when (active? cell)
+                     (active?-set! cell #f)
+                     (return 'interrupt)))])
+             (receive [#(,@reader ,r) r])))))])
+    (binary->utf8
+     (make-custom-binary-input-port "stdin-nb*" r! gp #f close)))
+
   (define hook-console-input
     (let ([hooked? #f])
       (lambda ()
         (unless hooked?
-          (let ([ip (make-console-input)])
+          (let ([ip (if (interactive?)
+                        (make-interruptable-console-input)
+                        (make-console-input))])
             ;; Chez Scheme uses $console-input-port to do smart
             ;; flushing of console I/O.
             (set! hooked? #t)
@@ -487,7 +576,7 @@
      [(path mode)
       (define result)
       (with-interrupts-disabled
-       (match (osi_make_directory* path mode
+       (match (osi_make_directory* (tilde-expand path) mode
                 (let ([p self])
                   (lambda (r)
                     (set! result r)
@@ -502,7 +591,7 @@
   (define make-directory-path
     (case-lambda
      [(path mode)
-      (let loop ([path path])
+      (let loop ([path (tilde-expand path)])
         (let ([dir (path-parent path)])
           (unless (or (string=? dir path) (string=? dir ""))
             (unless (directory? dir)
@@ -530,7 +619,7 @@
   (define (remove-directory path)
     (define result)
     (with-interrupts-disabled
-     (match (osi_remove_directory* path
+     (match (osi_remove_directory* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
                   (set! result r)
@@ -544,7 +633,7 @@
   (define (remove-file path)
     (define result)
     (with-interrupts-disabled
-     (match (osi_unlink* path
+     (match (osi_unlink* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
                   (set! result r)
@@ -558,7 +647,7 @@
   (define (rename-path path new-path)
     (define result)
     (with-interrupts-disabled
-     (match (osi_rename* path new-path
+     (match (osi_rename* (tilde-expand path) (tilde-expand new-path)
               (let ([p self])
                 (lambda (r)
                   (set! result r)
@@ -572,7 +661,7 @@
   (define (set-file-mode path mode)
     (define result)
     (with-interrupts-disabled
-     (match (osi_chmod* path mode
+     (match (osi_chmod* (tilde-expand path) mode
               (let ([p self])
                 (lambda (r)
                   (set! result r)
@@ -593,10 +682,18 @@
        [(,who . ,errno) (io-error name who errno)]
        [,handle (@make-osi-port name handle)])))
 
+  (define (tilde-expand path)
+    (if (and (> (string-length path) 0)
+             (char=? #\~ (string-ref path 0))
+             (string=? "~" (path-first path)))
+        (path-combine (osi_get_home_directory) (path-rest path))
+        path))
+
   (define (open-file-port name flags mode)
     (define result)
+    (arg-check 'open-file-port [name string?])
     (with-interrupts-disabled
-     (match (osi_open_file* name flags mode
+     (match (osi_open_file* (tilde-expand name) flags mode
               (let ([p self])
                 (lambda (r)
                   (if (pair? r)
@@ -628,8 +725,9 @@
 
   (define (get-real-path path)
     (define result)
+    (arg-check 'get-real-path [path string?])
     (with-interrupts-disabled
-     (match (osi_get_real_path* path
+     (match (osi_get_real_path* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
                   (set! result r)
@@ -645,8 +743,9 @@
     (case-lambda
      [(path follow?)
       (define result)
+      (arg-check 'get-stat [path string?])
       (with-interrupts-disabled
-       (match (osi_get_stat* path follow?
+       (match (osi_get_stat* (tilde-expand path) follow?
                 (let ([p self])
                   (lambda (r)
                     (set! result r)
@@ -659,8 +758,9 @@
 
   (define (list-directory path)
     (define result)
+    (arg-check 'list-directory [path string?])
     (with-interrupts-disabled
-     (match (osi_list_directory* path
+     (match (osi_list_directory* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
                   (set! result r)
@@ -679,6 +779,7 @@
   (include "io-constants.ss")
 
   (define (open-file name flags mode type)
+    (arg-check 'open-file [name string?])
     (unless (memq type '(binary-input binary-output binary-append input output append))
       (bad-arg 'open-file type))
     (let ([port (open-file-port name flags mode)])
@@ -732,6 +833,7 @@
     (open-file name (+ O_WRONLY O_CREAT O_TRUNC) #o666 'binary-output))
 
   (define (read-file name)
+    (arg-check 'read-file [name string?])
     (let ([port (open-file-port name O_RDONLY 0)])
       (on-exit (close-osi-port port)
         (let ([n (get-file-size port)])
@@ -739,19 +841,21 @@
               (let* ([bv (make-bytevector n)]
                      [count (read-osi-port port bv 0 n 0)])
                 (unless (eqv? count n)
-                  (raise `#(unexpected-eof ,name)))
+                  (throw `#(unexpected-eof ,name)))
                 bv)
               #vu8())))))
 
   ;; Process Ports
 
+  (define (list-of-strings? ls) (and (list? ls) (for-all string? ls)))
+
   (define (spawn-os-process path args process)
-    (unless (and (list? args) (for-all string? args))
-      (bad-arg 'spawn-os-process args))
-    (unless (process? process)
-      (bad-arg 'spawn-os-process process))
+    (arg-check 'spawn-os-process
+      [path string?]
+      [args list-of-strings?]
+      [process process?])
     (with-interrupts-disabled
-     (match (osi_spawn* path args
+     (match (osi_spawn* (tilde-expand path) args
               (lambda (os-pid exit-status term-signal)
                 (send process
                   `#(process-terminated ,os-pid ,exit-status ,term-signal))))
@@ -766,15 +870,40 @@
          os-pid)]
        [(,who . ,errno) (io-error path who errno)])))
 
+  (define (spawn-os-process-detached path args)
+    (arg-check 'spawn-os-process-detached
+      [path string?]
+      [args list-of-strings?])
+    (match (osi_spawn_detached* (tilde-expand path) args)
+      [(,who . ,errno) (io-error path who errno)]
+      [,os-pid os-pid]))
+
+  ;; System interface
+
+  (define-tuple <uname> system release version machine)
+  (define (get-uname) (osi_get_uname))
+
   ;; TCP/IP Ports
 
   (define-record-type listener
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable address)
      (immutable port-number)
      (immutable create-time)
      (mutable handle)))
+
+  (define (display-socket l op)
+    (define (contains-period? s)
+      (let lp ([i 0] [n (string-length s)])
+        (and (< i n)
+             (or (char=? (string-ref s i) #\.)
+                 (lp (+ i 1) n)))))
+    (match-define `(listener ,address ,port-number) l)
+    (if (contains-period? address)
+        (fprintf op "~a:~a" address port-number)
+        (fprintf op "[~a]:~a" address port-number)))
 
   (define tcp-listeners
     (make-foreign-handle-guardian 'tcp-listeners
@@ -783,24 +912,21 @@
       listener-create-time
       (lambda (l) (close-tcp-listener l))
       (lambda (op l handle)
-        (define (contains-period? s)
-          (let lp ([i 0] [n (string-length s)])
-            (and (< i n)
-                 (or (char=? (string-ref s i) #\.)
-                     (lp (+ i 1) n)))))
         (fprintf op "  ~d: " handle)
-        (let ([addr (listener-address l)])
-          (if (contains-period? addr)
-              (display-string addr op)
-              (fprintf op "[~a]" addr))
-          (fprintf op ":~d opened ~d\n"
-            (listener-port-number l)
-            (listener-create-time l))))))
+        (display-socket l op)
+        (fprintf op " opened ~d\n"
+          (listener-create-time l)))))
 
   (define tcp-listener-count (foreign-handle-count 'tcp-listeners))
   (define print-tcp-listeners (foreign-handle-print 'tcp-listeners))
 
   (define (port-number? x) (and (fixnum? x) (fx<= 0 x 65535)))
+
+  (define (@safe-get-ip-address port default)
+    (let ([addr (osi_get_ip_address* port)])
+      (cond
+       [(pair? addr) default]
+       [else addr])))
 
   (define (listen-tcp address port-number process)
     ;; Keep a weak reference to the listener in cell so that the
@@ -821,7 +947,7 @@
                       (if (pair? r)
                           (send process
                             `#(accept-tcp-failed ,listener ,(car r) ,(cdr r)))
-                          (let* ([name (osi_get_ip_address r)]
+                          (let* ([name (@safe-get-ip-address r "")]
                                  [port (@make-osi-port name r)])
                             (send process
                               `#(accept-tcp ,listener ,(make-iport name port #f)
@@ -829,7 +955,7 @@
                       (unless (pair? r)
                         (osi_close_port* r 0))))))
        [(,who . ,errno)
-        (raise `#(listen-tcp-failed ,address ,port-number ,who ,errno))]
+        (throw `#(listen-tcp-failed ,address ,port-number ,who ,errno))]
        [,handle
         (let ([l (make-listener address (osi_get_tcp_listener_port handle)
                    (erlang:now) handle)])
@@ -847,33 +973,32 @@
          (tcp-listeners listener #f)))))
 
   (define (connect-tcp hostname port-spec)
-    (define result
-      (begin
-        (unless (string? hostname)
-          (bad-arg 'connect-tcp hostname))
-        (unless (or (port-number? port-spec) (string? port-spec))
-          (bad-arg 'connect-tcp port-spec))
-        (void)))
-    (with-interrupts-disabled
-     (match (osi_connect_tcp* hostname
-              (if (string? port-spec) port-spec (number->string port-spec))
-              (let ([p self])
-                (lambda (r)
-                  (if (pair? r)
-                      (set! result r)
-                      (set! result (@make-osi-port (osi_get_ip_address r) r)))
-                  (complete-io p))))
-       [#t
-        (let ([name (format "[~a]:~a" hostname port-spec)])
+    (define result)
+    (unless (string? hostname)
+      (bad-arg 'connect-tcp hostname))
+    (unless (or (port-number? port-spec) (string? port-spec))
+      (bad-arg 'connect-tcp port-spec))
+    (let ([name (format "[~a]:~a" hostname port-spec)])
+      (with-interrupts-disabled
+       (match (osi_connect_tcp* hostname
+                (if (string? port-spec) port-spec (number->string port-spec))
+                (let ([p self])
+                  (lambda (r)
+                    (if (pair? r)
+                        (set! result r)
+                        (set! result (@make-osi-port (@safe-get-ip-address r name) r)))
+                    (complete-io p))))
+         [#t
           (wait-for-io name)
           (match result
             [(,who . ,errno) (io-error name who errno)]
             [,port
              (let ([name (osi-port-name port)])
-               (values (make-iport name port #f) (make-oport name port)))]))])))
+               (values (make-iport name port #f) (make-oport name port)))])]))))
 
   (define-record-type sighandler
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable signum)
      (immutable create-time)
@@ -942,4 +1067,22 @@
         [(,who . ,errno) (io-error (sighandler-signum handler) who errno)])))
 
   (set-top-level-value! '@deliver-signal @deliver-signal)
+
+  (record-writer (record-type-descriptor osi-port)
+    (lambda (r p wr)
+      (display-string "#<osi-port " p)
+      (wr (osi-port-name r) p)
+      (write-char #\> p)))
+
+  (record-writer (record-type-descriptor path-watcher)
+    (lambda (r p wr)
+      (display-string "#<path-watcher " p)
+      (wr (path-watcher-path r) p)
+      (write-char #\> p)))
+
+  (record-writer (record-type-descriptor listener)
+    (lambda (r p wr)
+      (display-string "#<tcp-listener " p)
+      (display-socket r p)
+      (write-char #\> p)))
   )

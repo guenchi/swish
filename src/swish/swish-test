@@ -41,13 +41,18 @@
   (cli-specs
    [incl-tags --tag (list "<tag>") "run only the tests with this tag"]
    [excl-tags --not (list "<tag>") "exclude tests with this tag"]
-   [progress --progress (string "<mode>") "<mode>={test|suite|none}"]
    [test-run --test-run (string "<UUID>")
     "use the specified <UUID> to identify the test run instead of generating one"]
+   [rerun --rerun (string "<type>")
+     (ct:join #\space
+       "rerun tests whose result type matches <type>, where <type> is"
+       "one of {pass|fail|skip} or a parenthesized Scheme list of those types;"
+       "here <spec> specifies test results in .ms.mo or .ss.mo files")]
    [specs (list . "<spec>") "directory | suite [{test | -t test} ...]"]))
 
 (define test-and-report-cli
   (cli-specs
+   [progress --progress (string "<mode>") "<mode>={test|suite|none}"]
    [load-prof --load-profile (list "<file>" "<file>" ...)
     "load the specified profile(s)"]
    [save-prof --save-profile (string "<file>")
@@ -57,7 +62,8 @@
    [coverage --coverage (string "<file>") "write coverage report to <file>"]
    [exclude --exclude (list "<glob>")
     "exclude these files from coverage report"]
-   [include --include (list "<glob>") "override exclude for coverage report"]))
+   [include --include (list "<glob>") "override exclude for coverage report"]
+   [info --info bool "summarize software-info meta-data from test results"]))
 
 (define report-only-cli
   (cli-specs
@@ -85,7 +91,7 @@
 
 (define (wrap indent . texts)
   (wrap-text (current-output-port)
-    (- (help-wrap-width) indent) indent indent (join texts #\space)))
+    (- (help-wrap-width) indent) indent indent texts))
 
 (define report-formats '(("json" . json) ("html" . html) ("htm" . html)))
 
@@ -125,6 +131,11 @@
          (display sep)
          ((car ps))))]))
 
+(define (sorted-cells ht key<?)
+  (vector->list
+   (vector-sort (lambda (a b) (key<? (car a) (car b)))
+     (hashtable-cells ht))))
+
 (define (usage short? sections ht)
   (define selected
     (cond
@@ -143,9 +154,7 @@
         (map (lambda (fmt)
                (format (oxford-comma "~{~a (~@{" "\".~a\"" " or " "~})~}")
                  fmt))
-          (vector->list
-           (vector-sort (lambda (a b) (string<? (car a) (car b)))
-             (hashtable-cells ht)))))))
+          (sorted-cells ht string<?)))))
   (any-sections selected
     [(all usage)
      (display-usage "Usage:" who testing-cli)
@@ -164,8 +173,11 @@
     [(all details)
      (wrap 0
        "By default, " who " runs all tests in the specified test suites."
-       "To run a limited set of tests, specify a suite or a suite and test"
-       "or use --tag or --not to filter tests based on tags.\n"
+       "To run a limited set of tests, use --tag or --not to select or exclude"
+       "tests based on the tags present in the mat or isolate-mat forms."
+       "To run particular tests, specify a suite followed by names of one"
+       "or more tests in the suite. Use -t to disambiguate where a test name"
+       "happens to match the name of an existing suite.\n"
        "\n"
        "Test suites are files with a \".ms\" or \".ss\" extension listed"
        "explicitly on the command line or found by recursively searching"
@@ -216,7 +228,12 @@
        "run tests t1, t2, and t3 from ./src/foo.ms and all tests from src/bar.ms\n")
      (example (who " --tag fast --not regression src web")
        "run only the tests under src and web whose mat tags include fast,"
-       "but not regression.")])
+       "but not regression.\n")
+     (example (who " --rerun fail --not long src web/alt.ms.mo")
+       "rerun failed tests under src or in web/alt.ms"
+       "whose tags do not include long.\n")
+     (example (who " --rerun '(skip fail)' .")
+       "rerun tests under . that failed or were skipped.")])
   (let ([invalid (fold-right remq sections help-sections)])
     (unless (null? invalid)
       (fail "unrecognized help section~p:~{ ~a~}" (length invalid) invalid)))
@@ -237,7 +254,7 @@
           (match entry
             [(,fn . ,@DIRENT_DIR) (search (combine path fn) hits)]
             [(,fn . ,@DIRENT_FILE)
-             (if (member (path-extension fn) extensions)
+             (if (ormap (lambda (ext) (ends-with-ci? fn ext)) extensions)
                  (cons (combine path fn) hits)
                  hits)]
             [,_ hits])) ;; not following symlinks
@@ -304,6 +321,10 @@
     var keys = [];
     for (key in info) keys.push(key);
     keys.sort((a, b) => a > b);
+    let uname = meta['uname'];
+    let unameKeys = [];
+    for (key in uname) unameKeys.push(key);
+    unameKeys.sort((a, b) => a > b);
     return `<div class="suite-meta">
              <span class="date">${meta.date || "?"}<\/span>
              <span class="hostname">${meta['hostname']}<\/span>
@@ -312,6 +333,9 @@
                                   <span class="version">${escapeHtml(info[key]['version'])}<\/span>
                                   <div class="revision">${escapeHtml(info[key]['revision'])}<\/div>
                                 <\/div>`).join('')}
+             <table>
+              ${unameKeys.map(key => `<tr><td>${escapeHtml(key)}</td><td>${escapeHtml(uname[key])}</td>`).join('')}
+             </table>
             <\/div>`;
   }
   var results = [];
@@ -378,12 +402,32 @@
   function renderType(r) {
     return `<td class="result-type"><div class="result-${r.type}">${escapeHtml(r.type)}<\/div><\/td>`;
   }
+  function renderSource(r, prefix) {
+    return r ? `${prefix} at offset ${r.bfp || "?"} of ${r.path || "?"}` : "";
+  }
+  function renderFrame(r) {
+    return `${r.description || "?"}${renderSource(r.source, '') || renderSource(r['procedure-source'],' in procedure')}\n` +
+      (r.free || []).map(f => `  ${f.name}: ${f.value}\n`).join('');
+  }
+  function showTruncated(s) {
+    return s.truncated ? `Stack dump truncated due to max-depth = ${s.truncated}.` : '';
+  }
+  let nStackID = 0;
+  function renderStack(s) {
+    nStackID += 1;
+    return `<input id="${nStackID}" type="checkbox" class="result-stack" checked>
+            <label for="${nStackID}" class="result-stack"><span><\/span>${escapeHtml(s.frames.map(renderFrame).join('') + showTruncated(s))}<\/label>`;
+  }
+  function renderStacks(stacks) {
+    if (!Array.isArray(stacks)) return '';
+    return stacks.map(renderStack).join('');
+  }
   function renderDetails(r) {
     return (r.message || r.stack) ?
       `<td colspan="7">
          <div class="result-error">
            <div class="result-message">${escapeHtml(r.message)}<\/div>
-           <div class="result-stack">${escapeHtml(r.stack)}<\/div>
+           ${renderStacks(r.stacks)}
          <\/div>
        <\/td>`
       : ('pass' == r.type || 'Result' == r.type) ? renderSstats(r.sstats) : '<td colspan="7"><\/td>';
@@ -466,6 +510,8 @@
     };
   }
   document.addEventListener('DOMContentLoaded', function(event) {
+    // serialize as blob before we install suite meta-data
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
     data.forEach(suite => {
       let meta = suite['meta-data'];
       let rs = suite.results || [];
@@ -486,6 +532,8 @@
     setSort('Suite');
     if (!results.every(r => 'pass' == r.type || 'skip' == r.type)) setSort('Result');
     render();
+    var link = document.getElementById('downloadLink');
+    link.href = window.URL.createObjectURL(blob, {type: 'text/plain'});
   });
 |#)))
   (let ([op (open-file-to-replace filename)])
@@ -524,9 +572,12 @@
              ".result-fail { width: 4em; text-transform: uppercase; color: red;}"
              ".result-error { position: relative; min-width: 50vw; max-width: 60vw; }"
              ".result-message { }"
-             ".result-stack:hover { max-height: 10em; overflow: auto; }"
-             ".result-stack:not(:hover):not(:empty):before { content: \"...\"; position: absolute; right: 0px; bottom: 0px; margin-right: .5em; font-size: large; }"
-             ".result-stack { font-family: monospace; white-space: pre; background: rgba(255,220,220,.125); max-height: 1em; overflow: hidden; }"
+             "label.result-stack { display: flex; white-space: pre; overflow: auto; }"
+             "input.result-stack { display: none; }"
+             "input.result-stack + label span { min-width: 1em; display: inline-block; }"
+             "input.result-stack + label span::before { content: \"▼\"; }"
+             "input.result-stack:checked + label span::before { content: \"▶\"; }"
+             "input.result-stack:checked + label.result-stack { text-overflow: ellipsis; max-height: 1.25em; line-height: 1.25; overflow: hidden; }"
              ".result-type { width: 5em; }"
              ".result-sstats { text-align: right;}"
              ".sstats-cpu { width: 6em; }"
@@ -538,7 +589,7 @@
              ".sstats-gc-bytes { width: 7em; }"
              ".vscroll { overflow-y: auto; overflow-x: hidden; margin-top: var(--tableheaderheight); }"
              ".vscroll tr:first-child td {border-top-style: none; position: unset;}"
-             ".vscroll tr:first-child div {background: rgb(245,245,245); position: absolute; top 0px; margin-top: calc(-1 * var(--tableheaderheight));}"
+             ".vscroll tr:first-child div {background: rgb(245,245,245); position: absolute; margin-top: calc(-1 * var(--tableheaderheight));}"
              "table { table-layout: fixed; border-collapse: collapse; }"
              "tr { vertical-align: text-top; }"
              "tr:not(:first-child):hover { background: #f4f4f4; }"
@@ -549,26 +600,15 @@
               (div (@ (id "summary")))
               (div (@ (id "controls"))
                 (input (@ (type "checkbox") (id "showStatistics")))
-                (label (@ (for "showStatistics")) "Show Statistics")))
+                (label (@ (for "showStatistics")) "Show Statistics")
+                (a (@ (id "downloadLink") (style "margin-left: 1em;")) "Download Data")))
             (div (@ (class "vscroll"))
               (table (@ (id "content"))))))))))
-
-(define (console-summary mat-data* reporting?)
-  (let-values ([(pass fail skip completed attempted) (summarize-results mat-data*)])
-    (when reporting?
-      (printf "Tests run: ~s   Pass: ~s   Fail: ~s   Skip: ~s\n\n"
-        (+ pass fail) pass fail skip))
-    (let ([incomplete (- attempted completed)])
-      (unless (zero? incomplete)
-        (printf "*** Some test suite~p did not complete ***\n\n" incomplete)))))
 
 (define (if-exists fn) (and (regular-file? fn) fn))
 
 (define (get-test-files x)
-  (and (directory? x) (find-files x "ms" "ss")))
-
-(define (get-test-suite x)
-  (or (if-exists x) (if-exists (string-append x ".ms"))))
+  (and (directory? x) (find-files x ".ms" ".ss")))
 
 (define (path->file-uri path)
   (define (sanitize path)
@@ -580,64 +620,107 @@
 (define (->report-filename filename)
   (string-append filename ".mo"))
 
-(define (extract-suites specs)
-  (let ([ht (make-hashtable string-hash string=?)])
-    (define (add-suite suite)
-      (when (may-have-mats? suite)
-        (hashtable-update! ht suite
-          (lambda (old)
-            (or old (make-hashtable string-hash string=?)))
-          #f)))
-    (let lp ([specs specs])
-      (cond
-       [(null? specs)
-        (let-values ([(keys vals) (hashtable-entries ht)])
-          (vector->list
-           (vector-map
-            (lambda (suite test-set)
-              (cons suite
-                (map string->symbol (vector->list (hashtable-keys test-set)))))
-            keys vals)))]
-       [(get-test-files (car specs)) =>
-        (lambda (files)
-          (for-each add-suite files)
-          (lp (cdr specs)))]
-       [(get-test-suite (car specs)) =>
-        (lambda (suite)
-          (add-suite suite)
-          (let ([tt (hashtable-ref ht suite #f)])
-            (define (add-test test)
-              (hashtable-set! tt test #t))
-            (let lp2 ([ls (cdr specs)])
-              (match ls
-                [() (lp ls)]
-                [("-t") (fail "option expects value: -t")]
-                [("-t" ,test . ,rest)
-                 (add-test test)
-                 (lp2 rest)]
-                [(,test . ,rest)
-                 (guard (not (or (directory? test) (get-test-suite test))))
-                 (add-test test)
-                 (lp2 rest)]
-                [,rest
-                 (lp rest)]))))]
-       [else
-        (fail "expected directory or suite: ~s" (car specs))]))))
+(define-tuple <pre-spec> suite test)
+
+(define (get-rerun types x)
+  (cond
+   [(not types) #f]
+   [(null? types) '()]
+   [(directory? x) (extract-reruns types (find-files x ".ms.mo" ".ss.mo"))]
+   [(if-exists x) (extract-reruns types (list x))]
+   [else #f]))
+
+(define (extract-reruns types ls)
+  (define (add-pre-spec ls mr)
+    (if (not (memq (mat-result-type mr) types))
+        ls
+        (cons (<pre-spec> make
+                [suite (mat-result-test-file mr)]
+                [test (symbol->string (mat-result-test mr))])
+          ls)))
+  (let lp ([ls ls] [pre-specs '()])
+    (if (null? ls)
+        (reverse pre-specs)
+        (let ([results (get-results (car ls))])
+          (unless (json:ref results '(meta-data completed) #f)
+            (printf "Warning: ~a found incomplete results in ~a.\n"
+              (option-named 'rerun) (car ls)))
+          (lp (cdr ls)
+            (fold-left add-pre-spec pre-specs
+              (mat-data-results results)))))))
+
+(define (parse-rerun-type s)
+  (let* ([x (read (open-input-string s))]
+         [ls (if (list? x) x (list x))])
+    (cond
+     [(ormap (lambda (x) (and (not (memq x '(pass fail skip))) x)) ls) =>
+        (lambda (type)
+          (fail "invalid ~a type ~s" (option-named 'rerun) type))]
+     [else ls])))
+
+(define (extract-pre-specs specs)
+  (define out (make-hashtable values =))
+  (define (add-pre-spec! pre-spec)
+    (hashtable-set! out (hashtable-size out) pre-spec))
+  (define (add-suite! suite)
+    (when (may-have-mats? suite)
+      (add-pre-spec! (<pre-spec> make [suite suite] [test #f]))))
+  (define (add-test! suite test)
+    (add-pre-spec! (<pre-spec> make [suite suite] [test test])))
+  (define types (cond [(opt 'rerun) => parse-rerun-type] [else #f]))
+  (let lp ([specs specs])
+    (cond
+     [(null? specs)
+      (vector->list
+       (vector-map cdr
+         (vector-sort (lambda (a b) (< (car a) (car b)))
+           (hashtable-cells out))))]
+     [(get-rerun types (car specs)) =>
+      (lambda (pre-specs)
+        (for-each add-pre-spec! pre-specs)
+        (lp (cdr specs)))]
+     [(get-test-files (car specs)) =>
+      (lambda (files)
+        (for-each add-suite! files)
+        (lp (cdr specs)))]
+     [(if-exists (car specs)) =>
+      (lambda (suite)
+        (let lp2 ([added? #f] [ls (cdr specs)])
+          (match ls
+            [("-t") (fail "option expects value: -t")]
+            [("-t" ,test . ,rest)
+             (add-test! suite test)
+             (lp2 #t rest)]
+            [(,test . ,rest)
+             (guard (not (or (directory? test) (if-exists test))))
+             (add-test! suite test)
+             (lp2 #t rest)]
+            [,rest
+             (unless added? (add-suite! suite))
+             (lp rest)])))]
+     [else
+      (fail "expected directory or suite: ~s" (car specs))])))
+
+(define (get-results from)
+  (match (catch (load-results from))
+    [#(EXIT ,reason)
+     (fail "cannot load mat results from ~a: ~a" from
+       (exit-reason->english reason))]
+    [,results results]))
 
 (define (harvest from*)
   (let ([ht (make-hashtable string-hash string=?)])
-    (define (get-results from)
-      (match (catch (load-results from))
-        [#(EXIT ,reason)
-         (fail "cannot load mat results from ~a: ~a" from
-           (exit-reason->english reason))]
-        [,results results]))
     (define (add! from)
       (if (directory? from)
-          (for-each add! (find-files from "mo"))
-          (hashtable-set! ht from #t)))
+          (for-each add! (find-files from ".ms.mo" ".ss.mo"))
+          (hashtable-set! ht from (hashtable-size ht))))
     (for-each add! from*)
-    (vector->list (vector-map get-results (hashtable-keys ht)))))
+    (vector->list
+     (vector-map get-results
+       (vector-sort
+        (lambda (k1 k2)
+          (< (hashtable-ref ht k1 #f) (hashtable-ref ht k2 #f)))
+        (hashtable-keys ht))))))
 
 (define (option-named name)
   (format-spec
@@ -693,20 +776,24 @@
     (when (pair? ignored)
       (printf "~@[Ignoring ~{~a~^, ~} in ~a mode\n~]" ignored
         (option-named 'repl))))
-  (apply (scheme-start) (cons "--" (or (opt 'files) '())))]
+  ;; reset app:config etc. to values observed via run-test-spec
+  (parameterize ([app:name #f] [app:path #f] [app:config #f])
+    (apply swish-start "--" (or (opt 'files) '())))]
  [else
   (let ([incl-tags (map string->symbol (or (opt 'incl-tags) '()))]
         [excl-tags (map string->symbol (or (opt 'excl-tags) '()))]
         [exclude (or (opt 'exclude) '())]
         [include (or (opt 'include) '())]
+        [rerun (opt 'rerun)]
         [save-prof (opt 'save-prof)]
         [load-prof (opt 'load-prof)]
-        [progress (string->symbol (or (opt 'progress) "test"))]
+        [progress (cond [(opt 'progress) => string->symbol] [else #f])]
         [report (opt 'report)]
         [coverage (opt 'coverage)]
-        [suites (sort (lambda (s1 s2) (string<? (car s1) (car s2)))
-                  (extract-suites (or (opt 'specs) '())))])
+        [pre-specs (extract-pre-specs (or (opt 'specs) '()))])
     (check-report-format report 'report)
+    (unless (memq progress '(#f test suite none))
+      (fail "invalid ~a ~s" (option-named 'progress) progress))
     (cond
      [(and load-prof (not (or save-prof coverage)))
       (fail "~a requires ~a or ~a"
@@ -718,22 +805,29 @@
         (option-named 'coverage)
         (option-named 'load-prof)
         (option-named 'save-prof))]
-     [(and report (not (or (opt 'harvest) (opt 'load-results) (pair? suites))))
+     [(and report (not (or (opt 'harvest) (opt 'load-results) (pair? pre-specs))))
       (fail "~a requires ~a or ~a or a set of tests to run (~a)"
         (option-named 'report)
         (option-named 'harvest)
         (option-named 'load-results)
         (option-named 'files))]
-     [(and (opt 'harvest) (pair? suites))
+     [(and (opt 'rerun) (opt 'harvest))
+      (fail "~a conflicts with ~a"
+        (option-named 'rerun)
+        (option-named 'harvest))]
+     [(and (opt 'rerun) (opt 'load-results))
+      (fail "~a conflicts with ~a"
+        (option-named 'rerun)
+        (option-named 'load-results))]
+     [(and (opt 'harvest) (pair? pre-specs))
       (fail "~a conflicts with ~a"
         (option-named 'harvest)
         (option-named 'files))]
-     [(and (opt 'load-results) (pair? suites))
+     [(and (opt 'load-results) (pair? pre-specs))
       (fail "~a conflicts with ~a"
         (option-named 'load-results)
         (option-named 'files))])
-    (let ([test-files (map car suites)]
-          [test-run
+    (let ([test-run
            (uuid->string ;; normalize to swish's format
             (cond
              [(opt 'test-run) =>
@@ -743,7 +837,36 @@
                    (fail "invalid ~a UUID ~a" (option-named 'test-run) s)]
                   [,uuid uuid]))]
              [else (osi_make_uuid)]))])
-      (define report-files (map ->report-filename test-files))
+      (define (combine-specs pre-specs)
+        (define (flush curr-suite tests specs)
+          (if (not curr-suite)
+              specs
+              (cons
+               (<test-spec> make
+                 [test-file curr-suite]
+                 [test-run test-run]
+                 [report-file (->report-filename curr-suite)]
+                 [tests (and (pair? tests) (map string->symbol (reverse tests)))]
+                 [incl-tags incl-tags]
+                 [excl-tags excl-tags]
+                 [profile save-prof]
+                 [progress (or progress 'test)]
+                 [lib-dirs (library-directories)]
+                 [src-dirs (source-directories)])
+               specs)))
+        (let combine ([ps pre-specs] [curr-suite #f] [tests '()])
+          (match ps
+            [() (flush curr-suite tests '())]
+            [(`(<pre-spec> [suite ,@curr-suite] ,test) . ,rest)
+             (guard test)
+             (combine rest curr-suite (cons test tests))]
+            [(`(<pre-spec> ,suite ,test) . ,rest)
+             (flush curr-suite tests
+               (if test
+                   (combine rest suite (list test))
+                   (flush suite #f
+                     (combine rest #f '()))))])))
+      (define test-specs (combine-specs pre-specs))
       (define status 0)
       (define no-tests '())
       (define full-load-filenames
@@ -760,6 +883,7 @@
            (fail "~a ~a failed (~a)" (option-named 'save-prof) save-prof
              (exit-reason->english reason))]
           [,op (close-port op)]))
+      (define report-files)
       (cond
        [(and load-prof save-prof)
         (let ([add-to-profile
@@ -777,30 +901,25 @@
                     (match (catch (profile:merge full-name))
                       [ok (void)]
                       [#(EXIT ,reason)
-                       (fail "cannot load profile data from ~a" user-supplied-name)]))))
+                       (fail "cannot load profile data from ~a: ~a" user-supplied-name
+                         (exit-reason->english reason))]))))
               (profile:stop))))]
        [save-prof (truncate-profile)])
-      (foreach ([suite/test suites] [report-file report-files])
-        ($init-mat-output-file report-file (car suite/test) test-run))
-      (foreach ([suite/test suites] [report-file report-files])
-        (let ([suite (car suite/test)]
-              [tests (cdr suite/test)])
-          (match (run-test-spec swish
-                   (<test-spec> make
-                     [test-file suite]
-                     [test-run test-run]
-                     [report-file report-file]
-                     [tests (and (pair? tests) tests)]
-                     [incl-tags incl-tags]
-                     [excl-tags excl-tags]
-                     [profile save-prof]
-                     [progress progress]
-                     [lib-dirs (library-directories)]
-                     [src-dirs (source-directories)]))
-            [ran (void)]
-            [fail (set! status 1)]
-            [skip (set! status 1)]
-            [no-tests (set! no-tests (cons suite no-tests))])))
+      (let ([done (make-hashtable string-hash string=?)])
+        (foreach ([spec test-specs])
+          (match spec
+            [`(<test-spec> ,test-file ,report-file ,test-run)
+             (unless (hashtable-contains? done test-file)
+               (hashtable-set! done test-file report-file)
+               ($init-mat-output-file report-file test-file test-run))]))
+        (set! report-files
+          (vector->list (vector-sort string<? (hashtable-values done)))))
+      (foreach ([spec test-specs])
+        (match (run-test-spec swish spec)
+          [ran (void)]
+          [fail (set! status 1)]
+          [skip (set! status 1)]
+          [no-tests (set! no-tests (cons (<test-spec> test-file spec) no-tests))]))
       (let ([summary
              (cond
               [(opt 'load-results) =>
@@ -825,7 +944,36 @@
           (if (profile:dump-html (or save-prof load-prof) coverage include exclude)
               (printf "see ~a\n" (path->file-uri (get-real-path coverage)))
               (printf "no profile to dump\n")))
-        (console-summary summary (or report coverage (opt 'load-results) (opt 'harvest)))
+        (call-with-values
+          (lambda ()
+            (summarize-results summary
+              (cond
+               [(or (opt 'harvest) (opt 'load-results)) (or progress 'summary)]
+               [(or report coverage) 'summary]
+               [else 'none])))
+          (lambda (pass fail skip completed attempted)
+            (when (or (opt 'harvest) (opt 'load-results))
+              (unless (and (> pass 0) (= fail 0) (= skip 0) (= completed attempted))
+                (set! status 1)))))
+        (when (opt 'info)
+          (let ([ht (make-eq-hashtable)])
+            (define (sym<? a b) (string<? (symbol->string a) (symbol->string b)))
+            (foreach ([mat-data summary])
+              (let ([info (json:ref mat-data '(meta-data software-info) (json:make-object))])
+                (foreach ([entry (vector->list (json:cells info))])
+                  (hashtable-update! ht (car entry)
+                    (lambda (prev)
+                      (let ([tbl (or prev (make-hashtable string-hash string=?))])
+                        (hashtable-set! tbl (json:object->string (cdr entry)) #t)
+                        tbl))
+                    #f))))
+            (foreach ([entry (sorted-cells ht sym<?)])
+              (foreach ([elt (sorted-cells (cdr entry) string<?)])
+                (let ([obj (json:string->object (car elt))])
+                  (fprintf (console-output-port) "~a ~a (~a)\n"
+                    (json:ref obj 'product-name "?")
+                    (json:ref obj 'version "?")
+                    (json:ref obj 'revision "?")))))))
         (match (filter (lambda (fn) (string=? "ms" (path-extension fn))) no-tests)
           [() (exit status)]
           [,expected-tests

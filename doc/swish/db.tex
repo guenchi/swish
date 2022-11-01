@@ -39,18 +39,20 @@ Definitive Guide to SQLite~\cite{sqlite-guide}.
 
 The \code{db} gen-server serializes internal requests to the
 database.  For storage and retrieval of data, each transaction is
-processed in turn by a separate linked process.  The gen-server does
+processed in turn by a separate monitored \var{worker} process.  The gen-server does
 not block waiting for this process to finish so that it can maintain
 linear performance by keeping its inbox short. The return value of the
 transaction is returned to the caller or an error is generated without
 tearing down the gen-server.
 
-To facilitate logging, the \code{db} gen-server can lazily open a
-transaction. In order to allow other processes access to the database,
-lazy transactions should be closed occasionally. To support this, it
-tracks a count of entries in the current transaction. A transaction is
-committed when the threshold of 10,000 is reached, the message queue
-of the \code{db} is empty, or when a direct transaction is requested.
+To facilitate logging, the \code{db} gen-server can execute SQL statements
+asynchronously. It enqueues SQL statements submitted via \code{db:log} and
+executes them by opening a transaction lazily when an explicit transaction is
+enqueued, when a \var{worker} process exits normally, or when the \code{db}
+message queue is empty and \code{commit-delay} has elapsed since enqueuing
+a \code{db:log} request in an empty queue.
+To maintain responsiveness, each lazy transaction commits at most \code{commit-limit} \code{db:log} requests.
+See \code{db:options} on page~\pageref{db:options} for details.
 By default, each database is created with write-ahead logging enabled
 to prevent write operations from blocking on queries made from another
 connection.
@@ -101,31 +103,55 @@ guardian via \code{make-foreign-handle-guardian}.
 \paragraph* {dictionary parameters}\index{db!parameters}
 \begin{itemize}
 
-\item \code{current-database} stores a Scheme record:\newline
-  \code{(define-record-type database (fields (mutable
-    handle)))}\newline The \code{handle} is set to \code{\#f} when
-  the database is closed.
+\item \code{current-database} stores a Scheme record:
+  \begin{alltt}
+(define-record-type database
+  (fields
+   (immutable filename)
+   (immutable create-time)
+   (mutable handle)))
+  \end{alltt}\antipar
+  The \code{handle} is set to \code{\#f} when the database is closed.
 
-\item \code{statement-cache} stores a Scheme record:\newline
-  \code{(define-record-type cache (fields (immutable ht) (mutable
-    waketime) (mutable lazy-statements)))}\newline
+\item \code{statement-cache} stores a Scheme record:
+  \begin{alltt}
+(define-record-type cache
+  (fields
+   (immutable ht)
+   (immutable expire-timeout)
+   (mutable waketime)
+   (mutable lazy-objects)))
+  \end{alltt}\antipar
+  The \code{expire-timeout} is the duration in milliseconds that
+  entries live in the cache. This is configurable using the
+  \code{cache-timeout} option.
+
   The \code{waketime} is the next time the cache will attempt to
   remove dead entries.
 
-  The hash table, \code{ht}, maps SQL strings to a Scheme
-  record:\newline \code{(define-record-type entry (fields
-    (immutable stmt) (mutable timestamp)))}\newline
+  The hash table, \code{ht}, maps SQL strings to a Scheme record:
+  \begin{alltt}
+(define-record-type entry
+  (fields
+   (immutable stmt)
+   (mutable timestamp)))
+  \end{alltt}\antipar
 
   When a SQL string is not found in the cache,
   \code{osi\_prepare\_statement} is used with the
   \code{current-database} to make a SQLite statement. The raw
-  statement handle is stored in a Scheme record:\newline
-  \code{(define-record-type statement (fields (immutable handle)
-    (immutable database)))}\newline
-  The statement is finalized using
-  \code{osi\_finalize\_statement} when it is removed from the
-  cache. \code{osi\_close\_database} will finalize any remaining
-  statements associated with the database.
+  statement handle is stored in a Scheme record:
+  \begin{alltt}
+(define-record-type statement
+  (fields
+   (immutable database)
+   (immutable sql)
+   (immutable create-time)
+   (mutable handle)))
+  \end{alltt}\antipar
+  The statement is finalized using \code{osi\_finalize\_statement}
+  when it is removed from the cache. \code{osi\_close\_database} will
+  finalize any remaining statements associated with the database.
 
   When a SQL string is found in the cache, the entry's
   \code{timestamp} is updated. Entries older than 5 minutes will
@@ -135,9 +161,9 @@ guardian via \code{make-foreign-handle-guardian}.
   \code{\#(db-error prepare \var{error} \var{sql})}, where
   \var{error} is a SQLite error pair.
 
-  The \code{lazy-statements} list contains \code{statement}
-  records created by \code{lazy-execute}. These statements are
-  finalized when a transaction completes.
+  The \code{lazy-objects} list contains \code{statement}
+  and marshaled \code{bindings} records created by \code{lazy-execute}.
+  These records are finalized when a transaction completes.
 
 \end{itemize}
 
@@ -177,24 +203,30 @@ processes the following message:
 
 \antipar\begin{itemize}
 
-\item \code{\#(log \var{sql} \var{bindings})}: Add this tuple to
-  the queue. Process the queue.
+\item \code{\#(<log> \var{sql} \var{mbindings})}: Add this tuple to the
+  queue. Process the queue.
 
 \end{itemize}
 
 \genserver{db}{handle-info} The \code{handle-info} procedure
-processes the following messages:
+processes messages matching the following patterns:
 
 \antipar\begin{itemize}
 
-\item \code{timeout}: Remove old entries from the statement cache.
+\item \code{timeout}: If the request queue is empty, remove old
+  entries from the statement cache. Process the queue.
 
-\item \code{\#(EXIT \var{worker-pid} normal)}: The worker finished
-  the previous request successfully. Process the queue.
+\item \code{`(DOWN \_ \var{worker-pid} \var{reason} \var{e})}: The
+  worker finished the previous request. If successful, process the
+  queue. Otherwise, flush the queue and stop with the fault \var{e}.
 
-\item \code{\#(EXIT \var{worker-pid} \var{reason})}: The worker
-  failed to process the previous request. Flush the queue and stop
-  with \var{reason}.
+\item \code{`(DOWN \_ \_ \_)}: Ignore the unexpected \code{DOWN}
+  message. Process the queue.
+
+\item \code{`(EXIT \var{pid} \_ \var{e})}: If the \var{pid} is the
+  worker, ignore the message. Do not update the state. A follow-up
+  \code{DOWN} message will process the queue. Otherwise, flush the
+  queue, and stop with the fault \var{e}.
 
 \end{itemize}
 
@@ -214,11 +246,19 @@ A commit threshold of 10,000 was chosen because it was large enough to
 minimize the cost of a transaction but small enough to execute simple
 queries in less than one second.
 
+Version 2.1.0 adds the concept of marshaled bindings. Bindings are
+copied into the C heap. The resulting handle is wrapped in a Scheme
+record and registered with a guardian via
+\code{make-foreign-handle-guardian}. The database worker process uses
+marshaled bindings to invoke \code{sqlite:bulk-execute} when processing log
+messages.
+
 \section {Programming Interface}
 
 \defineentry{db:start\&link}
 \begin{procedure}
-  \code{(db:start\&link \var{name} \var{filename} \var{mode} \opt{\var{db-init}})}
+  \code{(db:start\&link \var{name} \var{filename} \var{mode} \opt{\var{db-init}})}\\
+  \code{(db:start\&link \var{name} \var{filename} \var{mode} \opt{\var{db-options}})}
 \end{procedure}
 \returns{}
 \code{\#(ok \var{pid})} $|$
@@ -247,16 +287,51 @@ to \code{osi\_open\_database}:
   SQLITE\_OPEN\_READWRITE \code{SQLITE\_OPEN\_CREATE})}.
 \end{itemize}
 
+The SQLite constants can be found in \texttt{sqlite3.h} or
+online~\cite{sqlite}.
+
 \var{db-init} is a procedure that takes one argument, a database
 record instance. The return value is ignored. When the \var{mode} is
 \code{create} and \var{filename} is not a special SQLite filename, the
 default procedure sets \code{journal\_mode} to ``wal''; otherwise, no
 additional initialization occurs.
 
-The SQLite constants can be found in \texttt{sqlite3.h} or
-online~\cite{sqlite}.
+\var{db-options} can be defined using
+\code{(db:options [\var{option} \var{value}] \etc)}.
+The following options may be used:
+\defineentry{db:options}
+\phantomsection % make pageref go to correct page for this label
+\label{db:options}
 
-This procedure may return an \var{error} of \code{\#(db-error open
+\begin{tabular}{lp{5em}p{.65\textwidth}}
+  option & default & description \\ \hline
+
+  \code{init}
+  & see right
+  & a procedure, \code{(lambda (filename mode db) \etc)},
+  called when initializing the gen-server,
+  where \var{db} is a database record instance;
+  the default \code{init} procedure is equivalent to
+  the default \var{db-init} procedure described above \\
+
+  \code{cache-timeout}
+  & 5 minutes
+  & a nonnegative fixnum; the number of milliseconds before
+  unreferenced statements expire from the statement cache \\
+
+  \code{commit-delay}
+  & 0
+  & a nonnegative fixnum; the number of milliseconds
+  to wait before opening a lazy transaction \\
+
+  \code{commit-limit}
+  & 10,000
+  & a positive fixnum; the maximum number of \code{db:log}
+  entries to include when opening a lazy transaction \\
+\end{tabular}
+
+The \code{db:start\&link} procedure may return an \var{error} of
+\code{\#(db-error open
   \var{error} \var{filename})}, where \var{error} is a SQLite error
 pair.
 
@@ -287,6 +362,17 @@ exiting.  This is a suitable alternative to starting a
 SQLite connection, and you do not need to cache prepared SQL
 statements.
 
+\defineentry{db:expire-cache}
+\begin{procedure}
+  \code{(db:expire-cache \var{who})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{db:expire-cache} procedure enqueues a request to remove
+entries from the statement cache regardless of their expiration
+time. \code{BEGIN IMMEDIATE} and \code{COMMIT} remain in the cache
+because they are used frequently.
+
 \defineentry{db:filename}
 \begin{procedure}
   \code{(db:filename \var{who})}
@@ -304,8 +390,9 @@ The \code{db:filename} procedure calls \code{(gen-server:call
 \code{ok}
 
 The \code{db:log} procedure calls \code{(gen-server:cast \var{who}
-  \#(log \var{sql} \var{bindings}))}.  \var{sql} is a SQL string, and
-\var{bindings} is a list of values to be bound in the query.
+  \#(<log> \var{sql} \var{mbindings}))}, where \var{sql} is a SQL string,
+\var{bindings} is a list of values to be bound in the query, and
+\var{mbindings} is the result of \code{(sqlite:marshal-bindings \var{bindings})}.
 Because \code{db:log} does not wait for a reply from the server, any
 error in processing the request will crash the server.
 
@@ -336,7 +423,7 @@ this is a list of rows as returned by a \code{SELECT} query.
 \expandsto{} \antipar\begin{alltt}
 (match (db:transaction \var{db} (lambda () \var{body} \etc))
   [#(ok ,result) result]
-  [#(error ,reason) (raise reason)])
+  [#(error ,reason) (throw reason)])
 \end{alltt}
 
 The \code{transaction} macro runs the body in a transaction and
@@ -376,9 +463,11 @@ provided to \code{db:transaction}.
 A new SQLite statement is created from \var{sql} using
 \code{osi\_prepare\_statement} so that the statement won't interfere with
 any other queries. The statement is added to the
-\code{lazy-statements} list of the \code{statement-cache} and is
-finalized when the transaction completes.  The \var{bindings} are then
-applied using \code{osi\_bind\_statement}. A thunk is returned which, when
+\code{lazy-objects} list of the \code{statement-cache} and is
+finalized when the transaction completes.  The \var{bindings} are marshaled
+via \code{sqlite:marshal-bindings}. The resulting bindings record instance
+is added to the \code{lazy-objects} list and applied
+using \code{osi\_bind\_statement\_bindings}. A thunk is returned which, when
 called, executes the statement using \code{osi\_step\_statement}. The thunk
 returns one row of data or \code{\#f}.
 
@@ -430,7 +519,7 @@ By default, \var{symbol->sql} is the identity function.
 \begin{itemize}
 
 \item \code{(insert \var{table} ([\var{column} \var{e\(\sb{1}\)}
-    \var{e\(\sb{2}\)} \etc{}] \etc{})}
+    \var{e\(\sb{2}\)} \etc{}] \etc{}))}
 
   The \code{insert} form generates a SQL insert statement. The
   \var{table} and \var{column} patterns are SQL identifiers. Any
@@ -564,6 +653,36 @@ unfinalized statements to textual output port \var{op}, which defaults
 to the current output port.
 This is the procedure returned by \code{(foreign-handle-print\ 'statements)}.
 
+\defineentry{bindings?}
+\begin{procedure}
+  \code{(bindings? \var{x})}
+\end{procedure}
+\returns{} a boolean
+
+The \code{bindings?} procedure determines whether or not the datum
+\var{x} is a marshaled bindings record instance.
+
+\defineentry{bindings-count}
+\begin{procedure}
+  \code{(bindings-count)}
+\end{procedure}
+\returns{} the number of live marshaled bindings records
+
+The \code{bindings-count} procedure returns the number of live marshaled
+bindings records.
+This is the procedure returned by \code{(foreign-handle-count\ 'bindings)}.
+
+\defineentry{print-bindings}
+\begin{procedure}
+  \code{(print-bindings \opt{\var{op}})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{print-bindings} procedure prints information about all
+live marshaled bindings records to textual output port \var{op}, which
+defaults to the current output port.
+This is the procedure returned by \code{(foreign-handle-print\ 'bindings)}.
+
 \defineentry{sqlite:bind}
 \begin{procedure}
   \code{(sqlite:bind \var{stmt} \var{bindings})}
@@ -573,6 +692,18 @@ This is the procedure returned by \code{(foreign-handle-print\ 'statements)}.
 The \code{sqlite:bind} procedure binds the variables in statement
 record instance \var{stmt} with the list of \var{bindings}. It resets
 the statement before binding the variables.
+
+\defineentry{sqlite:bulk-execute}
+\begin{procedure}
+  \code{(sqlite:bulk-execute \var{stmts} \var{mbindings})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{sqlite:bulk-execute} procedure extracts the handles of the
+vectors \var{stmts} and \var{mbindings} and calls
+\code{osi\_bulk\_execute}.  \var{stmts} is a vector of statement
+record instances, and \var{mbindings} is a vector of corresponding
+marshaled bindings obtained via \code{sqlite:marshal-bindings}.
 
 \defineentry{sqlite:clear-bindings}
 \begin{procedure}
@@ -607,11 +738,18 @@ for the statement record instance \var{stmt}.
 \end{procedure}
 \returns{} a list of rows where each row is a vector of data in column order
 
-The \code{sqlite:execute} procedure calls \code{(sqlite:bind
-  \var{stmt} \var{bindings})} to bind any variables and then
-iteratively calls \code{(sqlite:step \var{stmt})} to build the
-resulting list of rows. It resets the statement when the procedure
-exits.
+The \code{sqlite:execute} procedure binds any variables in statement
+record instance \var{stmt} and then calls \code{(sqlite:step
+  \var{stmt})} repeatedly to build the resulting list of rows.
+If \var{bindings} is a marshaled bindings record instance,
+then \code{sqlite:execute} calls \code{osi\_bind\_statement\_bindings}
+to bind variables in the statement.
+Otherwise it calls \code{sqlite:marshal-bindings}
+before binding the variables and calls \code{sqlite:unmarshal-bindings}
+before returning.
+As a result, \code{sqlite:execute} accepts as \var{bindings} a list,
+a vector, or a marshaled bindings record instance.
+When the procedure exits, it resets the statement and clears the bindings.
 
 \defineentry{sqlite:expanded-sql}
 \begin{procedure}
@@ -632,15 +770,27 @@ expanded with the binding values for the statement record instance
 The \code{sqlite:finalize} procedure finalizes the statement record
 instance \var{stmt}.
 
+\defineentry{sqlite:get-bindings}
+\begin{procedure}
+  \code{(sqlite:get-bindings \var{bindings})}
+\end{procedure}
+\returns{} a vector or \code{\#f}
+
+The \code{sqlite:get-bindings} procedure returns a vector of the values
+marshaled in the \var{bindings} record instance via \code{sqlite:marshal-bindings},
+or \code{\#f} if the record has been unmarshaled by
+\code{sqlite:unmarshal-bindings}.
+
 \defineentry{sqlite:interrupt}
 \begin{procedure}
   \code{(sqlite:interrupt \var{db})}
 \end{procedure}
-\returns{} unspecified
+\returns{} a boolean
 
 The \code{sqlite:interrupt} procedure interrupts any pending
 operations on the database associated with database record instance
-\var{db}.
+\var{db}. It returns \code{\#t} when the database is busy and
+\code{\#f} otherwise.
 
 \defineentry{sqlite:last-insert-rowid}
 \begin{procedure}
@@ -652,6 +802,18 @@ The \code{sqlite:last-insert-rowid} procedure returns the rowid of the
 most recent successful insert into a rowid table or virtual table on
 the database associated with database record instance \var{db}. It
 returns 0 if no such insert has occurred.
+
+\defineentry{sqlite:marshal-bindings}
+\begin{procedure}
+  \code{(sqlite:marshal-bindings \var{bindings})}
+\end{procedure}
+\returns{} a marshaled bindings record instance or \code{\#f}
+
+The \code{sqlite:marshal-bindings} procedure returns a marshaled
+bindings record instance for the provided list or vector of
+\var{bindings}. The \code{sqlite:marshal-bindings} procedure registers
+the marshaled bindings record with a foreign-handle guardian using the
+type name \code{bindings}.
 
 \defineentry{sqlite:open}
 \begin{procedure}
@@ -698,3 +860,13 @@ the statement record instance \var{stmt}.
 The \code{sqlite:step} procedure steps the statement record instance
 \var{stmt} and returns the next row vector in column order or
 \code{\#f} if there are no more rows.
+
+\defineentry{sqlite:unmarshal-bindings}
+\begin{procedure}
+  \code{(sqlite:unmarshal-bindings \var{mbindings})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{sqlite:unmarshal-bindings} procedure deallocates the memory
+associated with the marshaled bindings record instance
+\var{mbindings}.

@@ -27,7 +27,9 @@
    <test-spec>
    assert-syntax-error
    capture-events
+   default-timeout
    delete-tree
+   discard-events
    gc
    handle-gone?
    isolate-mat
@@ -37,6 +39,7 @@
    process-alive?
    run-os-process
    run-test-spec
+   scale-timeout
    scheme-exe
    sleep-ms
    start-event-mgr
@@ -55,6 +58,7 @@
    (swish json)
    (swish log-db)
    (swish mat)
+   (swish meta)
    (swish osi)
    (swish pregexp)
    (swish profile)
@@ -93,6 +97,7 @@
   (define (sleep-ms t) (receive (after t 'ok)))
 
   (define (gc)
+    (debug-condition #f) ;; in case we've stashed a continuation condition
     (collect (collect-maximum-generation))
     (sleep-ms 10))
 
@@ -108,7 +113,7 @@
                      (event-mgr:start&link)
                      (send caller 'ready)
                      (receive)))])
-        (receive (after 1000 (raise 'timeout-starting-event-mgr))
+        (receive (after 1000 (throw 'timeout-starting-event-mgr))
           [ready 'ok]))))
 
   (define (start-silent-event-mgr)
@@ -120,23 +125,86 @@
     (let ([me self])
       (event-mgr:add-handler (lambda (event) (send me event)))))
 
-  (define ($isolate-mat thunk)
-    (let* ([pid (spawn thunk)]
-           [m (monitor pid)])
-      (receive (after 60000
-                 (kill pid 'kill)
-                 (raise 'timeout))
-        [#(DOWN ,@m ,@pid normal) (void)]
-        [#(DOWN ,@m ,@pid ,reason) (raise reason)])))
+  (define (discard-events)
+    (receive (after 0 'ok)
+      [,_ (discard-events)]))
 
-  (define-syntax isolate-mat
-    (syntax-rules ()
-      [(_ name tags e1 e2 ...)
-       (mat name tags ($isolate-mat (lambda () e1 e2 ...)))]))
+  (define (cleanup-after pid deadline kill-delay)
+    (let ([parent-id (process-id pid)]
+          [deadline (+ (erlang:now) deadline)]
+          [profiler (whereis 'profiler)])
+      (let ([rogues
+             (ps-fold-left > '()
+               (lambda (ls p)
+                 (if (or (<= (process-id p) parent-id) (eq? p profiler))
+                     ls
+                     (let ([m (monitor p)])
+                       (receive (until deadline (cons p ls))
+                         [`(DOWN ,@m ,@p ,r) ls])))))])
+        (for-each
+         (lambda (rogue)
+           (receive (after kill-delay (kill rogue 'shutdown))
+             [`(DOWN ,m ,@rogue ,r) 'ok]))
+         rogues))))
+
+  (define ($isolate-mat timeout deadline kill-delay thunk)
+    (let* ([white-flag
+            ;; avoid dynamic-wind frame in stack dump
+            (make-fault 'timeout)]
+           [me self]
+           [pid (spawn
+                 (lambda ()
+                   (thunk)
+                   (process-trap-exit #f)
+                   (send me `#(done ,self))
+                   (receive)))]
+           [m (monitor pid)])
+      (on-exit (cleanup-after pid deadline kill-delay)
+        (receive (after timeout
+                   (kill pid 'kill)
+                   (raise white-flag))
+          [`(DOWN ,@m ,@pid ,reason ,e) (raise e)]
+          [#(done ,@pid)
+           (kill pid 'shutdown)
+           (receive (after 1000 (throw 'timeout))
+             [`(DOWN ,@m ,@pid shutdown) 'ok]
+             [`(DOWN ,@m ,@pid ,r ,e) (raise e)])]))))
+
+  (define-syntax (isolate-mat x)
+    (define defaults
+      `([tags ()]
+        [timeout ,#'(scale-timeout 'isolate-mat)]
+        [process-cleanup-deadline 500]
+        [process-kill-delay 100]))
+    (define (make-lookup x forms)
+      (define clauses
+        (collect-clauses x forms (map car defaults)))
+      (lambda (key)
+        (syntax-case (find-clause key clauses) ()
+          [(key val) #'val]
+          [_ (cond
+              [(assq key defaults) => cadr]
+              [else (errorf 'isolate-mat "unknown key ~s" key)])])))
+    (syntax-case x ()
+      [(_ name (settings setting ...) e1 e2 ...)
+       (eq? (datum settings) 'settings)
+       (let ([lookup (make-lookup x #'(setting ...))])
+         (with-syntax ([tags (lookup 'tags)]
+                       [timeout-ms (lookup 'timeout)]
+                       [deadline (lookup 'process-cleanup-deadline)]
+                       [kill-delay (lookup 'process-kill-delay)])
+           #`(add-mat 'name 'tags
+               #,(replace-source x ;; use isolate-mat source in timeout continuation
+                   #'(lambda ()
+                       ($isolate-mat timeout-ms deadline kill-delay
+                         (lambda () e1 e2 ... (void)))
+                       (void))))))]
+      [(_ name tag-list e1 e2 ...)
+       #'(isolate-mat name (settings [tags tag-list]) e1 e2 ...)]))
 
   (define (match-prefix lines pattern)
     (match lines
-      [() (raise `#(pattern-not-found ,pattern))]
+      [() (throw `#(pattern-not-found ,pattern))]
       [(,line . ,rest)
        (if (starts-with? line pattern)
            line
@@ -147,7 +215,7 @@
       (demonitor m)
       (receive
        (after timeout #t)
-       [#(DOWN ,@m ,@x ,_) #f])))
+       [`(DOWN ,@m ,@x ,_) #f])))
 
   (define (boot-system)
     (log-file (path-combine (data-dir) "TestLog.db3"))
@@ -159,22 +227,26 @@
      [(whereis 'main-sup) =>
       (lambda (pid)
         (monitor pid)
-        (receive (after 60000 (raise 'main-sup-still-running))
-          [#(DOWN ,_ ,@pid ,_) 'ok]))]))
+        (receive (after 60000 (throw 'main-sup-still-running))
+          [`(DOWN ,_ ,@pid ,_) 'ok]))]))
 
   (define-syntax system-mat
     (syntax-rules ()
       [(_ name tags e1 e2 ...)
-       (mat name tags ($system-mat (lambda () (boot-system) e1 e2 ...)))]))
+       (mat name tags
+         ($system-mat
+          (lambda ()
+            (boot-system)
+            (let () e1 e2 ... (void)))))]))
 
   (define ($system-mat thunk)
     (parameterize ([console-error-port (open-output-string)])
       (let* ([pid (spawn thunk)]
              [m (monitor pid)])
         (on-exit (shutdown-system)
-          (receive (after 300000 (kill pid 'shutdown) (raise 'timeout))
-            [#(DOWN ,_ ,@pid normal) 'ok]
-            [#(DOWN ,_ ,@pid ,reason) (raise reason)])))))
+          (receive (after 300000 (kill pid 'shutdown) (throw 'timeout))
+            [`(DOWN ,_ ,@pid normal) 'ok]
+            [`(DOWN ,_ ,@pid ,reason ,e) (raise e)])))))
 
   (define-tuple <os-result> stdout stderr exit-status)
 
@@ -185,7 +257,7 @@
       (let ([to-stdin (binary->utf8 to-stdin)]
             [from-stdout (binary->utf8 from-stdout)]
             [from-stderr (binary->utf8 from-stderr)])
-        (define (spawn-handler pid tag ip)
+        (define (spawn-handler pid tag ip op)
           (define lines '())
           (define (spawn-drain handle-input)
             (spawn&link
@@ -200,20 +272,20 @@
           (define (print)
             (let ([c (read-char ip)])
               (unless (eof-object? c)
-                (write-char c)
-                (flush-output-port)
+                (write-char c op)
+                (flush-output-port op)
                 (print))))
           (spawn-drain (if (memq tag redirected) print collect-lines)))
-        (spawn-handler self 'stdout from-stdout)
-        (spawn-handler self 'stderr from-stderr)
+        (spawn-handler self 'stdout from-stdout (current-output-port))
+        (spawn-handler self 'stderr from-stderr (current-error-port))
         (on-exit (begin (close-output-port to-stdin)
                         (close-input-port from-stdout)
                         (close-input-port from-stderr))
           (write-stdin to-stdin)
           (receive
-           (after timeout
+           (after (scale-timeout (or timeout 'os-process))
              (osi_kill* os-pid 15)
-             (raise
+             (throw
               `#(os-process-timeout
                  #(stdout ,(receive (after 100 '()) [#(stdout ,@os-pid ,lines) lines]))
                  #(stderr ,(receive (after 100 '()) [#(stderr ,@os-pid ,lines) lines])))))
@@ -223,6 +295,43 @@
               [stderr (receive [#(stderr ,@os-pid ,lines) lines])]
               [exit-status exit-status])])))))
 
+  (define (scale-timeout timeout)
+    (define scale-factor
+      (or (cond
+           [(getenv "TIMEOUT_SCALE_FACTOR") => string->number]
+           [else 1])
+          1))
+    (assert (nonnegative? scale-factor))
+    (match (default-timeout timeout)
+      [infinity 'infinity]
+      [,ms
+       (guard (fixnum? ms))
+       (exact (round (* scale-factor ms)))]))
+
+  (module (default-timeout)
+    (define default-timeout
+      (let ([current (make-eq-hashtable)])
+        (case-lambda
+         [(key)
+          (cond
+           [(fixnum? key)
+            (unless (fxnonnegative? key)
+              (bad-arg 'default-timeout key))
+            key]
+           [(eq-hashtable-ref current key #f)]
+           [else (errorf 'default-timeout "unrecognized timeout ~s" key)])]
+         [(key val)
+          (arg-check default-timeout
+            [key symbol?]
+            [val
+             (lambda (x)
+               (or (eq? x 'infinity)
+                   (and (fixnum? x) (fxnonnegative? x))))])
+          (eq-hashtable-set! current key val)])))
+    (default-timeout 'infinity 'infinity)
+    (default-timeout 'isolate-mat 60000)
+    (default-timeout 'os-process 10000))
+
   (define (match-regexps patterns ls)
     (let check ([patterns patterns] [remaining-lines ls])
       (match patterns
@@ -230,7 +339,7 @@
         [(seek ,pattern . ,patterns)
          (let search ([re (pregexp pattern)] [lines remaining-lines])
            (match lines
-             [() (raise `#(pattern-not-found seek ,pattern ,remaining-lines))]
+             [() (throw `#(pattern-not-found seek ,pattern ,remaining-lines))]
              [(,line . ,lines)
               (if (pregexp-match re line)
                   (check patterns lines)
@@ -240,7 +349,7 @@
            [(,line . ,lines)
             (guard (pregexp-match pattern line))
             (check patterns lines)]
-           [,_ (raise `#(pattern-not-found ,pattern ,remaining-lines))])])))
+           [,_ (throw `#(pattern-not-found ,pattern ,remaining-lines))])])))
 
   (define (delete-tree path)
     (if (file-directory? path)
@@ -284,11 +393,11 @@
       (profile:prepare)
       (match (profile:start profile profile #t)
         [#(ok ,_) #t]
-        [#(error ,reason) (raise 'profile-failed-to-start)])
+        [#(error ,reason) (throw 'profile-failed-to-start)])
       (when (string=? "ms" (path-extension test-file))
         (let () (profile:exclude test-file) (void))))
     (match (catch (load-mats test-file profile))
-      [#(EXIT ,reason) (raise reason)]
+      [#(EXIT ,reason) (throw reason)]
       [none (exit 3)]
       [ok
        (let ([mo-op (open-file-to-append report-file)])

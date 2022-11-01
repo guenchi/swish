@@ -42,7 +42,8 @@
     timestamp
     pid
     killed
-    reason)
+    reason
+    details)
   (define-tuple <child-start>
     timestamp
     supervisor
@@ -63,9 +64,11 @@
   (define-tuple <gen-server-terminating>
     timestamp
     name
+    pid
     last-message
     state
-    reason)
+    reason
+    details)
   (define-tuple <http-request>
     timestamp
     pid
@@ -79,6 +82,8 @@
     date
     reason            ; startup | update | suspend | resume | shutdown
     bytes-allocated
+    current-memory-bytes
+    maximum-memory-bytes
     osi-bytes-used
     sqlite-memory
     sqlite-memory-highwater
@@ -89,12 +94,14 @@
     gc-count
     gc-cpu
     gc-real
-    gc-bytes)
+    gc-bytes
+    os-free-memory)
   (define-tuple <supervisor-error>
     timestamp
     supervisor
     error-context
     reason
+    details
     child-pid
     child-name)
   (define-tuple <system-attributes>
@@ -102,7 +109,13 @@
     date
     software-info
     machine-type
-    computer-name)
+    computer-name
+    os-pid
+    os-system
+    os-release
+    os-version
+    os-machine
+    os-total-memory)
   (define-tuple <transaction-retry>
     timestamp
     database

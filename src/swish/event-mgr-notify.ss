@@ -20,16 +20,51 @@
 ;;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 ;;; DEALINGS IN THE SOFTWARE.
 
+#!chezscheme
 (library (swish event-mgr-notify)
   (export
    event-mgr:notify
+   informative-exit-reason?
+   normalize-exit-reason
    system-detail
    )
   (import
    (chezscheme)
    (swish erlang)
+   (swish internal)
    (swish meta)
    )
+
+  ($import-internal make-fault-condition &fault-condition)
+
+  (define (abnormal? reason)
+    (not (memq reason '(normal shutdown))))
+
+  (define normalize-exit-reason
+    (case-lambda
+     [(x)
+      (match x
+        [`(catch ,r ,e) (normalize-exit-reason r e)]
+        [,_ (normalize-exit-reason x x)])]
+     [(reason err)
+      (let ([err (or err reason)])
+        (if (condition? reason)
+            (values 'exception (if (informative-exit-reason? err) err reason))
+            (values reason
+              (and (informative-exit-reason? err)
+                   ;; If called via (match (catch e) [`(catch ,reason ,err) ...]),
+                   ;; make fault so coerce records exit-reason->english message.
+                   (if (eq? err reason)
+                       (make-fault-condition #f reason '())
+                       err)))))]))
+
+  (define (informative-exit-reason? reason)
+    (and
+     (match reason
+       [`(&fault-condition ,reason ,k)
+        (or (#%$continuation? k) (abnormal? reason))]
+       [,_ (abnormal? reason)])
+     #t))
 
   (define (event-mgr:notify event)
     (cond

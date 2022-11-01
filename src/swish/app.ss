@@ -25,10 +25,8 @@
   (export
    $init-main-sup
    app-sup-spec
-   app:resume
    app:shutdown
    app:start
-   app:suspend
    make-swish-sup-spec
    swish-start
    )
@@ -42,9 +40,9 @@
    (swish errors)
    (swish event-mgr)
    (swish gatekeeper)
-   (swish http)
    (swish io)
    (swish log-db)
+   (swish meta)
    (swish osi)
    (swish pregexp)
    (swish software-info)
@@ -55,10 +53,6 @@
   (define (app:start) (application:start $init-main-sup))
 
   (alias app:shutdown application:shutdown)
-
-  (alias app:suspend statistics:suspend)
-
-  (alias app:resume statistics:resume)
 
   (define ($init-main-sup)
     ;; When one process at this level crashes, we want the supervisor
@@ -81,22 +75,21 @@
                      ;; after log-db shuts down from getting lost.
                      (process-trap-exit #t)
                      (receive
-                      [#(EXIT ,_ ,_) (event-mgr:unregister)])))))
+                      [`(EXIT ,_ ,_) (event-mgr:unregister)])))))
         permanent 1000 worker)
       #(log-db:setup ,(lambda () (log-db:setup loggers))
          temporary 1000 worker)
       #(statistics ,statistics:start&link
          permanent 1000 worker)
       #(gatekeeper ,gatekeeper:start&link
-         permanent 1000 worker)
-      #(http-sup ,http-sup:start&link permanent infinity supervisor)))
+         permanent 1000 worker)))
 
   (define app-sup-spec
     (make-parameter
      (make-swish-sup-spec (list swish-event-logger))
      (lambda (x)
        (let ([reason (supervisor:validate-start-specs x)])
-         (when reason (raise reason)))
+         (when reason (throw reason)))
        x)))
 
   (define cli
@@ -155,7 +148,19 @@
             (print-banner #f)
             (flush-output-port))
           (try-import)
-          (parameterize ([waiter-prompt-string (if (opt 'quiet) "" ">")])
+          (parameterize ([waiter-prompt-string (if (opt 'quiet) "" ">")]
+                         [repl-level (+ (repl-level) 1)])
+            (define (trap-CTRL-C handler)
+              (meta-cond
+               [windows?
+                (signal-handler SIGBREAK handler)
+                (signal-handler SIGINT handler)]
+               [else
+                (signal-handler SIGINT handler)]))
+            (when (interactive?)
+              (trap-CTRL-C
+               (let ([p self])
+                 (lambda (n) (keyboard-interrupt p)))))
             (for-each load filenames)
             (new-cafe)))]
        [else                            ; script
@@ -168,13 +173,11 @@
                          [app:config #f])
             (try-import)
             ;; use exit handler installed by the script, if any
-            (match (catch (load script-file))
-              [#(EXIT ,reason)
-               (app-exception-handler reason)
+            (match (try (load script-file))
+              [`(catch ,_ ,e)
+               (app-exception-handler e)
                (exit 1)]
-              [,_ (exit)])))])))
+              [,_ (void)])))])))
 
   (define (swish-start . args)
-    ($swish-start #f args run))
-
-  )
+    ($swish-start #f args run)))

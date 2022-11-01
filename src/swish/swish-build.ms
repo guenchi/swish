@@ -105,6 +105,25 @@
   (swish-build-test '("--version")
     '("swish-build Version (?:\\d+\\.){2}\\d+ \\([[:xdigit:]dirty-]+\\)")))
 
+(isolate-mat info ()
+  (swish-build-test '("--info")
+    (map pregexp-quote
+      (split
+       (trim-whitespace
+        (json:object->string
+         (json:make-object
+          [software-info (software-info)]
+          [uname
+           (match (get-uname)
+             [`(<uname> ,system ,release ,version ,machine)
+              (json:make-object
+               [os-machine machine]
+               [os-release release]
+               [os-system system]
+               [os-version version])])])
+         0))
+       #\newline))))
+
 (isolate-mat required-arguments ()
   (define testfile
     (write-example "triv"
@@ -115,6 +134,54 @@
   (match (catch (swish-build-test `(,testfile) '()))
     [#(EXIT `(<os-process-failed> [stderr ("swish-build: requires output filename.")]))
      'ok]))
+
+(isolate-mat errors ()
+  (define empty (write-example "empty" '()))
+  (define non-lib (write-example "non-lib" '((define x 1) (pretty-print x))))
+  (define tl-prog (write-example "tl-prog" '((top-level-program (import (scheme)) (newline)))))
+  (define mixed
+    (write-example "mixed"
+      ;; okay to compile a file containing more than one library, but can't mix in a top-level-program
+      '((library (A) (export a) (import (scheme)) (define a 1))
+        (top-level-program (import (scheme)) (newline)))))
+  (define mixed2
+    (write-example "mixed2"
+      ;; okay to compile a file containing more than one library, but can't mix in a top-level expression
+      '((library (A) (export a) (import (scheme)) (define a 1))
+        (write "hello"))))
+  (define-syntax expect-errors
+    (syntax-rules ()
+      [(_ [patterns expr] ...)
+       (begin
+         (match (try expr)
+           [`(catch `(<os-process-failed> ,stderr))
+            (match-regexps `patterns stderr)])
+         ...)]))
+  (expect-errors
+   [("swish-build: unexpected eof in fasl file.*")
+    (swish-build-test `("--library" "-o" "fail" ,empty) '())]
+   [("swish-build: expected .*library form, but encountered.*")
+    (swish-build-test `("--library" "-o" "fail" ,non-lib) '())]
+   [("swish-build: found program while reading library.*")
+    (swish-build-test `("--library" "-o" "fail" ,tl-prog) '())]
+   [("swish-build: found program while reading library.*")
+    (swish-build-test `("--library" "-o" "fail" ,mixed) '())]
+   [("swish-build: expected .*library form, but encountered.*")
+    (swish-build-test `("--library" "-o" "fail" ,mixed2) '())]
+   [("swish-build: invalid context for top-level-program form.*")
+    (swish-build-test `("-o" "fail" ,tl-prog) '())]
+   [("swish-build: invalid context for top-level-program form.*")
+    (swish-build-test `("-o" "fail" ,tl-prog "-c") '())]
+   [("swish-build: invalid context for top-level-program form.*")
+    (swish-build-test `("-o" "fail" ,tl-prog "-b" "petite") '())]
+   )
+  ;; empty program or component is okay; silly, but okay
+  (match-let*
+   ([() (swish-build-test `("-c" "-o" "empty" ,empty) '())]
+    [() (swish-build-test `("-o" "empty" ,empty) '())]
+    [() (swish-build-test `("-o" "empty" ,empty "-b" "petite") '())])
+   'ok)
+  )
 
 (define hello-fat
   `((import
@@ -129,7 +196,7 @@
   (delete-file wpo-file)
   (build-example "fat1" '("-b" "petite"))
   (match (get-stat wpo-file)
-    [`(<stat>) (raise "wpo file remains")]
+    [`(<stat>) (throw "wpo file remains")]
     [,_ 'ok])
   (run-fat "fat1" '() '("Hello, World!"))
   ;; run fat app via PATH search, not via relative or absolute path
@@ -493,7 +560,11 @@
   (match (catch (run-fat "rtlibs-swish-fat" '() '()))
     [#(EXIT `(<os-process-failed>
               [stdout ("A: [1,2,3]")]
-              [stderr ("rtlibs-swish-fat: library (swish json) is not visible.")]))
+              [stderr (,err-msg)]))
+     (assert
+      (or (string=? err-msg "rtlibs-swish-fat: library (swish json) is not visible.")
+          ;; 9.5.3 provides a more precise error message
+          (string=? err-msg "rtlibs-swish-fat: attempt to import invisible library (swish json).")))
      'ok])
 
   ;; Success case
@@ -538,20 +609,6 @@
   (swish-build-test `("-o" ,prog-compiled ,prog "--rtlib" ,libname "-L" ,libdir) '())
   (run-thin "rtlib-prog" '() '("abc: def")))
 
-;; TODO remove workaround once we move to Chez Scheme 9.5.4 containing
-;; f5fd9d144b68af26244855c7c2f34be97298deea
-(define (workaround-952 exprs)
-  ;; We wrap the expressions in (module () ...)
-  ;; so that the input is a definition, which prevents
-  ;; top-level-program from converting this into
-  ;;   (letrec* ([t1 (printf ...)]
-  ;;             [t2 (swish-start "--version")])
-  ;;     (void))
-  ;; which would fail since swish-start returns zero values
-  ;; to a context that expects one (but may fail only if
-  ;; cp0 is disabled, as when running profiled mats).
-  `(module () ,@exprs))
-
 (isolate-mat rtlibs-output ()
   (define rto-lib
     (write-example "rto-lib"
@@ -563,12 +620,11 @@
   (define rto-library (string-append rto-lib ".library"))
   (define rto-main
     (write-example "rto-main"
-      (list
-       (workaround-952
-        `((import (rto-lib) (scheme))
+      `((begin
+          (import (rto-lib) (scheme))
           (printf "~a ~a\n" x y)
           (waiter-prompt-string "")
-          (new-cafe))))))
+          (new-cafe)))))
   (define rto-out (output-file "rto-main"))
   (swish-build-test `("-o" ,rto-library "--library" ,rto-lib) '())
   ;; thin app omits petite.boot, swish-core.library, and swish.library despite --rtlib swish
@@ -626,7 +682,7 @@
                    [stdout ()]
                    [stderr ,stderr]))
           (match-regexps '(seek "application shutdown due to \\(exit foo\\)") stderr)])]))
-  ;; Attempt to call exit with a non-numeric exit code and is
+  ;; Attempt to call exit with a non-numeric exit code is
   ;; confusing enough that we output a message with the
   ;; console-event-handler.
   (define non-numeric-exit
@@ -667,28 +723,29 @@
   (run-fat "hook-exit" '() expected-output))
 
 (isolate-mat application-shutdown ()
-  (define event "Event: #\\(<child-end> [0-9]+ #<process [678]> 1 (normal|shutdown)")
+  (define event "Event: #\\(<child-end> [0-9]+ #<process [0-9]+:[0-9]+> 1 (normal|shutdown)")
   (define expected-output
     `(seek "Date:" "Timestamp:" ,event
-      seek "Date:" "Timestamp:" ,event
-      seek "Date:" "Timestamp:" ,event))
+       seek "Date:" "Timestamp:" ,event
+       seek "Date:" "Timestamp:" ,event))
   (define app-shutdown
     (write-test-file "app-shutdown.ss"
       (lambda ()
         (printf "#! /usr/bin/env swish\n")
-        (pretty-print
-          `(match (command-line-arguments)
+        (for-each pretty-print
+          `((log-file ":memory:")
+            (match (command-line-arguments)
               [("normal") (app:start)]
               [("abnormal")
                (begin
                  (app:start)
                  (kill (whereis 'application) 'shutdown)
                  (receive))]
-             [("specific")
-              (begin
-                (app:start)
-                (app:shutdown 42)
-                (receive))])))))
+              [("specific")
+               (begin
+                 (app:start)
+                 (app:shutdown 42)
+                 (receive))]))))))
   (set-file-mode app-shutdown #o755)
   ;; run as /usr/bin/env script
   (run-bash "app-shutdown.ss" '("normal") expected-output)
@@ -854,7 +911,11 @@
   (match (catch (run-script prog1 `(,comp2.out) '()))
     [#(EXIT `(<os-process-failed>
               [stdout ,@common-prefix]
-              [stderr ("prog1: variable say is not bound.")]))
+              [stderr (,err-msg)]))
+     (assert
+       (or (string=? err-msg "prog1: variable say is not bound.")
+           ;; 9.5.3 change in library-manager error messages
+           (string=? err-msg "prog1: attempt to invoke invisible library (lib1).")))
      'ok])
 
   ;; table not duplicated when prog2 is loaded and say is visible
@@ -891,7 +952,11 @@
   (match (catch (run-script prog1 `(,enable-crash) '()))
     [#(EXIT `(<os-process-failed>
               [stdout ,@common-prefix]
-              [stderr ("prog1: library (lib1) is not visible.")]))
+              [stderr (,err-msg)]))
+     (assert
+      (or (string=? err-msg "prog1: library (lib1) is not visible.")
+          ;; 9.5.3 provides more precise error message
+          (string=? err-msg "prog1: attempt to import invisible library (lib1).")))
      'ok])
 
   ;; expected crash does not happen since comp1 duplicates unarmed (crash-component)
@@ -940,7 +1005,8 @@
       [#(EXIT `(<os-process-failed> ,stdout ,stderr))
        (match-regexps comp-common stdout)
        (match-regexps
-        '("^Exception in visit: library \\(lib1\\) is not visible")
+        ;; 9.5.3 provides more precise error message
+        '("^(Exception in visit: library \\(lib1\\) is not visible|Exception: attempt to import invisible library \\(lib1\\)\\.)")
         stderr)])
     ;; can import lib1 by loading comp3, since it was compiled with --libs-visible
     (test-os-process swish-exe '("-q") (make-test-input comp3.out)
@@ -952,56 +1018,62 @@
   (define compiled (string-append (path-root source) ".so"))
   (define wpo (string-append (path-root source) ".wpo"))
   (define lib-compiled (path-combine (output-dir) "lib.so"))
-  (write-example "miss"
-    `((library (miss)
-        (export xyz)
-        (import (scheme))
-        (define xyz "PDQ"))))
-  (write-example "lib"
-    `((library (lib)
-        (export a)
-        (import (miss) (scheme))
-        (define a (list xyz "Bach")))))
-  (write-example "app"
-    `((import (lib) (scheme))
-      (printf "got:~{ ~a~}\n" a)))
-  (swish-build-test `("-o" ,compiled "--library" ,source) '())
-  ;; ensure we have only the compiled library, no source or wpo
-  (assert (delete-file source))
-  (assert (delete-file wpo))
-  ;; thin
-  (swish-build-test `("-v" "-L" ,(output-dir) "-o" ,(output-file "thin-ml") ,(input-file "app"))
-    `(seek ,(format "^~a$" (pregexp-quote "Added without whole-program optimization: (miss)"))))
-  (run-thin "thin-ml" '() '("^got: PDQ Bach$"))
-  ;; fat
-  (swish-build-test `("-v" "-L" ,(output-dir) "-o" ,(output-file "fat-ml") ,(input-file "app") "-b" "petite")
-    `(seek ,(format "^~a$" (pregexp-quote "Added without whole-program optimization: (miss)"))))
-  (run-fat "fat-ml" '() '("^got: PDQ Bach$"))
-  ;; library
-  (swish-build-test
-   `("-L" ,(output-dir) "--library" "-vv" "-o" ,lib-compiled ,(input-file "lib"))
-   '(seek
-     "^These libraries must be provided at run time:"
-     ;; could be .so or .sop file depending on whether or not we're profiling
-     ".*miss\\.sop?: \\(miss\\)"))
-  ;; delete lib.ss, but leave miss.so so we can check that the
-  ;; compiled library works so long as (miss) can be found
-  (assert (delete-file (input-file "lib")))
-  (test-os-process scheme-exe `("-q" "--import-notify" "--libdirs" ,(output-dir) ,lib-compiled)
-    (format "~{~s\n~}"
-      `((import (lib))
-        (pretty-print a)
-        #!eof))
-    `(seek
-      "^import: found object file \".*miss\\.so\""
-      seek
-      "^import: loading object file \".*miss\\.so\""
-      ,(pregexp-quote (format "~s" '("PDQ" "Bach")))))
-  ;; now delete miss.so so using compiled library fails
-  (assert (delete-file compiled))
-  (test-os-process scheme-exe `("-q" "--libdirs" ,(output-dir) ,lib-compiled)
-    (format "~{~s\n~}" `((reset-handler exit) (import (lib))))
-    (list "^Exception: library \\(miss\\) not found")))
+  ;; make tests less sensitive to changes in wrap-text line breaks,
+  ;; e.g., if run from directory with long path name
+  (with-script-test-parameters ([help-wrap-width (most-positive-fixnum)])
+    (write-example "miss"
+      `((library (miss)
+          (export xyz)
+          (import (scheme))
+          (define xyz "PDQ"))))
+    (write-example "lib"
+      `((library (lib)
+          (export a)
+          (import (miss) (scheme))
+          (define a (list xyz "Bach")))))
+    (write-example "app"
+      `((import (lib) (scheme))
+        (printf "got:~{ ~a~}\n" a)))
+    (swish-build-test `("-o" ,compiled "--library" ,source) '())
+    ;; ensure we have only the compiled library, no source or wpo
+    (assert (delete-file source))
+    (assert (delete-file wpo))
+    ;; thin
+    (swish-build-test `("-v" "-L" ,(output-dir) "-o" ,(output-file "thin-ml") ,(input-file "app"))
+      `(seek ,(format "^~a$" (pregexp-quote "Added without whole-program optimization: (miss)"))))
+    (run-thin "thin-ml" '() '("^got: PDQ Bach$"))
+    ;; fat
+    (swish-build-test `("-v" "-L" ,(output-dir) "-o" ,(output-file "fat-ml") ,(input-file "app") "-b" "petite")
+      `(seek ,(format "^~a$" (pregexp-quote "Added without whole-program optimization: (miss)"))))
+    (run-fat "fat-ml" '() '("^got: PDQ Bach$"))
+    ;; library
+    (swish-build-test
+     `("-L" ,(output-dir) "--library" "-vv" "-o" ,lib-compiled ,(input-file "lib"))
+     '(seek
+       "^These libraries must be provided at run time:"
+       ;; could be .so or .sop file depending on whether or not we're profiling
+       ".*miss\\.sop?: \\(miss\\)"))
+    ;; delete lib.ss, but leave miss.so so we can check that the
+    ;; compiled library works so long as (miss) can be found
+    (assert (delete-file (input-file "lib")))
+    (test-os-process scheme-exe `("-q" "--import-notify" "--libdirs" ,(output-dir) ,lib-compiled)
+      (format "~{~s\n~}"
+        `((import (lib))
+          (pretty-print a)
+          #!eof))
+      `(seek
+        "^import: found object file \".*miss\\.so\""
+        seek
+        ;; after Chez Scheme commit b911ed47190727b0e1d6a88c0e473d1757accdcd
+        ;; we get "visiting" here instead of "loading"
+        "^import: (load|visit)ing object file \".*miss\\.so\""
+        seek ;; skip new "attempting to 'revisit' previously 'visited' ..." message
+        ,(pregexp-quote (format "~s" '("PDQ" "Bach")))))
+    ;; now delete miss.so so using compiled library fails
+    (assert (delete-file compiled))
+    (test-os-process scheme-exe `("-q" "--libdirs" ,(output-dir) ,lib-compiled)
+      (format "~{~s\n~}" `((reset-handler exit) (import (lib))))
+      (list "^Exception: library \\(miss\\) not found"))))
 
 (isolate-mat claim-exceptions ()
   ;; run one source example three different ways
@@ -1136,8 +1208,8 @@
       (lambda ()
         (printf "#! /usr/bin/env swish\n")
         (pretty-print
-         (workaround-952
-          `((printf "Hello from ")
+         `(begin
+            (printf "Hello from ")
             (match-let*
              ([ok (begin (swish-start "--version") 'ok)]
               [ok (begin (swish-start "--help") 'ok)]
@@ -1167,7 +1239,7 @@
                                  [console-input-port (open-input-string ,outer-script-input)])
                     (swish-start ,outer-script "noodle" "soup"))))])
              (printf "~a\n" (app:name))
-             (printf "okay\n"))))))))
+             (printf "okay\n")))))))
   (define (expected-output who extra-stderr)
     `(;; ==stdin==
       ;; swish-start --version
@@ -1230,6 +1302,49 @@
   (run-fat "bounce" '() (expected-output "bounce" '()))
   )
 
+;; (swish-start <script> arg ...) should return, not exit
+(isolate-mat swish-start2 ()
+  (define script2
+    (write-test-file "script2"
+      (lambda ()
+        (printf "#! /usr/bin/env swish\n")
+        (for-each pretty-print
+          `((printf "script2 app:name = ~a, args =~{ ~a~}.\n"
+              (app:name) (command-line-arguments))
+            27)))))
+  (define script1
+    (write-test-file "script1"
+      (lambda ()
+        (printf "#! /usr/bin/env swish\n")
+        (for-each pretty-print
+          `((printf "script1 before: app:name = ~a, args =~{ ~a~}.\n"
+              (app:name) (command-line-arguments))
+            (printf "script1 calling script2\n")
+            (printf "result = ~s\n" (swish-start ,script2 "apple" "cider"))
+            (printf "script1 after: app:name = ~a, args =~{ ~a~}.\n"
+              (app:name) (command-line-arguments)))))))
+  (define script1.ss (string-append script1 ".ss"))
+  (define args '("ginger" "mace" "nutmeg"))
+  (define expected-output
+    (let ([arg-str (format "~{ ~a~}" args)])
+      `(,(format "^script1 before: app:name = script1, args =~a" arg-str)
+        "^script1 calling script2"
+        "^script2 app:name = script2, args = apple cider\\.$"
+        "^result = #<void>$"
+        ,(format "^script1 after: app:name = script1, args =~a" arg-str))))
+  (set-file-mode script1 #o755)
+  (set-file-mode script2 #o755)
+  ;; run as /usr/bin/env script
+  (run-bash "script1" args expected-output)
+  ;; run as thin app
+  (rename-path script1 script1.ss)
+  (build-example "script1" '())
+  (run-thin "script1" args expected-output)
+  (assert (delete-file (output-file "script1")))
+  ;; run as fat app
+  (build-example "script1" '("-b" "petite"))
+  (run-fat "script1" args expected-output))
+
 (isolate-mat try-import ()
   ;; combined into one big mat so we build fewer executables
   (define (ref-export var)
@@ -1255,10 +1370,9 @@
         ;; cases do try-import so script we load can work
         (printf "#! /usr/bin/env swish\n")
         (pretty-print
-         (workaround-952
-          `(;; cd so we can use relative path to keep Windows happy
+         `(begin ;; cd so we can use relative path to keep Windows happy
             (cd (path-parent (app:path)))
-            (apply swish-start (command-line-arguments))))))))
+            (apply swish-start (command-line-arguments)))))))
   (define importer.ss (path-last importer.ss-full-path))
   (define importer (path-root importer.ss))
   (define expected-output-core
@@ -1475,3 +1589,39 @@
   (run-thin "test" '() '("happy day" "great joy"))
   (delete-file test)
   )
+
+;; Regression test for bug where swish-build deletes the -o output-filename if
+;; source-filename extension matches an entry in library-extensions for which
+;; output-filename is the corresponding object file, e.g. "foo.ss" ->
+;; "foo.so".
+(isolate-mat filename-regression ()
+  (define lib.ss
+    (write-test-file "lib.ss"
+      (lambda ()
+        (pretty-print
+         '(library (lib)
+            (export x)
+            (import (scheme))
+            (define x 11))))))
+  (define lib.so (string-append (path-root lib.ss) ".so"))
+  (define prog.ss
+    (write-test-file "prog.ss"
+      (lambda ()
+        (pretty-print '(printf "okay\n")))))
+  (define prog.so (string-append (path-root prog.ss) ".so"))
+  ;; library case
+  (delete-file lib.so)
+  (swish-build-test `(,lib.ss "-o" ,lib.so "--library") '())
+  (assert (file-exists? lib.so))
+  ;; component case
+  (delete-file prog.so)
+  (swish-build-test `(,prog.ss "-o" ,prog.so "-c") '())
+  (assert (file-exists? prog.so))
+  ;; linked-program case
+  (delete-file prog.so)
+  (swish-build-test `(,prog.ss "-o" ,prog.so) '())
+  (assert (file-exists? prog.so))
+  ;; stand-alone program case
+  (delete-file prog.so)
+  (swish-build-test `(,prog.ss "-o" ,prog.so "-b" "petite") '())
+  (assert (file-exists? prog.so)))

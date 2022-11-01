@@ -22,6 +22,8 @@
 
 (library (swish string-utils)
   (export
+   ct:join
+   ct:string-append
    ends-with-ci?
    ends-with?
    format-rfc2822
@@ -38,7 +40,30 @@
   (import
    (chezscheme)
    (swish erlang)
+   (swish meta)
    (swish pregexp))
+
+  (define-syntax (ct:string-append x)
+    (syntax-case x ()
+      [(_ s ...)
+       (replace-source x
+         (match (combine-adjacent string? string-append #'(s ...))
+           [() (datum->syntax #'_ "")]
+           [(,s) (guard (string? s)) (datum->syntax #'_ s)]
+           [,exprs #`(string-append #,@exprs)]))]))
+
+  (define-syntax (ct:join x)
+    (define (do-join sep ls)
+      (if (or (null? ls) (null? (cdr ls)))
+          ls
+          (list* (car ls) sep (do-join sep (cdr ls)))))
+    (syntax-case x ()
+      [(_ sep s ...)
+       (char? (datum sep))
+       #`(ct:string-append #,@(do-join (string (datum sep)) #'(s ...)))]
+      [(_ sep s ...)
+       (string? (datum sep))
+       #`(ct:string-append #,@(do-join (datum sep) #'(s ...)))]))
 
   (define join
     (case-lambda
@@ -144,10 +169,10 @@
             (substring s start (fx+ i 1)))]))
     (find-start s 0 (string-length s)))
 
-  (define (extract text)
-    (let lp ([start 0] [acc '()])
+  (define (extract text acc)
+    (let lp ([start 0] [acc acc])
       (match (pregexp-match-positions (re "[^ \\n]+| |\\n") text start)
-        [#f (reverse acc)]
+        [#f acc]
         [((,start . ,end))
          (let ([s (substring text start end)])
            (lp end
@@ -171,7 +196,20 @@
                (cons 'ws rest)))])))
 
   (define (wrap-text op width initial-indent subsequent-indent text)
-    (let lp ([ls (minimize-whitespace (extract text))]
+    (arg-check 'wrap-text
+      [op output-port? textual-port?]
+      [width fixnum? fxnonnegative?]
+      [initial-indent fixnum? fxnonnegative?]
+      [subsequent-indent fixnum? fxnonnegative?]
+      [text (lambda (x) (or (string? x) (list? x)))])
+    (let lp ([ls (minimize-whitespace
+                  (reverse
+                   (if (string? text)
+                       (extract text '())
+                       (fold-left
+                        (lambda (ls s)
+                          (cons 'ws (extract s ls)))
+                        '() text))))]
              [pos 0] [indent initial-indent] [indent? #t])
       (match ls
         [() (void)]

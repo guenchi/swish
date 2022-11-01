@@ -29,6 +29,7 @@
    app:name
    app:path
    application:shutdown
+   repl-level
    )
   (import
    (chezscheme)
@@ -40,12 +41,16 @@
 
   (define application-exit-code 2)
 
+  (define app-identity #f)
+  (define pid1 #f)
+
   ;; intended to return short descriptive name of the application if known
   (define app:name
     (make-inherited-parameter #f
       (lambda (x)
         (unless (or (not x) (string? x))
           (bad-arg 'app:name x))
+        (when (eq? self pid1) (set! app-identity x))
         (and x (path-root (path-last x))))))
 
   ;; intended to return full path to the application script or executable, if known
@@ -55,6 +60,12 @@
         (unless (or (not x) (string? x))
           (bad-arg 'app:path x))
         (and x (get-real-path x)))))
+
+  (define repl-level
+    (make-process-parameter 0
+      (lambda (n)
+        (arg-check 'repl-level [n fixnum? nonnegative?])
+        n)))
 
   (define (strip-prefix string prefix)
     (define slen (string-length string))
@@ -66,30 +77,41 @@
   (define (claim-exception who c)
     (define stderr (console-error-port))
     (define os (open-output-string))
-    (fprintf stderr "~a: " who)
-    (guard (_ [else (display-condition c os)])
-      (cond
-       [(condition? c)
-        (display-condition (condition (make-who-condition #f) c) os)
-        (let ([text (get-output-string os)])
-          (display (or (strip-prefix text "Warning: ")
-                       (strip-prefix text "Exception: ")
-                       text)
-            os))]
-       [else (display (exit-reason->english c) os)]))
+    (when who (fprintf stderr "~a: " who))
+    (guard (_ [else (get-output-string os) (display-condition c os)])
+      (parameterize ([print-level 3] [print-length 6])
+        (cond
+         [(match c [`(catch ,_) #t] [,c (not (condition? c))])
+          (let ([text (exit-reason->english c)])
+            (unless who (display "Exception: " os))
+            (display text os))]
+         [(not who) (display (exit-reason->english c) os)]
+         [else
+          (display-condition (condition (make-who-condition #f) c) os)
+          (let ([text (get-output-string os)])
+            (display (or (strip-prefix text "Warning: ")
+                         (strip-prefix text "Exception: ")
+                         text)
+              os))])))
     ;; add final "." since display-condition does not and exit-reason->english may or may not
     (let ([i (- (port-output-index os) 1)])
       (when (and (> i 0) (not (char=? #\. (string-ref (port-output-buffer os) i))))
         (display "." os)))
     (display (get-output-string os) stderr)
     (fresh-line stderr)
-    (reset))
+    (unless (and (warning? c) (not (serious-condition? c)))
+      (when (and (> (repl-level) 0)
+                 (interactive?)
+                 (continuation-condition? (debug-condition)))
+        (display "Type (debug) to enter the debugger.\n" stderr))
+      (reset)))
 
   (define (app-exception-handler c)
     (debug-condition c)
-    (cond
-     [(app:name) => (lambda (who) (claim-exception who c))]
-     [else (default-exception-handler c)]))
+    (claim-exception (app:name)
+      (match c
+        [`(catch ,r) (if (condition? r) r c)]
+        [,_ c])))
 
   (define (int32? x) (and (or (fixnum? x) (bignum? x)) (<= #x-7FFFFFFF x #x7FFFFFFF)))
   (define (->exit-status exit-code)
@@ -103,6 +125,7 @@
   (profile-omit ;; profiler won't have a chance to save data for these due to osi_exit
 
    (define (exit-process exit-code)
+     (trap-signals #f)
      (catch (flush-output-port (console-output-port)))
      (catch (flush-output-port (console-error-port)))
      (let ([p (#%$top-level-value '$console-input-port)])
@@ -126,20 +149,31 @@
           (kill p 'shutdown))]
        [else (exit-process exit-code)])]))
 
-  (define (handle-signal n)
+  (define (quit)
+    ;; Spawn a process to avoid deadlock when application:shutdown
+    ;; calls exit-process.
     (spawn application:shutdown))
 
-  (define (trap-signals)
+  (define (handle-signal signo)
+    (match signo
+      [,@SIGHUP
+       ;; LSB 3.1.1: return 3 for unimplemented feature, e.g., SIGHUP to reload
+       (spawn (lambda () (application:shutdown 3)))]
+      [,_ (quit)]))
+
+  (define (trap-signals handler)
     (meta-cond
      [(memq (machine-type) '(i3nt ti3nt a6nt ta6nt))
-      (signal-handler SIGBREAK handle-signal)
-      (signal-handler SIGHUP handle-signal)
-      (signal-handler SIGINT handle-signal)]
+      (signal-handler SIGBREAK handler)
+      (signal-handler SIGHUP handler)
+      (signal-handler SIGINT handler)]
      [else
-      (signal-handler SIGINT handle-signal)
-      (signal-handler SIGTERM handle-signal)]))
+      (signal-handler SIGHUP handler)
+      (signal-handler SIGINT handler)
+      (signal-handler SIGTERM handler)]))
 
   (define started? #f)
+  (define Charon #f)
   (define ($swish-start stand-alone? args run)
     (let ([who (osi_get_executable_path)])
       (parameterize ([command-line (cons who args)]
@@ -147,6 +181,7 @@
         (cond
          [started? (run)]
          [else
+          (set! pid1 self)
           (set! started? #t)
           (base-exception-handler app-exception-handler)
           (random-seed (+ (remainder (erlang:now) (- (ash 1 32) 1)) 1))
@@ -157,12 +192,32 @@
               (lambda args
                 (apply application:shutdown args)
                 (bail)))
+             (reset-handler
+              (lambda ()
+                (application:shutdown application-exit-code)
+                (bail)))
              (when stand-alone?
                (app:name who)
                (app:path who))
-             (trap-signals)
+             (trap-signals handle-signal)
+             (set! Charon
+               (spawn
+                (let ([me self])
+                  (lambda ()
+                    (let ([m (monitor me)])
+                      (receive
+                       [`(DOWN ,@m ,_ normal) 'ok]
+                       [`(DOWN ,@m ,_ ,reason ,e)
+                        (app:name app-identity)
+                        (on-exit (application:shutdown application-exit-code)
+                          (app-exception-handler e))]))))))
              (call-with-values run exit)))
           (receive)]))))
+
+  ;; External entry points are run from the event-loop process
+  (set-top-level-value! '$shutdown quit)
+  (set-top-level-value! '$suspend void)
+  (set-top-level-value! '$resume void)
   )
 
 #!eof mats
@@ -170,10 +225,11 @@
 (load-this-exposing '(->exit-status))
 
 (import
+ (swish app-core)
  (swish mat)
  (swish profile)
  (swish testing)
- (swish app-core))
+ )
 
 (mat coverage ()
   (match-let*

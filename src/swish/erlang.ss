@@ -23,6 +23,8 @@
 #!chezscheme
 (library (swish erlang)
   (export
+   DOWN
+   EXIT
    add-finalizer
    arg-check
    bad-arg
@@ -37,9 +39,15 @@
    dump-stack
    erlang:now
    get-registered
+   global-process-id
    inherited-parameters
+   keyboard-interrupt
    kill
+   limit-stack
+   limit-stack?
    link
+   make-fault
+   make-fault/no-cc
    make-inherited-parameter
    make-process-parameter
    match
@@ -49,10 +57,14 @@
    monitor?
    on-exit
    pps
+   print-process-state
    process-id
+   process-name
+   process-parent
    process-trap-exit
    process?
    profile-me
+   ps-fold-left
    receive
    register
    reset-console-event-handler
@@ -60,13 +72,19 @@
    send
    spawn
    spawn&link
+   throw
+   try
    unlink
    unregister
    wait-for-io
+   walk-stack
+   walk-stack-max-depth
    whereis
+   with-process-details
    )
   (import
    (chezscheme)
+   (swish internal)
    (swish meta)
    (swish osi)
    )
@@ -141,6 +159,7 @@
 
   (define-record-type msg
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable contents))
     (parent q)
@@ -151,16 +170,18 @@
 
   (define-record-type mon
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable origin)
      (immutable target)))
 
   (define-record-type pcb
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable id)
      (immutable create-time)
-     (immutable parameters)
+     (mutable parameters)
      (mutable name)
      (mutable cont)
      (mutable sic)
@@ -207,25 +228,44 @@
           (fxlogbit1 2 (pcb-flags p))
           (fxlogbit0 2 (pcb-flags p)))))
 
+  (define (pcb-interrupt? p)
+    (fxlogbit? 3 (pcb-flags p)))
+
+  (define (pcb-interrupt?-set! p x)
+    (pcb-flags-set! p
+      (if x
+          (fxlogbit1 3 (pcb-flags p))
+          (fxlogbit0 3 (pcb-flags p)))))
+
   (define erlang:now osi_get_time)
 
   (define (panic event)
     (on-exit (osi_exit 80)
       (console-event-handler event)))
 
-  (define (@kill p reason)
+  (define (@kill p raw-reason)
+    (define reason (unwrap-fault-condition raw-reason))
+    (define extended-reason
+      (cond
+       [(pcb-cont p) =>
+        (lambda (k)
+          (if (memq reason '(normal shutdown))
+              raw-reason
+              (make-fault-condition k reason (list raw-reason))))]
+       [else raw-reason]))
     (when (eq? p event-loop-process)
       (panic `#(event-loop-process-terminated ,reason)))
     (when (eq? p finalizer-process)
       (panic `#(finalizer-process-terminated ,reason)))
     (when (enqueued? p)
-      (remove-q p))
+      (@remove-q p))
     (pcb-cont-set! p #f)
     (pcb-winders-set! p '())
-    (pcb-exception-state-set! p reason)
+    (pcb-exception-state-set! p extended-reason)
     (pcb-inbox-set! p #f)
     (pcb-flags-set! p 0)
     (pcb-src-set! p #f)
+    (pcb-parameters-set! p #f)
     (let ([name (pcb-name p)])
       (when name
         (pcb-name-set! p #f)
@@ -233,7 +273,7 @@
     (let ([links (pcb-links p)])
       (pcb-links-set! p '())
       (@remove-links links p)
-      (@kill-linked links p reason))
+      (@kill-linked links p reason extended-reason))
     (let ([monitors (pcb-monitors p)])
       (pcb-monitors-set! p '())
       (for-each
@@ -243,7 +283,7 @@
             [(eq? origin p)
              (@remove-monitor m (mon-target m))]
             [else
-             (@send origin `#(DOWN ,m ,p ,reason))
+             (@send origin (make-DOWN-msg m p extended-reason))
              (@remove-monitor m origin)])))
        monitors)))
 
@@ -262,30 +302,81 @@
   (define (@remove-monitor m p)
     (pcb-monitors-set! p (remq m (pcb-monitors p))))
 
+  ($import-internal
+   make-fault
+   make-fault/no-cc
+   &fault-condition fault-condition-reason fault-condition? make-fault-condition
+   EXIT-msg EXIT-msg? EXIT-msg-pid EXIT-msg-reason make-EXIT-msg
+   DOWN-msg DOWN-msg? DOWN-msg-monitor DOWN-msg-pid DOWN-msg-reason make-DOWN-msg)
+
+  (define (unwrap-fault-condition r)
+    (if (fault-condition? r)
+        (fault-condition-reason r)
+        r))
+
+  (define (->fault-condition reason)
+    (if (fault-condition? reason)
+        reason
+        (make-fault-condition #f reason '())))
+
+  (define (->EXIT reason)
+    `#(EXIT ,(unwrap-fault-condition reason)))
+
+  (define-syntax try
+    (syntax-rules ()
+      [(_ e1 e2 ...)
+       ($trap (lambda () e1 e2 ...) ->fault-condition)]))
+
+  ;; This binding serves a dual purpose: it provides backwards
+  ;; compatibility for older code and it provides a binding for
+  ;; the define-match-extension used in newer code.
   (define-syntax catch
     (syntax-rules ()
       [(_ e1 e2 ...)
-       (call/1cc
-        (lambda (return)
-          (with-exception-handler
-           (lambda (reason) (return `#(EXIT ,reason)))
-           (lambda () e1 e2 ...))))]))
+       ($trap (lambda () e1 e2 ...) ->EXIT)]))
+
+  (define ($trap thunk ->reason)
+    (call/1cc
+     (lambda (return)
+       (with-exception-handler
+        (lambda (r)
+          (return (->reason r)))
+        thunk))))
+
+  ($import-internal throw)
 
   (define (bad-arg who arg)
-    (raise `#(bad-arg ,who ,arg)))
+    (throw `#(bad-arg ,who ,arg)))
 
-  (define (kill p reason)
+  (define (kill p raw-reason)
     (unless (pcb? p)
       (bad-arg 'kill p))
     (no-interrupts
      (when (alive? p)
-       (cond
-        [(eq? reason 'kill) (@kill p 'killed)]
-        [(pcb-trap-exit p) (@send p `#(EXIT ,self ,reason))]
-        [(not (eq? reason 'normal)) (@kill p reason)])
+       (let ([reason (unwrap-fault-condition raw-reason)])
+         (cond
+          [(eq? reason 'kill) (@kill p 'killed)]
+          [(pcb-trap-exit p) (@send p (make-EXIT-msg self raw-reason))]
+          [(not (eq? reason 'normal)) (@kill p raw-reason)]))
        (unless (alive? self)
          (yield #f 0))))
     #t)
+
+  (define (keyboard-interrupt p)
+    (unless (pcb? p)
+      (bad-arg 'keyboard-interrupt p))
+    (if (eq? p self)
+        ((keyboard-interrupt-handler))
+        (no-interrupts
+         (when (alive? p)
+           (pcb-interrupt?-set! p #t)
+           (cond
+            [(pcb-sleeping? p)
+             (pcb-sleeping?-set! p #f)
+             (@enqueue p run-queue 0)]
+            [(pcb-blocked-io? p) (void)]
+            [(enqueued? p) (void)]
+            [else (@enqueue p run-queue 0)])))))
 
   (define process-trap-exit
     (case-lambda
@@ -307,10 +398,10 @@
        (cond
         [(alive? p) (@link p self)]
         [(pcb-trap-exit self)
-         (@send self `#(EXIT ,p ,(pcb-exception-state p)))]
+         (@send self (make-EXIT-msg p (pcb-exception-state p)))]
         [else
          (let ([r (pcb-exception-state p)])
-           (unless (eq? r 'normal)
+           (unless (eq? (unwrap-fault-condition r) 'normal)
              (@kill self r)
              (yield #f 0)))])))
     #t)
@@ -336,7 +427,7 @@
            (begin
              (add-monitor m self)
              (add-monitor m p))
-           (@send self `#(DOWN ,m ,p ,(pcb-exception-state p)))))
+           (@send self (make-DOWN-msg m p (pcb-exception-state p)))))
       m))
 
   (define (demonitor m)
@@ -350,7 +441,7 @@
   (define (demonitor&flush m)
     (demonitor m)
     (receive (until 0 #t)
-      [#(DOWN ,@m ,_ ,_) #t]))
+      [`(DOWN ,@m ,_ ,_) #t]))
 
   (define (make-queue)
     (let ([q (make-q)])
@@ -365,12 +456,12 @@
 
   (define (@enqueue process queue precedence)
     (when (enqueued? process)
-      (remove-q process))
+      (@remove-q process))
     (pcb-precedence-set! process precedence)
     (let find ([next queue])
       (let ([prev (q-prev next)])
         (if (or (eq? prev queue) (<= (pcb-precedence prev) precedence))
-            (insert-q process next)
+            (@insert-q process next)
             (find prev)))))
 
   (define last-process-id 0)
@@ -392,112 +483,203 @@
       (dump-process-table op (lambda (p) #t))]))
 
   (define (dump-process-table op pred)
-    (vector-for-each
-     (lambda (p)
-       (when (pred p)
-         (print-process p op)))
-     (vector-sort (lambda (x y) (< (pcb-id x) (pcb-id y)))
-       (no-interrupts (hashtable-keys process-table)))))
+    (parameterize ([print-length 3] [print-level 6])
+      (ps-fold-left < #f
+        (lambda (_ p)
+          (when (pred p)
+            (print-process p op))))))
+
+  (define (exception-state-continuation p)
+    (let ([e (pcb-exception-state p)])
+      (and (continuation-condition? e)
+           e)))
 
   (define dbg
     (case-lambda
      [()
       (dump-process-table (current-output-port)
-        (lambda (p)
-          (continuation-condition? (pcb-exception-state p))))]
+        exception-state-continuation)]
      [(who)
-      (define (find-match id exception base)
-        (if (eqv? id who) exception base))
-      (debug-condition (dbg #f find-match))
-      (debug)]
-     [(base proc) ;; proc is (lambda (id exception base) ...)
-      (define (gather p base)
-        (let ([exception (pcb-exception-state p)])
-          (if (continuation-condition? exception)
-              (proc (pcb-id p) exception base)
-              base)))
-      (fold-right gather base
-        (vector->list
-         (no-interrupts (hashtable-keys process-table))))]))
+      (define (find-process-to-debug base p)
+        (if (eqv? (process-id p) who)
+            (exception-state-continuation p)
+            base))
+      (debug-condition (ps-fold-left < #f find-process-to-debug))
+      (debug)]))
+
+  (define (ps-fold-left id<? base f)
+    (let* ([v (vector-sort (lambda (x y) (id<? (pcb-id x) (pcb-id y)))
+                (no-interrupts (hashtable-keys process-table)))]
+           [end (vector-length v)])
+      ;; fixed evaluation order in case f has side effects
+      (do ([i 0 (fx+ i 1)]
+           [base base (f base (vector-ref v i))])
+          ((= i end) base))))
 
   (define dump-stack
     (let ()
-      (define (source-path obj)
-        (call-with-values
-          (lambda () (obj 'source-path))
-          (case-lambda
-           [() #f]
-           [(path char)
-            (format " at offset ~a of ~a" char path)]
-           [(path line char)
-            (format " at line ~a, char ~a of ~a" line char path)])))
-      (define (dump-cont cont op)
-        (cont 'write op)
-        (cond
-         [(source-path cont) => (lambda (where) (display where op))]
-         [(source-path (cont 'code)) =>
-          (lambda (where) (fprintf op " in procedure~a" where))])
-        (newline op)
-        (when (cont 'source)
-          (do ([i 0 (fx+ i 1)] [len (cont 'length)])
-              ((fx= i len))
-            (let ([var (cont 'ref i)])
-              (fprintf op "  ~s: " (or (var 'name) i))
-              ((var 'ref) 'write op)
-              (newline op)))))
+      (define (source-path src)
+        (and (source-object? src)
+             (let ([sfd (source-object-sfd src)])
+               (call-with-values
+                 (lambda () (locate-source sfd (source-object-bfp src) #t))
+                 (case-lambda
+                  [()
+                   (format " at offset ~a of ~a" (source-object-bfp src)
+                     (source-file-descriptor-path sfd))]
+                  [(path line char)
+                   (format " at line ~a, char ~a of ~a" line char path)])))))
       (case-lambda
        [() (dump-stack (current-output-port))]
        [(op) (call/cc (lambda (k) (dump-stack k op 'default)))]
        [(k op max-depth)
+        (define (dump-frame name source proc-source vars)
+          (display name op)
+          (cond
+           [(source-path source) => (lambda (where) (display where op))]
+           [(source-path proc-source) =>
+            (lambda (where) (fprintf op " in procedure~a" where))])
+          (newline op)
+          (for-each
+           (lambda (var)
+             (fprintf op "  ~s: ~s\n" (car var) (cdr var)))
+           (or vars '())))
+        (define (next-frame frame base depth next) (next base))
+        (define (truncated base depth)
+          (fprintf op "Stack dump truncated due to max-depth = ~s.\n" depth))
         (unless (output-port? op) (bad-arg 'dump-stack op))
-        (let ([max-depth
-               (match max-depth
-                 [#f #f]
-                 [default 10]
-                 [,n (guard (and (fixnum? n) (positive? n))) n]
-                 [,_ (bad-arg 'dump-stack max-depth)])])
-          (parameterize ([print-level 3] [print-length 6] [print-gensym #f] [print-extended-identifiers #t])
-            (let loop ([cont (inspect/object k)] [depth 0])
-              (when (eq? (cont 'type) 'continuation)
-                (if (and max-depth (= depth max-depth))
-                    (fprintf op "Stack dump truncated due to max-depth = ~s.\n" max-depth)
-                    (begin
-                      (dump-cont cont op)
-                      (loop (cont 'link) (+ depth 1))))))))])))
+        (parameterize ([print-level 3] [print-length 6] [print-gensym #f] [print-extended-identifiers #t])
+          (walk-stack k (void) dump-frame next-frame
+            'dump-stack max-depth truncated))])))
+
+  (define ($limit-stack thunk source)
+    ;; thwart cp0 and ensure source is live on the stack
+    ((call-with-values thunk $limit-stack-receiver) source))
+
+  (define $limit-stack-receiver
+    (case-lambda
+     [(x) (lambda (source) x)]
+     [xs (lambda (source) (apply values xs))]))
+
+  (define-syntax (limit-stack x)
+    (syntax-case x ()
+      [(ls e0 e1 ...)
+       #`($limit-stack (lambda () e0 e1 ...)
+          #,(find-source #'ls))]))
+
+  (define (limit-stack? k)
+    (and (#3%$continuation? k)
+         (eq? (#3%$continuation-return-code k)
+           (#3%$closure-code $limit-stack))))
+
+  (define (do-frame cont handle-frame)
+    (let ([description (format "~s" (cont 'value))]
+          [source (cont 'source-object)]
+          [proc-source ((cont 'code) 'source-object)]
+          [vars
+           (do ([i (fx1- (cont 'length)) (fx1- i)]
+                [vars '()
+                  (let ([var (cont 'ref i)])
+                    (cons (cons (or (var 'name) i) ((var 'ref) 'value))
+                      vars))])
+               ((fx< i 0) vars))])
+      (handle-frame description source proc-source vars)))
+
+  (define walk-stack-max-depth
+    (make-parameter 10
+      (lambda (v)
+        (arg-check 'walk-stack-max-depth
+          [v fixnum? fxnonnegative?])
+        v)))
+
+  (define walk-stack
+    (case-lambda
+     [(k base handle-frame combine)
+      (walk-stack k base handle-frame combine 'walk-stack 'default
+        (lambda (base depth) base))]
+     [(k base handle-frame combine who max-depth truncated)
+      (define in (if (symbol? who) who 'walk-stack))
+      (arg-check in
+        [handle-frame procedure?]
+        [who symbol?]
+        [combine procedure?]
+        [truncated procedure?])
+      (let ([obey-limit? (eq? max-depth 'default)]
+            [max-depth
+             (match max-depth
+               [default (walk-stack-max-depth)]
+               [,n (guard (and (fixnum? n) (positive? n))) n]
+               [#f (most-positive-fixnum)]
+               [,_ (bad-arg in max-depth)])])
+        (let loop ([cont (inspect/object k)] [depth 0] [base base])
+          (cond
+           [(not (eq? (cont 'type) 'continuation)) base]
+           [(fx= depth max-depth) (truncated base depth)]
+           [else
+            ;; force evaluation order in case do-frame has side effects
+            (let ([frame (do-frame cont handle-frame)])
+              (combine frame base depth
+                (if (and obey-limit? (limit-stack? (cont 'value)))
+                    (lambda (base) base)
+                    (lambda (base)
+                      (loop (cont 'link) (+ depth 1) base)))))])))]))
 
   (define (process? p) (pcb? p))
 
   (define (print-process p op)
-    (define (print-src src op)
-      (when src
-        (match-let* ([#(,at ,offset ,file) src])
-          (fprintf op " ~a char ~d of ~a" at offset file))))
+    (with-process-details p
+     (lambda (id name spawned state)
+       (fprintf op " ~6d: " id)
+       (when name
+         (display name op)
+         (write-char #\space op))
+       (print-process-state state op)
+       (fprintf op ", spawned ~d\n" spawned))))
+
+  (define (with-process-details p k)
+    (arg-check 'with-process-details [p pcb?] [k procedure?])
     (let-values
         ([(name precedence sleeping? blocked-io? enqueued? completed? src)
           (with-interrupts-disabled
            (values (pcb-name p) (pcb-precedence p) (pcb-sleeping? p)
              (pcb-blocked-io? p) (enqueued? p) (not (alive? p)) (pcb-src p)))])
-      (fprintf op " ~6d: " (pcb-id p))
-      (when name
-        (display name op)
-        (write-char #\space op))
-      (cond
-       [(eq? self p)
-        (display-string "running" op)]
-       [sleeping?
-        (fprintf op "waiting for up to ~as"
-          (/ (max (- precedence (erlang:now)) 0) 1000.0))
-        (print-src src op)]
-       [blocked-io?
-        (fprintf op "waiting for ~a" src)]
-       [enqueued?
-        (display-string "ready to run" op)]
-       [completed?
-        (fprintf op "exited with reason ~s" (pcb-exception-state p))]
-       [else
-        (display-string "waiting indefinitely" op)
-        (print-src src op)])
-      (fprintf op ", spawned ~d\n" (pcb-create-time p))))
+      (k (pcb-id p) name (pcb-create-time p)
+        (cond
+         [(eq? self p) 'running]
+         [sleeping?
+          `#(sleep-up-to
+             ,(/ (max (- precedence (erlang:now)) 0) 1000.0)
+             ,src)]
+         [blocked-io? `#(waiting-for ,src)]
+         [enqueued? 'ready]
+         [completed? `#(exited ,(pcb-exception-state p))]
+         [else `#(waiting-indefinitely ,src)]))))
+
+  (define (print-src src op)
+    (when src
+      (match-let* ([#(,at ,offset ,file) src])
+        (fprintf op " ~a char ~d of ~a" at offset file))))
+
+  (define (print-process-state state op)
+    (match state
+      [running (display-string "running" op)]
+      [#(sleep-up-to ,seconds ,src)
+       (fprintf op "waiting for up to ~as" seconds)
+       (print-src src op)]
+      [#(waiting-for ,src)
+       (fprintf op "waiting for ~a" src)]
+      [ready (display-string "ready to run" op)]
+      [#(exited ,reason)
+       (fprintf op "exited with reason ~s" (unwrap-fault-condition reason))]
+      [#(waiting-indefinitely ,src)
+       (display-string "waiting indefinitely" op)
+       (print-src src op)]))
+
+  (define (global-process-id pid)
+    ($import-internal get-session-id)
+    (unless (pcb? pid)
+      (bad-arg 'global-process-id pid))
+    (format "~@[~d~]:~d" (get-session-id) (pcb-id pid)))
 
   (define process-id
     (case-lambda
@@ -507,10 +689,27 @@
         (bad-arg 'process-id p))
       (pcb-id p)]))
 
+  (define process-name
+    (case-lambda
+     [() (pcb-name self)]
+     [(p)
+      (unless (pcb? p)
+        (bad-arg 'process-name p))
+      (pcb-name p)]))
+
+  (define (process-parent)
+    (let ([x (weak-parent)])
+      (and (weak-pair? x)
+           (let ([x (car x)])
+             (and (not (bwp-object? x)) x)))))
+
   (define (inherit-parameters thunk)
+    (define parent self)
     (define inherited (inherited-parameters))
     (define vals (map (lambda (p) (p)) inherited))
     (lambda ()
+      (weak-parent (weak-cons parent '()))
+      (set! parent #f)
       (for-each (lambda (p v) (p v)) inherited vals)
       (set! inherited '())
       (set! vals '())
@@ -538,7 +737,7 @@
   (define (@send p x)
     (let ([inbox (pcb-inbox p)])
       (when inbox
-        (insert-q (make-msg x) inbox)
+        (@insert-q (make-msg x) inbox)
         (cond
          [(pcb-sleeping? p)
           (pcb-sleeping?-set! p #f)
@@ -562,14 +761,14 @@
      [(and (or (fixnum? timeout) (bignum? timeout)) (>= timeout 0))
       ($receive matcher src (+ (erlang:now) timeout) timeout-handler)]
      [(eq? timeout 'infinity) ($receive matcher src #f #f)]
-     [else (raise `#(timeout-value ,timeout ,src))]))
+     [else (throw `#(timeout-value ,timeout ,src))]))
 
   (define (receive-until matcher src time timeout-handler)
     (cond
      [(and (or (fixnum? time) (bignum? time)) (>= time 0))
       ($receive matcher src time timeout-handler)]
      [(eq? time 'infinity) ($receive matcher src #f #f)]
-     [else (raise `#(timeout-value ,time ,src))]))
+     [else (throw `#(timeout-value ,time ,src))]))
 
   (define ($receive matcher src waketime timeout-handler)
     (disable-interrupts)
@@ -580,13 +779,13 @@
           (cond
            [(not waketime)
             (pcb-src-set! self src)
-            (yield #f 0)
+            (@yield-preserving-interrupts #f 0)
             (pcb-src-set! self #f)
             (find prev)]
            [(< (erlang:now) waketime)
             (pcb-src-set! self src)
             (pcb-sleeping?-set! self #t)
-            (yield sleep-queue waketime)
+            (@yield-preserving-interrupts sleep-queue waketime)
             (pcb-src-set! self #f)
             (find prev)]
            [else
@@ -597,7 +796,7 @@
           (cond
            [(matcher (msg-contents msg)) =>
             (lambda (run)
-              (remove-q msg)
+              (no-interrupts (@remove-q msg))
               (run))]
            [else
             (disable-interrupts)
@@ -607,18 +806,14 @@
 
   (define quantum-nanoseconds 1000000) ;; 1 millisecond
 
-  (define (insert-q x next)
-    ;; No interrupts occur within this procedure because the record
-    ;; functions get inlined.
+  (define (@insert-q x next)
     (let ([prev (q-prev next)])
       (q-next-set! prev x)
       (q-prev-set! x prev)
       (q-next-set! x next)
       (q-prev-set! next x)))
 
-  (define (remove-q x)
-    ;; No interrupts occur within this procedure because the record
-    ;; functions get inlined.
+  (define (@remove-q x)
     (let ([prev (q-prev x)] [next (q-next x)])
       (q-next-set! prev next)
       (q-prev-set! next prev)
@@ -645,42 +840,55 @@
            #x1FFFFFFF)]))
 
   (define (yield queue precedence)
-    (let ([prev-sic (- (disable-interrupts) 1)])
-      (@event-check)
-      (when (alive? self)
-        (pcb-winders-set! self (#%$current-winders))
-        (pcb-exception-state-set! self (current-exception-state)))
-      (#%$current-winders '())
+    (@yield queue precedence (disable-interrupts)))
 
-      ;; snap the continuation
-      (call/1cc
-       (lambda (k)
-         (when (alive? self)
-           (pcb-cont-set! self k)
+  (define (@yield-preserving-interrupts queue precedence)
+    ;; If this process is interrupted, @yield should invoke the keyboard
+    ;; interrupt handler with interrupts enabled. Since we're called with
+    ;; interrupts disabled, we maintain this by disabling interrupts if
+    ;; @yield returns after it enables interrupts.
+    (disable-interrupts)
+    (@yield queue precedence (enable-interrupts))
+    (disable-interrupts))
+
+  ;; called with interrupts disabled, but may enable interrupts after restarting
+  ;; the new process
+  (define (@yield queue precedence disable-count)
+    (@event-check)
+    (when (alive? self)
+      (pcb-winders-set! self (#%$current-winders))
+      (pcb-exception-state-set! self (current-exception-state)))
+    (#%$current-winders '())
+
+    ;; snap the continuation
+    (call/1cc
+     (lambda (k)
+       (when (alive? self)
+         (pcb-cont-set! self k)
+         (cond
+          [queue (@enqueue self queue precedence)]
+          [(enqueued? self) (@remove-q self)]))
+
+       ;; context switch
+       (pcb-sic-set! self disable-count)
+       (let ([p (q-next run-queue)])
+         (when (eq? p run-queue)
+           (panic 'run-queue-empty))
+         (set-self! (@remove-q p)))
+
+       ;; adjust system interrupt counter for the new process
+       (let loop ([next-sic (pcb-sic self)])
+         (unless (fx= next-sic disable-count)
            (cond
-            [queue (@enqueue self queue precedence)]
-            [(enqueued? self) (remove-q self)]))
+            [(fx> next-sic disable-count)
+             (disable-interrupts)
+             (loop (fx- next-sic 1))]
+            [else
+             (enable-interrupts)
+             (loop (fx+ next-sic 1))])))
 
-         ;; context switch
-         (pcb-sic-set! self prev-sic)
-         (let ([p (q-next run-queue)])
-           (when (eq? p run-queue)
-             (panic 'run-queue-empty))
-           (set-self! (remove-q p)))
-
-         ;; adjust system interrupt counter for the new process
-         (let loop ([sic (pcb-sic self)])
-           (unless (fx= sic prev-sic)
-             (cond
-              [(fx> sic prev-sic)
-               (disable-interrupts)
-               (loop (fx- sic 1))]
-              [else
-               (enable-interrupts)
-               (loop (fx+ sic 1))])))
-
-         ;; Restart the process
-         ((pcb-cont self) (void)))))
+       ;; Restart the process
+       ((pcb-cont self) (void))))
 
     ;; Restart point
     (#%$current-winders (pcb-winders self))
@@ -690,7 +898,12 @@
     (pcb-exception-state-set! self #f) ;; drop ref
     (osi_set_quantum quantum-nanoseconds)
     (set-timer process-default-ticks)
-    (enable-interrupts))
+    (if (pcb-interrupt? self)
+        (begin
+          (pcb-interrupt?-set! self #f)
+          (enable-interrupts)
+          ((keyboard-interrupt-handler)))
+        (enable-interrupts)))
 
   (define @thunk->cont
     (let ([return #f])
@@ -716,7 +929,9 @@
                                 (exit-handler
                                  (case-lambda
                                   [() (raise 'normal)]
-                                  [(x . args) (raise x)]))
+                                  [(x . args) (throw x)]))
+                                (reset-handler
+                                 (lambda () (done (make-fault 'reset))))
                                 (thunk)
                                 'normal))])
                         ;; Process finished
@@ -727,14 +942,14 @@
             (#%$current-winders winders)
             k)))))
 
-  (define (@kill-linked links p reason)
+  (define (@kill-linked links p reason raw-reason)
     (unless (null? links)
       (let ([linked (car links)])
         (cond
          [(not (alive? linked))]
-         [(pcb-trap-exit linked) (@send linked `#(EXIT ,p ,reason))]
-         [(not (eq? reason 'normal)) (@kill linked reason)]))
-      (@kill-linked (cdr links) p reason)))
+         [(pcb-trap-exit linked) (@send linked (make-EXIT-msg p raw-reason))]
+         [(not (eq? reason 'normal)) (@kill linked raw-reason)]))
+      (@kill-linked (cdr links) p reason raw-reason)))
 
   (define (whereis name)
     (unless (symbol? name)
@@ -751,11 +966,11 @@
       (bad-arg 'register p))
     (with-interrupts-disabled
      (cond
-      [(not (alive? p)) (raise `#(process-dead ,p))]
+      [(not (alive? p)) (throw `#(process-dead ,p))]
       [(pcb-name p) =>
-       (lambda (name) (raise `#(process-already-registered ,name)))]
+       (lambda (name) (throw `#(process-already-registered ,name)))]
       [(eq-hashtable-ref registrar name #f) =>
-       (lambda (pid) (raise `#(name-already-registered ,pid)))]
+       (lambda (pid) (throw `#(name-already-registered ,pid)))]
       [else
        (pcb-name-set! p name)
        (eq-hashtable-set! registrar name p)
@@ -833,24 +1048,30 @@
 
   (define (console-event-handler event)
     (with-interrupts-disabled
-     (let ([op (console-error-port)]
-           [ht (or (event-condition-table) (make-eq-hashtable))])
-       (event-condition-table ht)
-       (fprintf op "\nDate: ~a\n" (date-and-time))
-       (fprintf op "Timestamp: ~a\n" (erlang:now))
-       (fprintf op "Event: ~s\n" event)
-       (let* ([keys (hashtable-keys ht)]
-              [end (vector-length keys)])
-         (do ([i 0 (fx1+ i)]) ((fx= i end))
-           (let ([c (vector-ref keys i)])
-             (unless (eq? (eq-hashtable-ref ht c #f) 'dumped)
-               (eq-hashtable-set! ht c 'dumped)
-               (fprintf op "Condition: ") (display-condition c op) (newline op)
-               (when (continuation-condition? c)
-                 (fprintf op "Stack:\n")
-                 (dump-stack (condition-continuation c) op 'default))))))
-       (newline op)
-       (flush-output-port op))))
+     (parameterize ([print-graph #t])
+       (let ([op (console-error-port)]
+             [ht (or (event-condition-table) (make-eq-hashtable))])
+         (event-condition-table ht)
+         (fprintf op "\nDate: ~a\n" (date-and-time))
+         (fprintf op "Timestamp: ~a\n" (erlang:now))
+         (fprintf op "Event: ~s\n" event)
+         (let* ([keys (hashtable-keys ht)]
+                [end (vector-length keys)])
+           (do ([i 0 (fx1+ i)]) ((fx= i end))
+             (let ([c (vector-ref keys i)])
+               (unless (eq? (eq-hashtable-ref ht c #f) 'dumped)
+                 (eq-hashtable-set! ht c 'dumped)
+                 (unless (fault-condition? c)
+                   (fprintf op "Condition: ")
+                   (display-condition c op)
+                   (newline op))
+                 (cond
+                  [(and (continuation-condition? c) (condition-continuation c)) =>
+                   (lambda (k)
+                     (fprintf op "Stack:\n")
+                     (dump-stack k op 'default))])))))
+         (newline op)
+         (flush-output-port op)))))
 
   (define make-process-parameter
     (case-lambda
@@ -887,7 +1108,18 @@
   (define make-inherited-parameter
     (case-lambda
      [(initial filter)
-      (add-inherited (make-process-parameter initial filter))]
+      ;; To reduce overhead in inherit-parameters, the internal inherited
+      ;; parameter does not call the filter. Instead, we return a wrapper that
+      ;; calls the provided filter when user code sets the parameter. The
+      ;; inherit-parameters code then propagates these filtered values into
+      ;; spawned processes.
+      (unless (procedure? filter)
+        (bad-arg 'make-inherited-parameter filter))
+      (let ([no-filter-param (make-process-parameter (filter initial))])
+        (add-inherited no-filter-param)
+        (case-lambda
+         [() (no-filter-param)]
+         [(v) (no-filter-param (filter v))]))]
      [(initial)
       (add-inherited (make-process-parameter initial))]))
 
@@ -946,7 +1178,7 @@
       [(_) #f]))
 
   (define (bad-match v src)
-    (raise `#(bad-match ,v ,src)))
+    (throw `#(bad-match ,v ,src)))
 
   (define extension)
   (define extensions)
@@ -1203,22 +1435,6 @@
              #,(match-help lookup
                  #'(v pattern fail (begin)) #f))])))
 
-  (meta define (valid-fields? x f* known-fields forbidden)
-    (let valid? ([f* f*] [seen '()])
-      (syntax-case f* ()
-        [(fn . rest)
-         (identifier? #'fn)
-         (let ([f (datum fn)])
-           (when (memq f seen)
-             (syntax-violation #f "duplicate field" x #'fn))
-           (when (memq f forbidden)
-             (syntax-violation #f "invalid field" x #'fn))
-           (unless (or (not known-fields) (memq f known-fields))
-             (syntax-violation #f "unknown field" x #'fn))
-           (valid? #'rest (cons f seen)))]
-        [() #t]
-        [_ #f])))
-
   (meta define (generate-name prefix fn)
     (if (not prefix) fn (compound-id fn prefix fn)))
 
@@ -1266,7 +1482,7 @@
                        (define tmp
                          (let ([val #,expr])
                            (unless (name is? val)
-                             (raise `#(bad-tuple name ,val ,#,(find-source x))))
+                             (throw `#(bad-tuple name ,val ,#,(find-source x))))
                            val))
                        #,@(map make-accessor (syntax->list field-names)))))
              (define (handle-copy x e bindings mode)
@@ -1274,7 +1490,7 @@
                    #,(case mode
                        [copy
                         #`(unless (name is? src)
-                            (raise `#(bad-tuple name ,src ,#,(find-source x))))]
+                            (throw `#(bad-tuple name ,src ,#,(find-source x))))]
                        [copy*
                         (handle-open x #'src #f (get-binding-names bindings))])
                    (vector 'name #,@(copy-tuple #'(field ...) 1 bindings))))
@@ -1320,12 +1536,17 @@
                [(name open expr field-names)
                 (eq? (datum open) 'open)
                 (handle-open x #'expr #f #'field-names)]
-               [(name is? e)
+               [(name is? . args)
                 (eq? (datum is?) 'is?)
-                #'(let ([x e])
-                    (and (vector? x)
-                         (#3%fx= (#3%vector-length x) (length '(name field ...)))
-                         (eq? (#3%vector-ref x 0) 'name)))]
+                (let ([is?
+                       #'(lambda (x)
+                           (and (vector? x)
+                                (#3%fx= (#3%vector-length x) (length '(name field ...)))
+                                (eq? (#3%vector-ref x 0) 'name)))])
+                  (syntax-case #'args ()
+                    [() is?]
+                    [(e) #`(#,is? e)]
+                    [else (syntax-case x ())]))]
                [(name fn e)
                 (syntax-datum-eq? #'fn #'field)
                 (with-syntax ([getter (replace-source x #'(name fn))])
@@ -1335,7 +1556,7 @@
                 (syntax-datum-eq? #'fn #'field)
                 #`(lambda (x)
                     (unless (name is? x)
-                      (raise `#(bad-tuple name ,x ,#,(find-source x))))
+                      (throw `#(bad-tuple name ,x ,#,(find-source x))))
                     (#3%vector-ref x #,(find-index #'fn #'(field ...) 1)))]
                ...
                [(name no-check fn e)
@@ -1352,6 +1573,69 @@
                ))
            (define-property name fields '(field ...)))]))
 
+  (define (legacy-EXIT? x)
+    (and (vector? x)
+         (#3%fx= (#3%vector-length x) 2)
+         (eq? (#3%vector-ref x 0) 'EXIT)))
+
+  (define-syntax direct-&fault-condition-ref
+    (syntax-rules ()
+      [(_ field x)
+       ((#3%csv7:record-field-accessor (record-type-descriptor &fault-condition) field) x)]))
+
+  (define-syntax exit-reason (syntax-rules ()))
+  (define-match-extension exit-reason
+    (lambda (v pattern)
+      (syntax-case pattern (quasiquote)
+        [`(exit-reason always-match? r e)
+         (with-temporaries (is-fault? tmp.reason)
+           #`((bind is-fault? (fault-condition? #,v))
+              (guard (or always-match? is-fault? (legacy-EXIT? #,v)))
+              (bind tmp.reason
+                (if is-fault?
+                    (direct-&fault-condition-ref 'reason #,v)
+                    (if always-match?
+                        (if (legacy-EXIT? #,v)
+                            (#3%vector-ref #,v 1)
+                            #,v)
+                        (#3%vector-ref #,v 1))))
+              (handle-fields (#,v is-fault? tmp.reason) [reason r] [err e])))]))
+    (lambda (input fld var options context)
+      (syntax-case input ()
+        [(v is-fault? tmp.reason)
+         (case (syntax->datum fld)
+           [(reason) #`((bind #,var tmp.reason))]
+           [(err) #`((bind #,var (if (and is-fault? (direct-&fault-condition-ref 'k v)) v tmp.reason)))]
+           [else (pretty-syntax-violation "unknown field" fld)])])))
+
+  (define-match-extension catch
+    (lambda (v pattern)
+      (syntax-case pattern (quasiquote)
+        [`(catch r)
+         (with-temporaries (tmp)
+           #`((sub-match #,v `(exit-reason #f r ,_))))]
+        [`(catch r e)
+         (with-temporaries (tmp)
+           #`((sub-match #,v `(exit-reason #f r e))))])))
+
+  (define-syntax DOWN (syntax-rules ()))
+  (define-match-extension DOWN
+    (lambda (v pattern)
+      (syntax-case pattern (quasiquote)
+        [`(DOWN m p r)
+         #`((sub-match #,v `(DOWN-msg [monitor m] [pid p] [reason `(exit-reason #t r ,_)])))]
+        [`(DOWN m p r e)
+         #`((sub-match #,v `(DOWN-msg [monitor m] [pid p] [reason `(exit-reason #t r e)])))])))
+
+  (define-syntax EXIT (syntax-rules ()))
+  (define-match-extension EXIT
+    (lambda (v pattern)
+      (syntax-case pattern (quasiquote)
+        [`(EXIT p r)
+         #`((sub-match #,v `(EXIT-msg [pid p] [reason `(exit-reason #t r ,_)])))]
+        [`(EXIT p r e)
+         #`((sub-match #,v `(EXIT-msg [pid p] [reason `(exit-reason #t r e)])))])))
+
   (define-syntax redefine
     (syntax-rules ()
       [(_ var e) (#%$set-top-level-value! 'var e)]))
@@ -1359,15 +1643,42 @@
   (define event-condition-table (make-parameter #f))
   (define (reset-console-event-handler) (event-condition-table #f))
 
+  (define (add-event-condition! c)
+    (let ([ht (event-condition-table)])
+      (when (and ht (not (eq-hashtable-ref ht c #f)))
+        (eq-hashtable-set! ht c #t))))
+
+  (define weak-parent (make-process-parameter #f))
+
+  (record-writer (record-type-descriptor mon)
+    (lambda (r p wr)
+      (display-string "#<monitor " p)
+      (wr (mon-origin r) p)
+      (display-string " " p)
+      (wr (mon-target r) p)
+      (write-char #\> p)))
+
   (record-writer (record-type-descriptor pcb)
     (lambda (r p wr)
       (display-string "#<process " p)
-      (wr (pcb-id r) p)
+      (display-string (global-process-id r) p)
       (let ([name (pcb-name r)])
         (when name
           (write-char #\space p)
           (wr name p)))
       (write-char #\> p)))
+
+  ;; support equal-hash on mon and pcb records so folks don't get burned
+  ;; by the default record-hash-procedure when using functional hash tables
+  (record-type-hash-procedure (record-type-descriptor mon)
+    (lambda (m hash)
+      (match-define `(mon ,origin ,target) m)
+      (+ (pcb-id origin)
+         (ash (pcb-id target) (quotient (fixnum-width) 2)))))
+
+  (record-type-hash-procedure (record-type-descriptor pcb)
+    (lambda (pcb hash)
+      (pcb-id pcb)))
 
   (record-writer (csv7:record-type-descriptor
                   (condition (make-error) (make-warning)))
@@ -1375,9 +1686,30 @@
       (display-string "#<compound condition: " p)
       (display-condition x p)
       (write-char #\> p)
-      (let ([ht (event-condition-table)])
-        (when (and ht (not (eq-hashtable-ref ht x #f)))
-          (eq-hashtable-set! ht x #t)))))
+      (add-event-condition! x)))
+
+  (record-writer (record-type-descriptor &fault-condition)
+    (lambda (r p wr)
+      (display-string "#<fault " p)
+      (wr (fault-condition-reason r) p)
+      (write-char #\> p)
+      (add-event-condition! r)))
+
+  (record-writer (record-type-descriptor EXIT-msg)
+    (lambda (r p wr)
+      (display-string "#<EXIT " p)
+      (wr (EXIT-msg-pid r) p)
+      (display-string " " p)
+      (wr (unwrap-fault-condition (EXIT-msg-reason r)) p)
+      (write-char #\> p)))
+
+  (record-writer (record-type-descriptor DOWN-msg)
+    (lambda (r p wr)
+      (display-string "#<DOWN " p)
+      (wr (DOWN-msg-pid r) p)
+      (display-string " " p)
+      (wr (unwrap-fault-condition (DOWN-msg-reason r)) p)
+      (write-char #\> p)))
 
   (disable-interrupts)
   (set-self! (@make-process #f))
@@ -1422,6 +1754,12 @@
       (lambda (x)
         (unless (procedure? x)
           (bad-arg 'exit-handler x))
+        x)))
+  (redefine keyboard-interrupt-handler
+    (make-process-parameter (keyboard-interrupt-handler)
+      (lambda (x)
+        (unless (procedure? x)
+          (bad-arg 'keyboard-interrupt-handler x))
         x)))
   (redefine pretty-initial-indent
     (make-process-parameter 0

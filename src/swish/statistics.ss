@@ -92,6 +92,11 @@
          [date date]
          [reason reason]
          [bytes-allocated (bytes-allocated)]
+         [current-memory-bytes (current-memory-bytes)]
+         [maximum-memory-bytes
+          (let ([max (maximum-memory-bytes)])
+            (reset-maximum-memory-bytes!)
+            max)]
          [osi-bytes-used (osi_get_bytes_used)]
          [sqlite-memory sqlite-memory]
          [sqlite-memory-highwater sqlite-memory-highwater]
@@ -102,6 +107,11 @@
          [gc-count (sstats-gc-count delta)]
          [gc-cpu (time-duration (sstats-gc-cpu delta))]
          [gc-real (time-duration (sstats-gc-real delta))]
-         [gc-bytes (sstats-gc-bytes delta)])
+         [gc-bytes (sstats-gc-bytes delta)]
+         [os-free-memory (osi_get_free_memory)])
        stats)))
+
+  ;; External entry points are run from the event-loop process.
+  (set-top-level-value! '$suspend statistics:suspend)
+  (set-top-level-value! '$resume statistics:resume)
   )

@@ -27,13 +27,17 @@
    SQLITE_OPEN_READONLY
    SQLITE_OPEN_READWRITE
    SQLITE_STATUS_MEMORY_USED
+   bindings-count
+   bindings?
    columns
    database-count
    database-create-time
    database-filename
    database?
+   db:expire-cache
    db:filename
    db:log
+   db:options
    db:start&link
    db:stop
    db:transaction
@@ -41,21 +45,26 @@
    execute-sql
    lazy-execute
    parse-sql
+   print-bindings
    print-databases
    print-statements
    sqlite:bind
+   sqlite:bulk-execute
    sqlite:clear-bindings
    sqlite:close
    sqlite:columns
    sqlite:execute
    sqlite:expanded-sql
    sqlite:finalize
+   sqlite:get-bindings
    sqlite:interrupt
    sqlite:last-insert-rowid
+   sqlite:marshal-bindings
    sqlite:open
    sqlite:prepare
    sqlite:sql
    sqlite:step
+   sqlite:unmarshal-bindings
    statement-count
    statement-create-time
    statement-database
@@ -71,6 +80,7 @@
    (swish events)
    (swish gen-server)
    (swish io)
+   (swish options)
    (swish osi)
    (swish queue)
    (swish string-utils)
@@ -84,18 +94,43 @@
   (define (init-wal db)
     (match (execute-sql db "pragma journal_mode=wal")
       [(#("wal")) 'ok]
-      [(#(,mode)) (raise `#(bad-journal-mode ,mode))]))
+      [(#(,mode)) (throw `#(bad-journal-mode ,mode))]))
+
+  (define (default-db-init filename mode db)
+    (when (and (eq? mode 'create)
+               (not (special-filename? filename)))
+      (init-wal db)))
+
+  (define-options db:options
+    (optional
+     [init
+      (default default-db-init)
+      (must-be (procedure/arity? #b1000))]
+     [cache-timeout
+      (default (* 5 60 1000))
+      (must-be fixnum? fxnonnegative?)]
+     [commit-delay
+      (default 0)
+      (must-be fixnum? fxnonnegative?)]
+     [commit-limit
+      (default 10000)
+      (must-be fixnum? fxpositive?)]))
 
   (define db:start&link
     (case-lambda
      [(name filename mode)
-      (db:start&link name filename mode
-        (if (and (eq? mode 'create)
-                 (not (special-filename? filename)))
-            init-wal
-            values))]
-     [(name filename mode db-init)
-      (gen-server:start&link name filename mode db-init)]))
+      (db:start&link name filename mode (db:options))]
+     [(name filename mode arg)
+      (gen-server:start&link name filename mode
+        (match arg
+          [`(<db:options>) arg]
+          [,db-init
+           (guard (procedure? db-init))
+           (db:options
+            [init
+             (lambda (filename mode db)
+               (db-init db))])]
+          [,_ (bad-arg 'db:start&link arg)]))]))
 
   (define (db:stop who)
     (gen-server:call who 'stop 'infinity))
@@ -104,24 +139,27 @@
     (gen-server:call who 'filename))
 
   (define (db:log who sql . bindings)
-    (gen-server:cast who `#(log ,sql ,bindings)))
+    (gen-server:cast who
+      (<log> make
+        [sql sql]
+        [mbindings (sqlite:marshal-bindings-no-check bindings)])))
 
   (define (db:transaction who f)
     (gen-server:call who `#(transaction ,f) 'infinity))
 
   (define (lazy-execute sql . bindings)
     (unless (statement-cache)
-      (raise `#(invalid-context lazy-execute)))
+      (throw `#(invalid-context lazy-execute)))
     ($lazy-execute sql bindings))
 
   (define (execute sql . bindings)
     (unless (statement-cache)
-      (raise `#(invalid-context execute)))
+      (throw `#(invalid-context execute)))
     ($execute sql bindings))
 
   (define (columns sql)
     (unless (statement-cache)
-      (raise `#(invalid-context columns)))
+      (throw `#(invalid-context columns)))
     (sqlite:columns (get-statement sql)))
 
   (define-syntax transaction
@@ -131,11 +169,18 @@
   (define ($transaction db thunk)
     (match (db:transaction db thunk)
       [#(ok ,result) result]
-      [#(error ,reason) (raise reason)]))
+      [#(error ,reason) (throw reason)]))
 
-  (define commit-threshold 10000)
+  (define (db:expire-cache who)
+    (transaction who
+      (remove-dead-entries (statement-cache)
+        (lambda (key)
+          (not (member key '("BEGIN IMMEDIATE" "COMMIT")))))))
 
-  (define-state-tuple <db-state> filename db cache queue worker)
+  (define-state-tuple <db-state>
+    filename db cache queue worker commit-delay commit-limit log-timeout)
+
+  (define-tuple <log> sql mbindings)
 
   (define current-database (make-process-parameter #f))
   (define statement-cache (make-process-parameter #f))
@@ -144,32 +189,41 @@
   (define SQLITE_OPEN_READWRITE 2)
   (define SQLITE_OPEN_CREATE 4)
 
-  (define (init filename mode db-init)
+  (define (init filename mode options)
+    (match-define `(<db:options> ,init ,cache-timeout ,commit-delay ,commit-limit) options)
     (process-trap-exit #t)
     (let ([db (sqlite:open filename
                 (match mode
                   [open SQLITE_OPEN_READWRITE]
                   [create
                    (logor SQLITE_OPEN_READWRITE SQLITE_OPEN_CREATE)]))])
-      (match (catch (db-init db))
-        [#(EXIT ,reason)
+      (match (try (init filename mode db))
+        [`(catch ,reason ,e)
          (sqlite:close db)
-         (raise reason)]
+         (raise e)]
         [,_ (void)])
       `#(ok ,(<db-state> make
                [filename filename]
                [db db]
-               [cache (make-cache)]
+               [cache (make-cache cache-timeout)]
                [queue queue:empty]
-               [worker #f]))))
+               [worker #f]
+               [commit-delay commit-delay]
+               [commit-limit commit-limit]
+               [log-timeout #f]))))
 
   (define (terminate reason state)
-    (catch (flush state))
-    (vector-for-each (lambda (e) (sqlite:finalize (entry-stmt e)))
-      (hashtable-values (cache-ht ($state cache))))
-    (finalize-lazy-statements ($state cache))
-    (sqlite:close ($state db))
-    'ok)
+    (let* ([x (try (flush (update state)))]
+           [y (try
+               (vector-for-each (lambda (e) (sqlite:finalize (entry-stmt e)))
+                 (hashtable-values (cache-ht ($state cache))))
+               (finalize-lazy-objects ($state cache))
+               (sqlite:close ($state db)))])
+      (match x
+        [`(catch ,_ ,e) (raise e)]
+        [,_ (match y
+              [`(catch ,_ ,e) (raise e)]
+              [,_ 'ok])])))
 
   (define (handle-call msg from state)
     (match msg
@@ -177,94 +231,164 @@
        (no-reply
         ($state copy* [queue (queue:add `#(transaction ,f ,from) queue)]))]
       [filename `#(reply ,($state filename) ,state ,(get-timeout state))]
-      [stop `#(stop normal stopped ,(flush state))]))
+      [stop `#(stop normal stopped ,state)]))
 
   (define (handle-cast msg state)
     (match msg
-      [#(log ,sql ,bindings)
-       (no-reply ($state copy* [queue (queue:add msg queue)]))]))
+      [`(<log>)
+       (no-reply/delay
+        ($state copy*
+          [queue (queue:add msg queue)]
+          [commit-delay commit-delay]
+          [log-timeout (or log-timeout (+ (erlang:now) commit-delay))]))]))
 
   (define (handle-info msg state)
-    (let ([pid ($state worker)])
-      (match msg
-        [timeout
-         (remove-dead-entries ($state cache))
-         (no-reply state)]
-        [#(EXIT ,@pid normal) (no-reply ($state copy [worker #f]))]
-        [#(EXIT ,_pid ,reason) `#(stop ,reason ,($state copy [worker #f]))])))
+    ($state open [cache queue worker])
+    (match msg
+      [timeout
+       (when (queue:empty? queue)
+         (remove-dead-entries cache (lambda (key) #f)))
+       (no-reply state)]
+      [`(DOWN ,_ ,@worker ,reason ,e)
+       (let ([state ($state copy [worker #f])])
+         (if (eq? reason 'normal)
+             (no-reply state)
+             `#(stop ,e ,state)))]
+      [`(DOWN ,_ ,_ ,_ ,_) (no-reply state)]
+      [`(EXIT ,pid ,_ ,e)
+       ;; The DOWN message will process the worker.
+       (if (eq? pid worker)
+           (no-reply state)
+           `#(stop ,e ,state))]))
 
   (define (no-reply state)
     (let ([state (update state)])
       `#(no-reply ,state ,(get-timeout state))))
 
+  (define (no-reply/delay state)
+    (if (fxzero? ($state commit-delay))
+        (no-reply state)
+        `#(no-reply ,state ,(get-timeout state))))
+
   (define (get-timeout state)
+    ($state open [cache log-timeout worker])
     (cond
-     [($state worker) 'infinity]
-     [(cache-waketime ($state cache)) =>
-      (lambda (waketime) (max (- waketime (erlang:now)) 0))]
+     [worker 'infinity]
+     [log-timeout]
+     [(cache-waketime cache)]
      [else 'infinity]))
 
   (define (update state)
     (match-let* ([`(<db-state> ,queue ,worker) state])
       (if (or worker (queue:empty? queue))
           state
-          (let-values ([(work queue) (get-work queue state)])
-            ($state copy [queue queue] [worker (spawn&link work)])))))
+          (let-values ([(queue work) (get-work queue state)])
+            (let ([worker (spawn work)])
+              (monitor worker)
+              ($state copy
+                [queue queue]
+                [log-timeout (if (queue:empty? queue) #f ($state log-timeout))]
+                [worker worker]))))))
+
+  (define-syntax with-values
+    (syntax-rules ()
+      [(_ expr consumer)
+       (call-with-values (lambda () expr) consumer)]))
 
   (define (get-work queue state)
     (let ([head (queue:get queue)])
       (match head
-        [#(log ,_ ,_)
-         (let-values ([(logs queue) (get-related queue 0)])
-           (values (make-worker (cons head logs) state) queue))]
-        [#(transaction ,_ ,_)
-         (values (make-worker head state) (queue:drop queue))])))
+        [`(<log>)
+         (with-values (get-logs queue 0 ($state commit-limit))
+           (lambda (logs queue count)
+             (values queue
+               (make-log-worker (cons head logs) count state))))]
+        [#(transaction ,f ,from)
+         (values (queue:drop queue)
+           (make-transaction-worker f from state))])))
 
-  (define (get-related queue count)
+  (define (get-logs queue count commit-limit)
     (let ([queue (queue:drop queue)]
           [count (+ count 1)])
-      (if (or (queue:empty? queue) (>= count commit-threshold))
-          (values '() queue)
+      (if (or (queue:empty? queue) (>= count commit-limit))
+          (values '() queue count)
           (let ([head (queue:get queue)])
-            (match head
-              [#(log ,_ ,_)
-               (let-values ([(logs queue) (get-related queue count)])
-                 (values (cons head logs) queue))]
-              [,_ (values '() queue)])))))
+            (if (<log> is? head)
+                (with-values (get-logs queue count commit-limit)
+                  (lambda (logs queue count)
+                    (values (cons head logs) queue count)))
+                (values '() queue count))))))
 
-  (define (make-worker x state)
+  (define (setup-worker db cache)
+    (current-database db)
+    (statement-cache cache))
+
+  (define (make-transaction-worker f from state)
     (match-let* ([`(<db-state> ,db ,cache) state])
       (lambda ()
-        (current-database db)
-        (statement-cache cache)
+        (setup-worker db cache)
         (execute-with-retry-on-busy "BEGIN IMMEDIATE")
-        (match x
-          [#(transaction ,f ,from)
-           (match (catch (f))
-             [#(EXIT ,reason)
-              (finalize-lazy-statements cache)
-              (execute-with-retry-on-busy "ROLLBACK")
-              (gen-server:reply from `#(error ,reason))]
-             [,result
-              (finalize-lazy-statements cache)
-              (execute-with-retry-on-busy "COMMIT")
-              (gen-server:reply from `#(ok ,result))])]
-          [,logs
-           (for-each
-            (lambda (x)
-              (match-let* ([#(log ,sql ,bindings) x])
-                ($execute sql bindings)))
-            logs)
-           (execute-with-retry-on-busy "COMMIT")]))))
+        (match (try (limit-stack (f)))
+          [`(catch ,reason ,e)
+           (finalize-lazy-objects cache)
+           (execute-with-retry-on-busy "ROLLBACK")
+           (gen-server:reply from `#(error ,e))]
+          [,result
+           (finalize-lazy-objects cache)
+           (execute-with-retry-on-busy "COMMIT")
+           (gen-server:reply from `#(ok ,result))]))))
+
+  (define (make-log-worker logs count state)
+    (match-let* ([`(<db-state> ,db ,cache) state])
+      (lambda ()
+        (setup-worker db cache)
+        (let ([vstmt (make-vector count)]
+              [vbind (make-vector count)])
+          (do ([ls logs (cdr ls)]
+               [i 0 (+ i 1)])
+              ((null? ls))
+            (match-let* ([`(<log> ,sql ,mbindings) (car ls)])
+              (vector-set! vstmt i (get-statement sql))
+              (vector-set! vbind i mbindings)))
+          (execute-with-retry-on-busy "BEGIN IMMEDIATE")
+          (sqlite:bulk-execute vstmt vbind)
+          (execute-with-retry-on-busy "COMMIT")
+          (vector-for-each sqlite:unmarshal-bindings vbind)))))
+
+  (define (shutdown pid)
+    ;; The worker may contain misbehaving code. Use the
+    ;; shutdown protocol similar to supervisors.
+    (kill pid 'shutdown)
+    (receive
+     (after 1000
+       (kill pid 'kill)
+       (receive
+        [`(DOWN ,_ ,@pid ,_ ,e)
+         (raise e)]))
+     [`(DOWN ,_ ,@pid ,reason ,e)
+      (unless (memq reason '(normal shutdown))
+        (raise e))]))
+
+  (define (stop-worker pid db)
+    ;; The C thread may be working on a slow or never-ending
+    ;; query. Interrupt and allow a brief time for context
+    ;; switches.
+    (define busy? (sqlite:interrupt db))
+    (receive (after (if busy? 100 0) (shutdown pid))
+      [`(DOWN ,_ ,@pid ,reason ,e)
+       (unless (eq? reason 'normal)
+         (raise e))]))
 
   (define (flush state)
-    (cond
-     [($state worker) =>
-      (lambda (pid)
-        (receive
-         [#(EXIT ,@pid normal) (flush (update ($state copy [worker #f])))]
-         [#(EXIT ,@pid ,reason) (raise reason)]))]
-     [else state]))
+    (let ([pid ($state worker)])
+      (when pid
+        ;; Allow the worker enough time to complete default
+        ;; commit-limit inserts.
+        (receive (after 1000 (stop-worker pid ($state db)))
+          [`(DOWN ,_ ,@pid ,reason ,e)
+           (if (eq? reason 'normal)
+               (flush (update ($state copy [worker #f])))
+               (raise e))]))))
 
   (define ($execute sql bindings)
     (sqlite:execute (get-statement sql) bindings))
@@ -272,15 +396,20 @@
   (define (execute-with-retry-on-busy sql)
     ;; Use with BEGIN IMMEDIATE, COMMIT, and ROLLBACK
     (define sleep-times '(2 3 6 11 16 21 26 26 26 51 51 . #0=(101 . #0#)))
+    (define (bits-set? rc bits) (equal? bits (bitwise-and rc bits)))
     (define (attempt stmt count sleep-times)
       (unless (< count 500)
-        (raise `#(db-retry-failed ,sql ,count)))
-      (match (catch (sqlite:execute stmt '()))
-        [#(EXIT #(db-error ,_ (,_ . #x20000005) ,detail)) ; SQLITE_BUSY
+        (throw `#(db-retry-failed ,sql ,count)))
+      (match (try (sqlite:execute stmt '()))
+        [`(catch #(db-error ,_ (,_ ,sqlite_rc . ,_) ,_))
+         (guard
+          (let ([rc (- (- sqlite_rc) 6000000)])
+            (or (bits-set? rc 5)    ;; SQLITE_BUSY
+                (bits-set? rc 6)))) ;; SQLITE_LOCKED
          (match sleep-times
            [(,t . ,rest)
             (receive (after t (attempt stmt (+ count 1) rest)))])]
-        [#(EXIT ,reason) (raise reason)]
+        [`(catch ,reason ,e) (raise e)]
         [,_ count]))
     (let* ([stmt (get-statement sql)]
            [start-time (erlang:now)]
@@ -297,21 +426,22 @@
 
   ;; Cache
 
-  (define cache-timeout (* 5 60 1000))
-
   (define-record-type cache
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable ht)
+     (immutable expire-timeout)
      (mutable waketime)
-     (mutable lazy-statements))
+     (mutable lazy-objects))
     (protocol
      (lambda (new)
-       (lambda ()
-         (new (make-hashtable string-hash string=?) #f '())))))
+       (lambda (expire-timeout)
+         (new (make-hashtable string-hash string=?) expire-timeout #f '())))))
 
   (define-record-type entry
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable stmt)
      (mutable timestamp))
@@ -321,45 +451,52 @@
          (new stmt (erlang:now))))))
 
   (define (get-statement sql)
-    (let* ([cache (statement-cache)]
-           [ht (cache-ht cache)])
-      (cond
-       [(hashtable-ref ht sql #f) =>
-        (lambda (entry)
-          (entry-timestamp-set! entry (erlang:now))
-          (entry-stmt entry))]
-       [else
-        (let ([stmt (sqlite:prepare (current-database) sql)])
-          (hashtable-set! ht sql (make-entry stmt))
-          (unless (cache-waketime cache)
-            (cache-waketime-set! cache (+ (erlang:now) cache-timeout)))
-          stmt)])))
+    (match (statement-cache)
+      [,(cache <= `(cache ,expire-timeout ,ht ,waketime))
+       (cond
+        [(hashtable-ref ht sql #f) =>
+         (lambda (entry)
+           (entry-timestamp-set! entry (erlang:now))
+           (entry-stmt entry))]
+        [else
+         (let ([stmt (sqlite:prepare (current-database) sql)])
+           (hashtable-set! ht sql (make-entry stmt))
+           (unless waketime
+             (cache-waketime-set! cache (+ (erlang:now) expire-timeout)))
+           stmt)])]))
 
-  (define (finalize-lazy-statements cache)
-    (for-each sqlite:finalize (cache-lazy-statements cache))
-    (cache-lazy-statements-set! cache '()))
+  (define (finalize-lazy-objects cache)
+    (for-each
+     (lambda (x)
+       (match x
+         [`(statement) (sqlite:finalize x)]
+         [`(bindings) (sqlite:unmarshal-bindings x)]))
+     (cache-lazy-objects cache))
+    (cache-lazy-objects-set! cache '()))
 
-  (define (remove-dead-entries cache)
-    (let ([dead (- (erlang:now) cache-timeout)]
-          [ht (cache-ht cache)]
-          [oldest #f])
-      (let-values ([(keys vals) (hashtable-entries ht)])
-        (vector-for-each
-         (lambda (key val)
-           (let ([timestamp (entry-timestamp val)])
-             (cond
-              [(<= timestamp dead)
-               (hashtable-delete! ht key)
-               (sqlite:finalize (entry-stmt val))]
-              [(or (not oldest) (< timestamp oldest))
-               (set! oldest timestamp)])))
-         keys vals))
-      (cache-waketime-set! cache (and oldest (+ oldest cache-timeout)))))
+  (define (remove-dead-entries the-cache expire-now?)
+    (match-let*
+     ([`(cache ,expire-timeout ,ht) the-cache]
+      [,dead (- (erlang:now) expire-timeout)]
+      [,oldest #f])
+     (let-values ([(keys vals) (hashtable-entries ht)])
+       (vector-for-each
+        (lambda (key val)
+          (let ([timestamp (entry-timestamp val)])
+            (cond
+             [(or (<= timestamp dead) (expire-now? key))
+              (hashtable-delete! ht key)
+              (sqlite:finalize (entry-stmt val))]
+             [(or (not oldest) (< timestamp oldest))
+              (set! oldest timestamp)])))
+        keys vals))
+     (cache-waketime-set! the-cache (and oldest (+ oldest expire-timeout)))))
 
   ;; Low-level SQLite interface
 
   (define-record-type database
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable filename)
      (immutable create-time)
@@ -386,6 +523,7 @@
 
   (define-record-type statement
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable database)
      (immutable sql)
@@ -412,8 +550,56 @@
     (let ([s (make-statement database sql create-time handle)])
       (statements s handle)))
 
+  (define-record-type bindings
+    (nongenerative)
+    (sealed #t)
+    (fields
+     (mutable handle)))
+
+  (define bindings-guardian
+    (make-foreign-handle-guardian 'bindings
+      bindings-handle
+      bindings-handle-set!
+      (lambda (b) 0)
+      (lambda (b) (sqlite:unmarshal-bindings b))
+      (lambda (op b handle)
+        (fprintf op "  ~d: ~s\n" handle (sqlite:get-bindings b)))))
+
+  (define bindings-count (foreign-handle-count 'bindings))
+  (define print-bindings (foreign-handle-print 'bindings))
+
+  (define (@make-bindings handle)
+    (let ([b (make-bindings handle)])
+      (bindings-guardian b handle)))
+
+  (define (sqlite:marshal-bindings-no-check bindings)
+    (if (or (null? bindings) (eq? bindings '#()))
+        #f
+        (with-interrupts-disabled
+         (@make-bindings (osi_marshal_bindings bindings)))))
+
+  (define (sqlite:marshal-bindings bindings)
+    (arg-check 'sqlite:marshal-bindings
+      [bindings (lambda (x) (or (list? x) (vector? x)))])
+    (sqlite:marshal-bindings-no-check bindings))
+
+  (define (sqlite:unmarshal-bindings mbindings)
+    (when mbindings
+      (with-interrupts-disabled
+       (let ([handle (bindings-handle mbindings)])
+         (when handle
+           (match (osi_unmarshal_bindings* handle)
+             [#t (bindings-guardian mbindings #f)]))))))
+
+  (define (sqlite:get-bindings mbindings)
+    (if (not mbindings)
+        '#()
+        (with-interrupts-disabled
+         (let ([handle (bindings-handle mbindings)])
+           (and handle (osi_get_bindings handle))))))
+
   (define (db-error who error detail)
-    (raise `#(db-error ,who ,error ,detail)))
+    (throw `#(db-error ,who ,error ,detail)))
 
   (define-syntax with-db
     (syntax-rules ()
@@ -491,6 +677,13 @@
         ((null? ls))
       (osi_bind_statement (statement-handle stmt) i (car ls))))
 
+  (define (sqlite:bind-mbindings stmt mbindings)
+    (match stmt
+      [`(statement [handle ,stmt-handle])
+       (osi_reset_statement* stmt-handle)
+       (when mbindings
+         (osi_bind_statement_bindings stmt-handle (bindings-handle mbindings)))]))
+
   (define (sqlite:clear-bindings stmt)
     (osi_clear_statement_bindings (statement-handle stmt)))
 
@@ -515,13 +708,47 @@
      result))
 
   (define (sqlite:execute stmt bindings)
-    (sqlite:bind stmt bindings)
-    (on-exit (osi_reset_statement* (statement-handle stmt))
-      (let lp ()
-        (let ([row (sqlite:step stmt)])
-          (if row
-              (cons row (lp))
-              '())))))
+    (define mbindings
+      (if (bindings? bindings)
+          bindings
+          (sqlite:marshal-bindings bindings)))
+    (define unmarshal? (not (eq? bindings mbindings)))
+    (on-exit
+     (begin
+       (osi_reset_statement* (statement-handle stmt))
+       (sqlite:clear-bindings stmt)
+       (when unmarshal?
+         (sqlite:unmarshal-bindings mbindings)))
+     (sqlite:bind-mbindings stmt mbindings)
+     (let lp ()
+       (let ([row (sqlite:step stmt)])
+         (if row
+             (cons row (lp))
+             '())))))
+
+  (define NULL 0)
+  (define (get-bindings-handle bindings)
+    (if (not bindings)
+        NULL
+        (bindings-handle bindings)))
+
+  (define (sqlite:bulk-execute stmts mbindings)
+    (define result)
+    (with-interrupts-disabled
+     (let ([stmt-handles (vector-map statement-handle stmts)]
+           [bind-handles (vector-map get-bindings-handle mbindings)])
+       (osi_bulk_execute stmt-handles bind-handles
+         (let ([p self])
+           (lambda (r)
+             (#%$keep-live stmts)
+             (#%$keep-live mbindings)
+             (set! result r)
+             (complete-io p))))
+       (let ([db-name (statement-database (vector-ref stmts 0))])
+         (wait-for-io (database-filename db-name))
+         (when (pair? result)
+           (db-error 'bulk-execute result db-name))
+         result))))
 
   (define (execute-sql db sql . bindings)
     (let ([stmt (sqlite:prepare db sql)])
@@ -539,10 +766,12 @@
 
   (define ($lazy-execute sql bindings)
     (let* ([cache (statement-cache)]
-           [stmt (sqlite:prepare (current-database) sql)])
-      (cache-lazy-statements-set! cache
-        (cons stmt (cache-lazy-statements cache)))
-      (sqlite:bind stmt bindings)
+           [stmt (sqlite:prepare (current-database) sql)]
+           [mbindings (sqlite:marshal-bindings bindings)])
+      (cache-lazy-objects-set! cache
+        (let ([objects (cache-lazy-objects cache)])
+          (cons stmt (if mbindings (cons mbindings objects) objects))))
+      (sqlite:bind-mbindings stmt mbindings)
       (lambda () (sqlite:step stmt))))
 
   (define parse-sql
@@ -612,4 +841,39 @@
            #\space)
           (collect-args #'(where ...)))])]))
 
-  (define SQLITE_STATUS_MEMORY_USED 0))
+  (define SQLITE_STATUS_MEMORY_USED 0)
+
+  (record-writer (record-type-descriptor database)
+    (lambda (r p wr)
+      (display-string "#<database " p)
+      (wr (database-filename r) p)
+      (write-char #\> p)))
+
+  (record-writer (record-type-descriptor statement)
+    (lambda (r p wr)
+      (display-string "#<statement " p)
+      (wr (statement-database r) p)
+      (display-string " " p)
+      (wr (statement-sql r) p)
+      (write-char #\> p)))
+
+  (record-writer (record-type-descriptor bindings)
+    (lambda (r p wr)
+      (cond
+       [(sqlite:get-bindings r) =>
+        (lambda (bindings)
+          (display-string "#<bindings" p)
+          (let ([vlen (vector-length bindings)]
+                [limit (print-length)])
+            (do ([i 0 (fx+ i 1)])
+                ((cond
+                  [(fx= i vlen)]
+                  [(and limit (fx= i limit))
+                   (display-string " ..." p)]
+                  [else #f]))
+              (display-string " " p)
+              (wr (vector-ref bindings i) p)))
+          (display-string ">" p))]
+       [else (display-string "#<bindings>" p)])))
+
+  )

@@ -44,9 +44,10 @@
 (define (start-watchdog timeout reason)
   (spawn&link
    (lambda ()
-     (receive (after timeout (raise reason))))))
+     (receive (after timeout (throw reason))))))
 
-(define (stop-watchdog x) (unlink x))
+(define (stop-linked x) (unlink x) (kill x 'kill))
+(define stop-watchdog stop-linked)
 
 (define (get-bv ip len)
   (let* ([me self]
@@ -74,9 +75,10 @@
                `#(send/expect-timeout ,timeout ,(bytevector-length data)))])
     (on-exit (stop-watchdog dog)
       (let ([w (spawn&link (lambda () (writer op)))])
-        (put-bv w data #t)
-        (let ([new (get-bv ip (bytevector-length data))])
-          (assert (equal? new data)))))))
+        (on-exit (stop-linked w)
+          (put-bv w data #t)
+          (let ([new (get-bv ip (bytevector-length data))])
+            (assert (equal? new data))))))))
 
 (define primes '(7 11 13 239 241 251))
 (define buffer-sizes '(1 127 256 1024 2048 4096 8192))
@@ -109,12 +111,12 @@
         (let-values ([(cip cop) (connect-tcp hostname test-port)])
           (on-exit
            (begin (close-input-port cip) (force-close-output-port cop))
-           (receive (after 5000 (raise 'timeout-connecting-tcp))
+           (receive (after 5000 (throw 'timeout-connecting-tcp))
              [#(accept-tcp ,@listener ,sip ,sop)
               (on-exit (force-close-output-port sop)
                 (check-loopback sip cop)
                 (check-loopback cip sop))]
-             [,(msg <= #(accept-tcp-failed ,_ ,_ ,_)) (raise msg)]))))))
+             [,(msg <= #(accept-tcp-failed ,_ ,_ ,_)) (throw msg)]))))))
   (run "0.0.0.0" "127.0.0.1")
   (run "127.0.0.1" "127.0.0.1")
   (run "::1" "::1")
@@ -144,11 +146,10 @@
     (let* ([listener (listen-tcp "::" 0 self)]
            [test-port (listener-port-number listener)])
       (on-exit (close-tcp-listener listener)
-        (let ([op (open-output-string)]
-              [l2 (listen-tcp "::" 0 self)])
+        (let ([l2 (listen-tcp hostname 0 self)])
           (on-exit (close-tcp-listener l2)
             (match-let* ([2 (tcp-listener-count)])
-              (print-tcp-listeners op))))
+              'ok)))
         (match (catch (listen-tcp "::" test-port self))
           [#(EXIT #(listen-tcp-failed "::" ,@test-port uv_listen ,_)) 'ok])
         (receive (after 10 (close-tcp-listener listener)))
@@ -158,6 +159,24 @@
   (run "127.0.0.1")
   (run "::1"))
 
+(isolate-mat print-tcp-listeners ()
+  (let ([op (open-output-string)]
+        [l1 (listen-tcp "127.0.0.1" 0 self)])
+    (on-exit (close-tcp-listener l1)
+      (receive (after 1 'ok)) ;; make listener creation times differ
+      (let ([l2 (listen-tcp "::1" 0 self)])
+        (on-exit (close-tcp-listener l2)
+          (print-tcp-listeners op)
+          (match-let*
+           ([2 (tcp-listener-count)]
+            [(,line1 ,line2 "") (split (get-output-string op) #\newline)]
+            [,pat (re "^ +[0-9]+: (\\S+) opened [0-9]+")]
+            [,socket1 (format "127.0.0.1:~a" (listener-port-number l1))]
+            [,socket2 (format "[::1]:~a" (listener-port-number l2))]
+            [(,_ ,@socket1) (pregexp-match pat line1)]
+            [(,_ ,@socket2) (pregexp-match pat line2)])
+           'ok))))))
+
 (isolate-mat process-bad ()
   (match-let*
    ([#(EXIT #(io-error "*!*" uv_spawn ,_))
@@ -165,7 +184,13 @@
     [(osi_spawn . ,_)
      (osi_spawn* "*" '(0) (lambda (os-pid exit-status term-signal) 'ok))]
     [(osi_spawn . ,_)
-     (osi_spawn* "*" '("x" . 0) (lambda (os-pid exit-status term-signal) 'ok))])
+     (osi_spawn* "*" '("x" . 0) (lambda (os-pid exit-status term-signal) 'ok))]
+    [#(EXIT #(io-error "*!*" uv_spawn ,_))
+     (catch (spawn-os-process-detached "*!*" '()))]
+    [(osi_spawn_detached . ,_)
+     (osi_spawn_detached* "*" '(0))]
+    [(osi_spawn_detached . ,_)
+     (osi_spawn_detached* "*" '("x" . 0))])
    'ok))
 
 (isolate-mat files ()
@@ -179,37 +204,40 @@
         primes))
      '()
      buffer-sizes))
-  (define (watch-callbacks renames updates)
-    ;; macOS does not send update events consistently for new files.
+  (define (watch-callbacks who renames updates)
     (let lp ([renames-tbd renames]
-             [updates-tbd (if (memq (machine-type) '(a6osx ta6osx))
-                              '()
-                              updates)]
-             [updates-seen (if (memq (machine-type) '(a6osx ta6osx))
-                               updates
-                               '())])
+             [renames-seen '()]
+             [updates-tbd updates]
+             [updates-seen '()])
       (receive
-       (after 100
+       (after 500
          (unless (and (null? renames-tbd) (null? updates-tbd))
-           (raise `#(path-changed-missing ,renames-tbd ,updates-tbd))))
+           (throw `#(path-changed-missing ,who ,renames-tbd ,updates-tbd))))
        [#(path-changed ,@test-dir ,filename 1)
-        (if (member filename renames-tbd)
-            (lp (remove filename renames-tbd) updates-tbd updates-seen)
-            (raise `#(unexpected-path-rename ,filename ,renames)))]
+        (cond
+         [(member filename renames-tbd)
+          (lp (remove filename renames-tbd) (cons filename renames-seen)
+            updates-tbd updates-seen)]
+         [(member filename renames-seen)
+          (lp renames-tbd renames-seen updates-tbd updates-seen)]
+         [else
+          (throw `#(unexpected-path-rename ,who ,filename ,renames))])]
        [#(path-changed ,@test-dir ,filename 2)
         (cond
          [(member filename updates-tbd)
-          (lp renames-tbd (remove filename updates-tbd)
-            (cons filename updates-seen))]
+          (lp renames-tbd renames-seen
+            (remove filename updates-tbd) (cons filename updates-seen))]
          [(member filename updates-seen)
-          (lp renames-tbd updates-tbd updates-seen)]
+          (lp renames-tbd renames-seen updates-tbd updates-seen)]
          [else
-          (raise `#(unexpected-path-updated ,filename ,updates))])])))
+          (throw `#(unexpected-path-updated ,who ,filename ,updates))])])))
   (define bullet "\x2022;")
   (define test-dir (string-append bullet "files-test" bullet "/"))
   (match-let*
    ([#(EXIT #(bad-arg open-file bad-type))
      (catch (open-file "foo.bar" 0 0 'bad-type))]
+    [#(EXIT #(bad-arg open-file not-a-string))
+     (catch (open-file 'not-a-string 0 0 'input))]
     [#(EXIT #(bad-arg close-path-watcher #f))
      (catch (close-path-watcher #f))]
     [#(EXIT #(io-error "*" uv_fs_realpath ,_))
@@ -235,7 +263,8 @@
     ["end of file" (osi_get_error_text UV_EOF)]
     ["SQLITE_ERROR" (osi_get_error_text -6000001)]
     ["Error code 0" (osi_get_error_text 0)]
-    [#t (directory? (osi_get_temp_directory))])
+    [#t (directory? (osi_get_temp_directory))]
+    [#t (directory? (osi_get_home_directory))])
    'ok)
   (delete-tree test-dir)
   (make-directory-path test-dir)
@@ -258,19 +287,25 @@
           (match-let* ([2 (path-watcher-count)])
             (print-path-watchers op))))
       (write-file fn)
-      (watch-callbacks '("basic") '("basic"))
+      (watch-callbacks 1 '("basic")
+        (if (memq (machine-type) '(a6osx ta6osx))
+            '()
+            '("basic")))
       (rename-path fn fn2)
       (assert (not (file-exists? fn)))
       (assert (file-exists? fn2))
-      (watch-callbacks '("basic" "moved") '())
+      (watch-callbacks 2 '("basic" "moved") '())
       (write-file fn)
-      (watch-callbacks '("basic") '("basic"))
+      (watch-callbacks 3 '("basic")
+        (if (memq (machine-type) '(a6osx ta6osx))
+            '()
+            '("basic")))
       (delete-file fn2)
       (assert (not (file-exists? fn2)))
-      (watch-callbacks '("moved") '())
+      (watch-callbacks 4 '("moved") '())
       (delete-file fn)
       (assert (not (file-exists? fn)))
-      (watch-callbacks '("basic") '())
+      (watch-callbacks 5 '("basic") '())
       (close-path-watcher watcher))
 
     (let* ([buffers (make-buffers)]
@@ -349,7 +384,7 @@
       (do ([n #x110000 (- n 1)]) ((= n 0))
         (let ([c1 (read-char ip)] [c2 (stream)])
           (unless (eqv? c1 c2)
-            (raise `#(wrong-char ,n ,(char->integer c1) ,(char->integer c2))))))))
+            (throw `#(wrong-char ,n ,(char->integer c1) ,(char->integer c2))))))))
   (let ([op (open-file-to-replace fn)])
     (on-exit (force-close-output-port op)
       (display "nothing here" op)))
@@ -467,7 +502,7 @@
       close-fake
       print-fake))
   (match-let*
-    ([,fake-count (foreign-handle-count fakes-id)]
+   ([,fake-count (foreign-handle-count fakes-id)]
     [,print-fakes (foreign-handle-print fakes-id)]
     [,os (open-output-string)]
     [0 (fake-count)]
@@ -545,7 +580,9 @@
          (print-foreign-handles))
        (match-regexps
         ;; gensym g<nnn> will show up between databases and osi-ports
-        `("" "databases:" "" seek
+        `(""
+          "bindings:" "" seek
+          "databases:" "" seek
           ,(format "~a:" fakes-id)
           "8000: info2 created 1"
           "  6000: info4 created 2"
@@ -605,18 +642,18 @@
     [ok (begin (signal-handler SIGWINCH handle-it) 'ok)]
     [,@handle-it (signal-handler SIGWINCH)]
     [,trapped-signals ;; in app-core.ss
-      (sort <
-        (cons SIGWINCH
-          (meta-cond
-           [(memq (machine-type) '(i3nt ti3nt a6nt ta6nt))
-            (list SIGBREAK SIGHUP SIGINT)]
-           [else
-            (list SIGINT SIGTERM)])))]
+     (sort <
+       (cons SIGWINCH
+         (meta-cond
+          [(memq (machine-type) '(i3nt ti3nt a6nt ta6nt))
+           (list SIGBREAK SIGHUP SIGINT)]
+          [else
+           (list SIGHUP SIGINT SIGTERM)])))]
     [ok (and (andmap procedure? (map signal-handler trapped-signals)) 'ok)]
     [,@trapped-signals
-      (let ([os (open-output-string)])
-        (print-signal-handlers os)
-        (->signals (get-output-string os)))]
+     (let ([os (open-output-string)])
+       (print-signal-handlers os)
+       (->signals (get-output-string os)))]
     [,@trapped-signals
      (let ([os (open-output-string)])
        (parameterize ([current-output-port os])
@@ -674,7 +711,7 @@
                    (osi_kill ,parent-pid SIGINT)
                    (receive))))
               (flush-output-port to-stdin)
-              (receive (after 2000 (raise 'fail))
+              (receive (after 2000 (throw 'fail))
                 [#(process-terminated ,',@os-pid ,',exit-status ,',@SIGTERM)
                  'ok])
               (printf "child-output:\n")
@@ -692,5 +729,261 @@
         "done"
         ))])
   )
+
+(isolate-mat record-writers ()
+  ;; osi-port
+  (match-let*
+   ([,p (open-fd-port "mystdin" 0 #f)]
+    [,_ (close-osi-port p)]
+    [,expected (format "#<osi-port ~s>" "mystdin")]
+    [,@expected (format "~s" p)])
+   'ok)
+  ;; path-watcher
+  (match-let*
+   ([,w (watch-path (base-dir) self)]
+    [,_ (close-path-watcher w)]
+    [,expected (format "#<path-watcher ~s>" (base-dir))]
+    [,@expected (format "~s" w)])
+   'ok)
+  ;; listener
+  (match-let*
+   ([,l (listen-tcp "127.0.0.1" 0 self)]
+    [,p (listener-port-number l)]
+    [,_ (close-tcp-listener l)]
+    [,expected (format "#<tcp-listener 127.0.0.1:~a>" p)]
+    [,@expected (format "~s" l)]
+    [,l (listen-tcp "::1" 0 self)]
+    [,p (listener-port-number l)]
+    [,_ (close-tcp-listener l)]
+    [,expected (format "#<tcp-listener [::1]:~a>" p)]
+    [,@expected (format "~s" l)])
+   'ok))
+
+(isolate-mat read-leak ()
+  (let* ([hostname "::1"]
+         [listener (listen-tcp hostname 0 self)]
+         [test-port (listener-port-number listener)]
+         [gbuff (make-guardian)]
+         [gproc (make-guardian)])
+    (on-exit (close-tcp-listener listener)
+      (let-values ([(cip cop) (connect-tcp hostname test-port)])
+        (on-exit (begin (close-input-port cip) (force-close-output-port cop))
+          (receive (after 5000 (throw 'timeout-connecting-tcp))
+            [#(accept-tcp ,@listener ,sip ,sop)
+             (on-exit (force-close-output-port sop)
+               (let* ([me self]
+                      [_ (gbuff (binary-port-input-buffer cip))]
+                      [pid (spawn (lambda ()
+                                    (on-exit (send me 'ran-winders)
+                                      (assert (eof-object? (get-u8 cip))))))]
+                      [_ (gproc pid)]
+                      [m (monitor pid)])
+                 (receive (after 100 'ok)) ; wait for the read to start
+                 (force-close-output-port cop)
+                 (receive (after 1000 (throw 'reader-failed-to-complete))
+                   [ran-winders
+                    (receive (after 1000 (throw 'reader-failed-to-complete))
+                      [`(DOWN ,@m ,@pid ,reason) 'ok])])))]
+            [,(msg <= #(accept-tcp-failed ,_ ,_ ,_)) (throw msg)]))))
+    (gc)
+    (assert (bytevector? (gbuff)))
+    (assert (process? (gproc)))))
+
+(isolate-mat write-leak ()
+  ;; Spawn a Swish process that blocks on (receive), and thus does not
+  ;; read from input. Then send enough data that the pipe fills up and
+  ;; the process blocks on write. Then, from the original process,
+  ;; close the output port and verify that the buffer and process are
+  ;; garbage collected.
+  (define (spawn-swish-no-read)
+    (let ([me self])
+      (spawn
+       (lambda ()
+         (let-values ([(to-stdin from-stdout from-stderr os-pid)
+                       (spawn-os-process swish-exe '() me)])
+           (send me `#(process-started ,os-pid ,to-stdin))
+           (put-bytevector to-stdin (string->utf8 "(receive)\n"))
+           (flush-output-port to-stdin)
+           (on-exit (send me 'ran-winders)
+             (let lp ()
+               (put-u8 to-stdin (char->integer #\A))
+               (send me 'not-blocked)
+               (lp))))))))
+  (let* ([gbuff (make-guardian)]
+         [gproc (make-guardian)]
+         [pid (spawn-swish-no-read)]
+         [_ (gproc pid)]
+         [m (monitor pid)])
+    (receive
+     [#(process-started ,os-pid ,op)
+      (gbuff (binary-port-output-buffer op))
+      (let lp ()
+        ;; wait for the write to fill up the pipe
+        (receive (after 100 'ok)
+          [not-blocked (lp)]))
+      (force-close-output-port op)
+      (receive (after 1000 (throw 'writer-failed-to-complete))
+        [ran-winders
+         (receive (after 1000 (throw 'writer-failed-to-complete))
+           [`(DOWN ,@m ,@pid ,reason)
+            (osi_kill* os-pid 15)
+            (receive (after 10000 (throw 'os-process-timeout))
+              [#(process-terminated ,@os-pid ,exit-status ,_) 'ok])])])])
+    (gc)
+    (assert (bytevector? (gbuff)))
+    (assert (process? (gproc)))))
+
+(define (current-disable-count)
+  (#%$tc-field 'disable-count (#%$tc)))
+
+;; test keyboard-interrupt for pid blocked on I/O
+(isolate-mat keyboard-interrupt-wait-for-io ()
+  (define listener (listen-tcp "::1" 0 self))
+  (define test-port (listener-port-number listener))
+  (define interrupts '())
+  (define test self)
+  (define message "This is a test")
+  (define pid
+    (spawn&link
+     (lambda ()
+       (keyboard-interrupt-handler
+        (lambda ()
+          ;; no reset here, so return from handler, but check disable count
+          (set! interrupts (cons (current-disable-count) interrupts))))
+       (let-values ([(cip cop) (connect-tcp "::1" test-port)])
+         (clear-input-port cip)
+         (send test (utf8->string (get-bytevector-all cip)))
+         (assert (= 0 (current-disable-count)))))))
+  (receive
+   [#(accept-tcp ,@listener ,sip ,sop)
+    (match-let*
+     ([0 (current-disable-count)]
+      ;; pid eventually waiting for I/O
+      [ok (let wait ()
+            (with-process-details pid
+              (lambda (id name created status)
+                (match status
+                  [#(waiting-for ,_io) 'ok]
+                  [,_ (receive (after 200 (wait)))]))))]
+      [0 (current-disable-count)]
+      ;; keyboard interrupts left pending while waiting for I/O
+      [ok
+       (do ([i 0 (+ i 1)]) ((= i 5) 'ok)
+         (receive (after 200 'ok))
+         (keyboard-interrupt pid))]
+      [ok (receive (after 200 'ok))]
+      ;; still waiting for I/O
+      [(,_ #f ,_ #(waiting-for ,_io)) (with-process-details pid list)]
+      [() interrupts]
+      [0 (current-disable-count)]
+      ;; send output and unblock
+      [ok
+       (begin
+         (put-bytevector sop (string->utf8 message))
+         (flush-output-port sop)
+         (close-port sop)
+         (receive (after 200 'ok)))]
+      [0 (current-disable-count)]
+      ;; pid was interrupted during an I/O operation
+      [(1) interrupts])
+     'ok)])
+  (receive [,@message 'ok]))
+
+;; test keyboard-interrupt for pid blocked on receive
+(isolate-mat keyboard-interrupt-receive ()
+  (define test (gensym "this test"))
+  (define inputs
+    (list
+     '(pretty-print 'start-loop-1)
+     '(let f () (pretty-print 'ping) (receive (after 10000 (f))))
+     `(newline)
+     `(send ',test 'continue)
+     '(pretty-print 'start-loop-2)
+     '(let f () (pretty-print 'pong) (receive (after 10000 (f))))
+     `(newline)
+     '(keyboard-interrupt-handler
+       (lambda ()
+         (printf "disable-count is ~s\n" (current-disable-count))))
+     `(send ',test 'continue)
+     '(receive [quit 'ok])))
+  (define pid
+    (spawn&link
+     (lambda ()
+       (define op (open-output-string))
+       (parameterize ([console-output-port op]
+                      [current-output-port op]
+                      [console-input-port
+                       (make-custom-textual-input-port "always r"
+                         (lambda (s start n)
+                           (assert (> n 2))
+                           ;; always respond with 'r' to reset from break> prompt
+                           (string-copy! "r\n" 0 s start 2)
+                           2)
+                         #f #f #f)]
+                      [waiter-prompt-and-read
+                       (lambda (depth)
+                         (match inputs
+                           [(,x . ,rest) (set! inputs rest) x]
+                           [() #!eof]))])
+         (send test 'start)
+         (new-cafe))
+       (send test (get-output-string op)))))
+  (define (wait-until-sleeping pid)
+    (let wait ()
+      (with-process-details pid
+        (lambda (id name created status)
+          (match status
+            [#(sleep-up-to ,_seconds ,_src) 'ok]
+            [,_ (receive (after 100 (wait)))])))))
+  (register test self)
+  (match-let*
+   ([0 (current-disable-count)]
+    [ok (receive [start 'ok])]
+    [0 (current-disable-count)]
+    ;; pid eventually sleeping in receive
+    [ok (wait-until-sleeping pid)]
+    ;; interrupt first loop
+    [,_ (keyboard-interrupt pid)]
+    [ok (receive [continue 'ok])]
+    [0 (current-disable-count)]
+    [ok (wait-until-sleeping pid)]
+    ;; interrupt second loop
+    [,_ (keyboard-interrupt pid)]
+    [0 (current-disable-count)]
+    [ok (receive [continue 'ok])]
+    ;; interrupt the receive
+    [,_ (keyboard-interrupt pid)]
+    [,_ (send pid 'quit)]
+    [("start-loop-1"
+      "ping"
+      "break>"
+      "start-loop-2"
+      "pong"
+      "break>"
+      "disable-count is 0"
+      "ok")
+     (remq ""
+       (map trim-whitespace
+         (split (receive [,x x]) #\newline)))])
+   'ok))
+
+(isolate-mat bad-args ()
+  (define-syntax assert-bad-args
+    (syntax-rules ()
+      [(_ [bad (fn arg ...)] ...)
+       (match-let*
+        ([`(catch #(bad-arg fn bad)) (try (fn arg ...))] ...)
+        'ok)]))
+  (assert-bad-args
+   [123 (open-file-port 123 O_RDONLY S_IFREG)]
+   [123 (get-real-path 123)]
+   [123 (get-stat 123)]
+   [123 (list-directory 123)]
+   [123 (read-file 123)]
+   [123 (spawn-os-process 123 '() self)]
+   [(oops) (spawn-os-process "nosuchfile" '(oops) self)]
+   [due (spawn-os-process "nosuchfile" '() 'due)]
+   [123 (spawn-os-process-detached 123 '())]
+   [(oops) (spawn-os-process-detached"nosuchfile" '(oops))]))
 
 (hook-console-input)

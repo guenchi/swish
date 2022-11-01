@@ -1,8 +1,11 @@
 .PHONY: all build-dirs clean platform-clean ready reminders submodules
 
-SETUP := Makefile submodules build-dirs git.revision chezscheme.revision
+SETUP := Makefile submodules build-dirs \
+         chezscheme-revision.include swish-revision.include swish-version.include
 CORE := ../../${BUILD}/bin/swish${EXESUFFIX} ../../${BUILD}/bin/swish.boot ../../${BUILD}/bin/swish.library
-AUXLIB := ../../${BUILD}/lib/swish/mat.so ../../${BUILD}/lib/swish/profile.so ../../${BUILD}/lib/swish/testing.so
+AUXLIB := ../../${BUILD}/lib/swish/mat.so ../../${BUILD}/lib/swish/profile.so ../../${BUILD}/lib/swish/testing.so ../../${BUILD}/lib/swish/internal-testing.so
+
+export CC CPPFLAGS CFLAGS LD LDFLAGS
 
 ready:: | ${SETUP}
 ready:: io-constants.ss ${SwishLibs}
@@ -22,17 +25,20 @@ build-dirs:
 
 all: ready ${CORE} ${AUXLIB} ${REMINDERS}
 
-%.revision: %.tmp-revision
+%.include: %.tmp-include
 	@if cmp --quiet "$@" "$<"; then \
 	  rm "$<"; \
 	else \
 	  mv "$<" "$@"; touch software-info.ss; echo "$@ changed"; \
 	fi
 
-git.tmp-revision:
-	@git describe --always --exclude='*' --abbrev=40 --dirty > "$@"
+swish-revision.tmp-include:
+	@git describe --always --match none --abbrev=40 --dirty > "$@"
 
-chezscheme.tmp-revision:
+swish-version.tmp-include: swish.h
+	@sed -n 's/^#define SWISH_VERSION "\([0-9a-z."]*\)"/\1/p' swish.h > "$@"
+
+chezscheme-revision.tmp-include:
 	@if [ ! -f "${SCHEME_REVISION_PATH}/revision" ]; then \
 	  echo '<unknown>' > "$@"; \
 	else \
@@ -67,7 +73,7 @@ compile.ss: ${SwishLibs} | ${SETUP}
 	'(library-directories (quote (("." . "../${BUILD}/lib"))))' \
 	'(generate-wpo-files #t)' \
 	'(import (swish $(<:.ss=)))' \
-	| ../../${BUILD}/bin/swish${EXESUFFIX} -q -- compile.ss
+	| "${SCHEME}" -q compile.ss
 
 ../../${BUILD}/lib/swish/testing.so: ../../${BUILD}/lib/swish/mat.so ../../${BUILD}/lib/swish/profile.so
 
@@ -81,8 +87,9 @@ clean: platform-clean
 	rm -f ../../${BUILD}/lib/swish/*.wpo
 	rm -f ${SwishLibs}
 	rm -f ${SHLIBTEST}
-	rm -f chezscheme.revision
-	rm -f git.revision
+	rm -f chezscheme-revision.include
+	rm -f swish-revision.include
+	rm -f swish-version.include
 	rm -f io-constants.ss io-constants${EXESUFFIX}
 	rm -f ../*.ss.html ../mat-report.html ../server-profile.html
 	rm -f *.mo *.ms.html *.ss.html
@@ -119,18 +126,21 @@ install-bin: install-check all
 	ln -sf ${INSTLIBDIR}/swish-build ${INSTALLROOT}/bin/swish-build
 	ln -sf ${INSTLIBDIR}/swish-test ${INSTALLROOT}/bin/swish-test
 	${GNU_INSTALL} --directory ${INSTLIBDIR}/lib
-	cd ../../${BUILD}/lib ; find . -type f -name '*.wpo' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/wpo/{} \;
-	cd ../../${BUILD}/lib ; find . -type f -name '*.so' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/lib/{} \;
+	cd ../../${BUILD}/lib ; find . -type f -name '*.wpo' -a -not -iname 'internal*' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/wpo/{} \;
+	cd ../../${BUILD}/lib ; find . -type f -name '*.so' -a -not -iname 'internal*' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/lib/{} \;
 	${GNU_INSTALL} ../../${BUILD}/lib/swish/mat.so ${INSTLIBDIR}/lib/swish
 	${GNU_INSTALL} ../../${BUILD}/lib/swish/profile.so ${INSTLIBDIR}/lib/swish
 	${GNU_INSTALL} ../../${BUILD}/lib/swish/testing.so ${INSTLIBDIR}/lib/swish
 	${GNU_INSTALL} --directory ${INSTWEBDIR}
 	cd ../../web ; find . -type f -exec ${GNU_INSTALL} -D -T {} ${INSTWEBDIR}/{} \;
 
+install-internal: install-check all
+	cd ../../${BUILD}/lib ; find . -type f -name 'internal*.so' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/lib/{} \;
+
 .PHONY: mat-prereq
 mat-prereq:: | ${SETUP}
-mat-prereq:: ${SHLIBTEST}
+mat-prereq:: ${SHLIBTEST} ${TESTREQUEST}
 	@printf "making mat-prereq ... "
 	@rm -rf ../../build/mat-prereq
-	@$(MAKE) install-bin INSTALLROOT="$$(${NORMALIZE_PATH} ../../build/mat-prereq)" SWISH_VERSION=".x.y.z" MACHINE_TYPE="arch" > /dev/null
+	@$(MAKE) install-bin install-internal INSTALLROOT="$$(${NORMALIZE_PATH} ../../build/mat-prereq)" SWISH_VERSION=".x.y.z" MACHINE_TYPE="arch" > /dev/null
 	@printf "done.\n"

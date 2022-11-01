@@ -122,6 +122,8 @@
       "{\"#{foo lish}\":789,\"#{bar unique-name}\":456}")
     #(,(json:make-object [,(string->symbol "#{foo not-gensym") 123])
       "{\"#{foo not-gensym\":123}")
+    #(,(json:make-object [,(string->symbol "#{looks more like gensym}") 123])
+      "{\"#{looks more like gensym}\":123}")
     ))
 
 (mat read ()
@@ -454,6 +456,8 @@
      (catch (json:size 'large))]
     [#(EXIT #(bad-arg json:set! 1))
      (catch (json:set! 1 2 3))]
+    [#(EXIT #(bad-arg json:cells apoptosis))
+     (catch (json:cells 'apoptosis))]
     )
    'ok))
 
@@ -461,27 +465,27 @@
   (define (find-collision s1 bound)
     (define (gen)
       (let* ([len (+ 1 (random 5))]
-	     [s (make-string len)])
-	(do ([i 0 (fx+ i 1)]) ((fx= i len) (string->symbol s))
-	  (string-set! s i
-	    (integer->char (fx+ (char->integer #\a) (random 26)))))))
+             [s (make-string len)])
+        (do ([i 0 (fx+ i 1)]) ((fx= i len) (string->symbol s))
+          (string-set! s i
+            (integer->char (fx+ (char->integer #\a) (random 26)))))))
     (define target (symbol-hash s1))
     (let search ([i 0])
       (and (fx< i bound)
-	   (let ([s2 (gen)])
-	     (if (= (symbol-hash s2) target)
-	         `(,s1 ,s2)
-	         (search (fx+ i 1)))))))
+           (let ([s2 (gen)])
+             (if (= (symbol-hash s2) target)
+                 `(,s1 ,s2)
+                 (search (fx+ i 1)))))))
   (match-let*
    ([,hash (symbol-hash 'foo)]
     [,@hash (symbol-hash 'byu)] ;; use find-collision if this fails
     [,obj1 (json:make-object
-	    [foo 1]
-	    [byu 2])]
+            [foo 1]
+            [byu 2])]
     [,str1 (json:object->string obj1)]
     [,obj2 (json:make-object
-	    [byu 2]
-	    [foo 1])]
+            [byu 2]
+            [foo 1])]
     [,@str1 (json:object->string obj2)])
    'ok))
 

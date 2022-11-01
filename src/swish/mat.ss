@@ -33,11 +33,15 @@
    mat-data-results
    mat-data?
    mat-result-message
-   mat-result-stack
+   mat-result-meta-data
+   mat-result-sstats
+   mat-result-stacks
    mat-result-tags
    mat-result-test
+   mat-result-test-file
    mat-result-type
    mat-result?
+   mat:add-annotation!
    run-mat
    run-mats
    run-mats-to-file
@@ -47,8 +51,10 @@
   (import
    (chezscheme)
    (swish erlang)
+   (swish errors)
    (swish io)
    (swish json)
+   (swish log-db)
    (swish meta)
    (swish osi)
    (swish software-info)
@@ -58,6 +64,7 @@
 
   (define-record-type (%mat make-mat mat?)
     (nongenerative)
+    (sealed #t)
     (fields
      (immutable name)
      (immutable tags)
@@ -105,7 +112,8 @@
      (<- (lambda (x) (map string->symbol x)))]
     [type (-> symbol->string) (<- string->symbol)]
     message
-    stack
+    meta-data
+    stacks
     [sstats
      (->
       (lambda (sstats)
@@ -125,7 +133,7 @@
   (define-syntax mat
     (syntax-rules ()
       [(_ name (tag ...) e1 e2 ...)
-       (add-mat 'name '(tag ...) (lambda () e1 e2 ...))]))
+       (add-mat 'name '(tag ...) (lambda () e1 e2 ... (void)))]))
 
   (define (all-mats) (reverse (mats)))
 
@@ -151,15 +159,22 @@
         (and (pair? excl-tags) (present (%mat-tags mat) excl-tags))))
 
   (define (do-run-mat mat reporter incl-tags excl-tags)
-    (let* ([skip (and (skip? mat incl-tags excl-tags) 'skip)]
-           [before (statistics)]
-           [result
-            (or skip
-                (guard (e [else (cons 'fail e)])
-                  ((%mat-test mat))
-                  'pass))])
-      (reporter (%mat-name mat) (%mat-tags mat) result
-        (sstats-difference (statistics) before))))
+    (parameterize ([mat-annotations '()])
+      (let* ([skip (and (skip? mat incl-tags excl-tags) 'skip)]
+             [before (statistics)]
+             [result
+              (or skip
+                  (let ([ignore #f])
+                    (guard (e [else (list 'fail e ignore)])
+                      (call/cc
+                       (lambda (k)
+                         (set! ignore k)
+                         (mat-start-time (erlang:now))
+                         ((%mat-test mat))))
+                      'pass)))])
+        (mat-end-time (erlang:now))
+        (reporter (%mat-name mat) (%mat-tags mat) result
+          (sstats-difference (statistics) before)))))
 
   (define (present tags tag-list)
     (ormap (lambda (tag) (memq tag tag-list)) tags))
@@ -180,20 +195,6 @@
      [(and (pair? x) (eq? (car x) 'fail)) 'fail]
      [else #f]))
 
-  (define (extract x)
-    (if (condition? x)
-        (let-values ([(op get) (open-string-output-port)])
-          (display-condition x op)
-          (get))
-        (format "~s" x)))
-
-  (define (stack x)
-    (if (continuation-condition? x)
-        (let-values ([(op get) (open-string-output-port)])
-          (dump-stack (condition-continuation x) op 'default)
-          (get))
-        ""))
-
   (define (print-col col1 col2 col3)
     (printf " ~8a ~14a ~a\n" col1 col2 col3))
 
@@ -204,61 +205,95 @@
         (write-meta-data op 'test-file test-file)
         (write-meta-data op 'hostname (osi_get_hostname))
         (write-meta-data op 'machine-type (symbol->string (machine-type)))
-        (write-meta-data op 'test-run uuid))))
+        (write-meta-data op 'test-run uuid)
+        (write-meta-data op 'uname
+          (match (get-uname)
+            [`(<uname> ,system ,release ,version ,machine)
+             (json:make-object
+              [os-machine machine]
+              [os-release release]
+              [os-system system]
+              [os-version version])]))))
+    (void))
+
+  (define mat-annotations (make-parameter #f))
+  (define mat-start-time (make-parameter #f))
+  (define mat-end-time (make-parameter #f))
+
+  (define-syntax (mat:add-annotation! x)
+    (syntax-case x ()
+      [(_ expr)
+       #`(add-annotation! #,(find-source x) expr)]))
+
+  (define (add-annotation! src datum)
+    (let ([timestamp (erlang:now)])
+      (with-interrupts-disabled
+       (let ([anno (mat-annotations)])
+         (unless anno
+           (errorf 'mat:add-annotation! "must be called only while running a mat"))
+         (mat-annotations
+          (cons
+           (json:make-object
+            [src
+             (match src
+               [#(at ,bfp ,path) (json:make-object [bfp bfp] [path path])]
+               [#f #f])]
+            [timestamp timestamp]
+            [value datum])
+           anno))))))
+
+  (define-json result-meta-data start-time end-time annotations)
+
+  (define (get-result-meta-data)
+    (make-result-meta-data
+     (mat-start-time)
+     (mat-end-time)
+     (reverse (mat-annotations))))
 
   (define $run-mats
     (case-lambda
      [(mat/names) ($run-mats mat/names #f '() '() #f 'test) (void)]
      [(mat/names test-file incl-tags excl-tags mo-op progress)
-      (let-values ([(update-tally! get-tally) (make-tally-reporter)])
-        (define progress-reporter (if (eq? progress 'test) (make-progress-reporter progress) NOP))
+      (let-values ([(update-tally! get-tally) (make-tally-reporter)]
+                   [(write-header write-result write-tally) (progress-reporter progress)])
         (define write-summary (if mo-op (make-write-summary mo-op) NOP))
         (define (reporter name tags result sstats)
           (define r
             (case (result-type result)
-              [(pass skip) (make-mat-result test-file name tags result "" "" sstats)]
-              [(fail) (make-mat-result test-file name tags 'fail (extract (cdr result)) (stack (cdr result)) sstats)]
+              [(pass skip) (make-mat-result test-file name tags result "" (get-result-meta-data) '() sstats)]
+              [(fail)
+               (match (cdr result)
+                 [(,e ,ignore)
+                  (make-mat-result test-file name tags 'fail
+                    (exit-reason->english e)
+                    (get-result-meta-data)
+                    (map stack->json (remq ignore (exit-reason->stacks e)))
+                    sstats)])]
               [else (errorf '$run-mats "unknown result ~s" result)]))
           (update-tally! r)
-          (progress-reporter r)
+          (write-result r)
           (write-summary r))
-        (define (sep) (display "-------------------------------------------------------------------------\n"))
-        (case progress
-          [none (void)]
-          [suite (printf "~40a" test-file)]
-          [test
-           (when test-file (printf "~a\n" test-file))
-           (sep)
-           (print-col "Result" "Test name" "Message")
-           (sep)])
+        (write-header test-file)
         (flush-output-port)
         (when mo-op
           ;; record revision information after loading mats, but before running mats
           (write-meta-data mo-op 'software-info (software-info))
           (write-meta-data mo-op 'date (format-rfc2822 (current-date)))
-          (write-meta-data mo-op 'timestamp (erlang:now)))
+          (write-meta-data mo-op 'timestamp (erlang:now))
+          (flush-output-port mo-op))
         (for-each
          (lambda (mat/name)
            (run-mat mat/name reporter incl-tags excl-tags))
          (or mat/names (all-mats)))
-        (when mo-op (write-meta-data mo-op 'completed #t))
+        (when mo-op
+          (write-meta-data mo-op 'completed #t)
+          (flush-output-port mo-op))
         (let-values ([(pass fail skip) (get-tally)])
-          (case progress
-            [none (void)]
-            [suite
-             (cond
-              [(= pass fail skip 0) (printf "no tests\n")]
-              [(> fail 0) (printf "fail\n")]
-              [(> pass 0) (printf "pass~[~:;     (skipped ~s)~]\n" skip skip)]
-              [else (printf "skipped\n")])]
-            [test
-             (sep)
-             (printf "Tests run: ~s   Pass: ~s   Fail: ~s   Skip: ~s\n\n"
-               (+ pass fail) pass fail skip)])
+          (write-tally pass fail skip)
           (flush-output-port)
           `((pass ,pass) (fail ,fail) (skip ,skip))))]))
 
-  (define (NOP r) (void))
+  (define (NOP . _) (void))
 
   (define (make-tally-reporter)
     (define pass 0)
@@ -273,14 +308,48 @@
          [else (errorf 'tally-reporter "unknown result type in ~s" r)]))
      (lambda () (values pass fail skip))))
 
-  (define (make-progress-reporter progress)
-    (lambda (r)
-      (case (mat-result-type r)
-        [pass (print-col "pass" (mat-result-test r) "")]
-        [fail (print-col "FAIL" (mat-result-test r) (mat-result-message r))]
-        [skip (print-col "SKIP" (mat-result-test r) "")]
-        [else (errorf 'test-progress-reporter "unknown result ~s" r)])
-      (flush-output-port)))
+  (define (sep) (display "-------------------------------------------------------------------------\n"))
+  (define (write-totals pass fail skip)
+    (printf "Tests run: ~s   Pass: ~s   Fail: ~s   Skip: ~s\n\n"
+      (+ pass fail) pass fail skip))
+  (define (progress-reporter progress)
+    (case progress
+      [(none summary) (values NOP NOP NOP)]
+      [(suite)
+       (values
+        ;; write-header
+        (lambda (test-file)
+          (printf "~39a " test-file))
+        ;; write-result
+        NOP
+        ;; write-tally
+        (lambda (pass fail skip)
+          (cond
+           [(= pass fail skip 0) (printf "no tests\n")]
+           [(> fail 0) (printf "fail\n")]
+           [(> pass 0) (printf "pass~[~:;     (skipped ~s)~]\n" skip skip)]
+           [else (printf "skipped\n")])))]
+      [(test)
+       (values
+        ;; write-header
+        (lambda (test-file)
+          (when test-file (printf "~a\n" test-file))
+          (sep)
+          (print-col "Result" "Test name" "Message")
+          (sep))
+        ;; write-result
+        (lambda (r)
+          (case (mat-result-type r)
+            [pass (print-col "pass" (mat-result-test r) "")]
+            [fail (print-col "FAIL" (mat-result-test r) (mat-result-message r))]
+            [skip (print-col "SKIP" (mat-result-test r) "")]
+            [else (errorf 'test-progress-reporter "unknown result ~s" r)])
+          (flush-output-port))
+        ;; write-tally
+        (lambda (pass fail skip)
+          (sep)
+          (write-totals pass fail skip)))]
+      [else (match progress)]))
 
   (define-json meta-kv key value)
 
@@ -292,7 +361,8 @@
 
   (define (make-write-summary op)
     (lambda (r)
-      (json:write op r 0)))
+      (json:write op r 0)
+      (flush-output-port op)))
 
   (define (run-mats-to-file filename)
     (define test-file (string-append "to " filename))
@@ -316,21 +386,42 @@
               ["meta-kv"
                (json:set! meta-data (string->symbol (meta-kv-key r)) (meta-kv-value r))])
             (rd)))))
+    (json:set! obj 'results (reverse (json:ref obj 'results '())))
     obj)
 
-  (define (summarize-results results*)
-    (let-values ([(update-tally! get-tally) (make-tally-reporter)]
-                 [(completed) 0])
-      (for-each
-       (lambda (data)
-         (for-each update-tally! (mat-data-results data))
-         (when (json:ref data '(meta-data completed) #f)
-           (set! completed (+ completed 1))))
-       results*)
-      (let-values ([(pass fail skip) (get-tally)])
-        (values pass fail skip completed (length results*)))))
+  (define summarize-results
+    (case-lambda
+     [(results*) (summarize-results results* 'none)]
+     [(results* progress) (summarize-results results* progress #t)]
+     [(results* progress warn-incomplete?)
+      (let-values ([(update-total-tally! get-total-tally) (make-tally-reporter)]
+                   [(write-header write-result write-tally) (progress-reporter progress)])
+        (define completed 0)
+        (for-each
+         (lambda (data)
+           (let-values ([(update-tally! get-tally) (make-tally-reporter)])
+             (define (do-result mr)
+               (update-tally! mr)
+               (update-total-tally! mr)
+               (write-result mr))
+             (write-header (assert (json:ref (mat-data-meta-data data) 'test-file #f)))
+             (for-each do-result (mat-data-results data))
+             (let-values ([(pass fail skip) (get-tally)])
+               (write-tally pass fail skip))
+             (flush-output-port)
+             (when (json:ref data '(meta-data completed) #f)
+               (set! completed (+ completed 1)))))
+         results*)
+        (let-values ([(pass fail skip) (get-total-tally)])
+          (match progress
+            [none (void)]
+            [,_ (write-totals pass fail skip)])
+          (let ([attempted (length results*)])
+            (when (and warn-incomplete? (not (= attempted completed)))
+              (printf "*** Some test suite~p did not complete ***\n\n" (- attempted completed)))
+            (values pass fail skip completed attempted))))]))
 
   (define (summarize files)
-    (summarize-results (map load-results files)))
+    (summarize-results (map load-results files) 'none #f))
 
   )

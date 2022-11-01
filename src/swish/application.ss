@@ -44,7 +44,7 @@
       (monitor process)
       (kill process 'shutdown)
       (receive
-       [#(DOWN ,_ ,@process ,_) 'ok]))
+       [`(DOWN ,_ ,@process ,_) 'ok]))
     ($exit-process))
 
   (define (handle-call msg from process) (match msg))
@@ -53,7 +53,7 @@
 
   (define (handle-info msg process)
     (match msg
-      [#(EXIT ,p ,reason)
+      [`(EXIT ,p ,reason)
        `#(stop ,reason ,(and (not (eq? p process)) process))]))
 
   (define (application:start starter)

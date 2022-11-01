@@ -150,8 +150,8 @@
 
   (define (handle-info msg state)
     (match msg
-      [#(EXIT ,pid ,reason)
-       (match (restart-child pid reason state)
+      [`(EXIT ,pid ,reason ,err)
+       (match (restart-child pid reason err state)
          [#(ok ,new-state)
           (profile-me)
           `#(no-reply ,new-state)]
@@ -235,16 +235,19 @@
            [#(ok ,pid ,child)
             (lp rest (cons child new-children))]
            [#(error ,reason)
-            (report-error 'start-error reason child)
             `#(error ,(append (reverse rest) (cons child new-children)))])])))
 
+  (define (report-start-error reason err child)
+    (report-error 'start-error reason err child)
+    `#(error ,reason))
+
   (define (do-start-child child children)
-    (match (catch ((<child> thunk child)))
+    (match (try ((<child> thunk child)))
       [#(ok ,pid) (guard (process? pid))
        (cond
         [(find-pid pid children)
          (profile-me)
-         `#(error #(duplicate-process ,pid))]
+         (report-start-error `#(duplicate-process ,pid) #f child)]
         [else
          (link pid)
          (let ([child (<child> copy child [pid pid])])
@@ -255,13 +258,13 @@
        `#(ok #f ,child)]
       [#(error ,reason)
        (profile-me)
-       `#(error ,reason)]
-      [#(EXIT ,reason)
+       (report-start-error reason #f child)]
+      [`(catch ,reason ,err)
        (profile-me)
-       `#(error ,reason)]
+       (report-start-error reason err child)]
       [,other
        (profile-me)
-       `#(error #(bad-return-value ,other))]))
+       (report-start-error `#(bad-return-value ,other) #f child)]))
 
   (define (handle-start-child child state)
     (match (state-find-child (<child> name child) state)
@@ -280,17 +283,17 @@
        (profile-me)
        `#(reply #(error #(already-started ,pid)) ,state)]))
 
-  (define (restart-child pid reason state)
+  (define (restart-child pid reason err state)
     (cond
      [(state-find-pid pid state) =>
       (lambda (child)
-        (do-restart (<child> restart-type child) reason child state))]
+        (do-restart (<child> restart-type child) reason err child state))]
      [else
       (profile-me)
       `#(ok ,state)]))
 
-  (define (do-restart restart-type reason child state)
-    (report-end child 0 reason)
+  (define (do-restart restart-type reason err child state)
+    (report-end child 0 reason err)
     (match restart-type
       [permanent
        (restart child state)]
@@ -308,7 +311,7 @@
       [#(ok ,new-state)
        (strategic-restart child new-state)]
       [#(terminate ,new-state)
-       (report-error 'shutdown 'reached-max-restart-intensity child)
+       (report-error 'shutdown 'reached-max-restart-intensity #f child)
        `#(shutdown ,(state-remove-child child new-state))]))
 
   (define (strategic-restart child state)
@@ -318,7 +321,6 @@
          [#(ok ,pid ,child)
           `#(ok ,(state-replace-child child state))]
          [#(error ,reason)
-          (report-error 'start-error reason child)
           (restart child state)])]
       [one-for-all
        (match (start-children
@@ -340,8 +342,8 @@
     (cond
      [(<child> pid child) =>
       (lambda (pid)
-        (let ([reason (shutdown pid (<child> shutdown child))])
-          (report-end child 1 reason)
+        (let-values ([(reason err) (shutdown pid (<child> shutdown child))])
+          (report-end child 1 reason err)
           (<child> copy child [pid #f])))]
      [else child]))
 
@@ -352,25 +354,29 @@
          [brutal-kill
           (kill pid 'kill)
           (receive
-           [#(DOWN ,_ ,@pid ,reason) reason])]
+           [`(DOWN ,_ ,@pid ,reason ,err)
+            (values reason err)])]
          [,timeout
           (kill pid 'shutdown)
           (receive (after timeout
                      (kill pid 'kill)
                      (receive
-                      [#(DOWN ,_ ,@pid ,reason) reason]))
-            [#(DOWN ,_ ,@pid ,reason) reason])])]
-      [#(error ,reason) reason]))
+                      [`(DOWN ,_ ,@pid ,reason ,err)
+                       (values reason err)]))
+            [`(DOWN ,_ ,@pid ,reason ,err)
+             (values reason err)])])]
+      [#(error ,reason ,err)
+       (values reason err)]))
 
   (define (monitor-child pid)
     (monitor pid)
     (unlink pid)
     (receive (after 0 'ok)
-      [#(EXIT ,@pid ,reason)
+      [`(EXIT ,@pid ,reason)
        (receive
-        [#(DOWN ,_ ,@pid ,_)
+        [`(DOWN ,_ ,@pid ,_ ,err)
          (profile-me)
-         `#(error ,reason)])]))
+         `#(error ,reason ,err)])]))
 
   (define (state-mark-child-dead child state)
     ($state copy*
@@ -432,13 +438,15 @@
            '())]
       [() '()]))
 
-  (define (report-error err reason child)
-    (system-detail <supervisor-error>
-      [supervisor self]
-      [error-context err]
-      [reason reason]
-      [child-pid (<child> pid child)]
-      [child-name (<child> name child)]))
+  (define (report-error err-context reason err child)
+    (let-values ([(reason details) (normalize-exit-reason reason err)])
+      (system-detail <supervisor-error>
+        [supervisor self]
+        [error-context err-context]
+        [reason reason]
+        [details details]
+        [child-pid (<child> pid child)]
+        [child-name (<child> name child)])))
 
   (define (report-start child)
     (system-detail <child-start>
@@ -449,9 +457,11 @@
       [shutdown (<child> shutdown child)]
       [type (<child> type child)]))
 
-  (define (report-end child killed reason)
-    (system-detail <child-end>
-      [pid (<child> pid child)]
-      [killed killed]
-      [reason reason]))
+  (define (report-end child killed reason err)
+    (let-values ([(reason details) (normalize-exit-reason reason err)])
+      (system-detail <child-end>
+        [pid (<child> pid child)]
+        [killed killed]
+        [reason reason]
+        [details details])))
   )

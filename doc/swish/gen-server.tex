@@ -68,8 +68,8 @@ respectively.
 The \code{gen-server} framework code automatically interprets a
 \code{stop} return value from the callback API or an \code{EXIT}
 message from the process which created it as a termination request and
-calls \code{terminate}. Unless the termination reason is either
-\code{normal} or \code{shutdown}, generic servers use
+calls \code{terminate}. If the termination reason satisfies the
+\code{informative-exit-reason?} predicate, generic servers use
 \code{event-mgr:notify} to report the termination.
 
 Erlang's \code{gen\_server} supports timeouts during
@@ -141,6 +141,31 @@ process and yield \code{\#(error \#(bad-return-value \var{other}))}.
 \code{gen-server:start} behaves the same as \code{start\&link}
 except that it does not link to the calling process.
 
+\defineentry{gen-server:enter-loop}
+\begin{syntax}
+  \code{(gen-server:enter-loop \var{state} \opt{\var{timeout}})}
+\end{syntax}
+\returns{} does not return
+
+\code{gen-server:enter-loop} transforms the calling process into a
+generic server. The \var{state} and \var{timeout} are equivalent to
+those returned by \code{init}.
+
+On entry, the macro calls \code{(process-name)} to determine the
+registered name of the process, if any, and \code{(process-parent)} to
+determine the spawning process, if available, for logging and
+processing termination. As a result, the name recorded in
+\code{<gen-server-terminating>} will not reflect subsequent changes in
+process registration.
+
+This macro uses the current scope to capture the callback functions
+\code{handle-call}, \code{handle-cast}, \code{handle-info}, and
+\code{terminate}.
+
+While \code{gen-server:enter-loop} does not return normally, it does
+raise an exception upon termination. This allows any exception
+handlers or winders on the stack to run.
+
 \defineentry{gen-server:call}
 \begin{procedure}
   \code{(gen-server:call \var{server} \var{request} \opt{\var{timeout}})}
@@ -166,6 +191,9 @@ reason \code{\#(timeout \#(gen-server call (\var{server}
 a timeout is specified. If the caller catches the failure and
 continues running, the caller must be prepared for a possible late
 reply from the server.
+
+When the reply is a fault condition, the fault is thrown in the
+calling process.
 
 \code{gen-server:call} exits if the server terminates while the
 client is waiting for a reply. When that happens, the client exits for
@@ -203,13 +231,14 @@ ignores all failures. The server will process the request using
   \argrow{reply}{any Scheme datum}
 \end{argtbl}
 
-\code{gen-server:reply} can be used by a server to explicitly send a
-\var{reply} to a \var{client} that called \code{gen-server:call}.
+A server can use \code{gen-server:reply} to send a
+\var{reply} to a \var{client} that called \code{gen-server:call}
+and is blocked awaiting a reply.
 
-In some situations, a server cannot reply immediately to a client. In
-such cases, the \var{from} argument inside \code{handle-call} is
-stored, and \code{no-reply} is returned.  Later,
-\code{gen-server:reply} can be called using that \var{from} value as
+In some situations, a server cannot reply immediately to a client.
+In such cases, \code{handle-call} may store the \var{from} argument
+and return \code{no-reply}. Later, the server can call
+\code{gen-server:reply} using that \var{from} value as
 \var{client}. The \var{reply} is the return value of the
 \code{gen-server:call} in this case.
 
@@ -288,14 +317,17 @@ All generic servers send the event manager the following event:
 \begin{pubevent}{<gen-server-terminating>}
   \argrow{timestamp}{the time the event occured}
   \argrow{name}{the name of the server}
+  \argrow{pid}{the server process}
   \argrow{last-message}{the last message received by the server}
   \argrow{state}{the last state passed into \code{terminate}}
   \argrow{reason}{the reason for termination}
+  \argrow{details}{\code{\#f} or a fault-condition containing the reason for termination}
 \end{pubevent}
 
 This event is fired after a successful call to \code{terminate}
-unless the reason for termination is \code{normal} or
-\code{shutdown}. If the \code{terminate} procedure exits with a
+if the reason for termination satisfies the \code{informative-exit-reason?}
+predicate.
+If the \code{terminate} procedure exits with a
 new \var{reason}, the event contains the new \var{reason}.
 
 \begin{pubevent}{<gen-server-debug>}
@@ -338,9 +370,10 @@ from \code{erlang:now}), or \code{infinity}. The default
 another message is received, then a \code{timeout} message will be
 processed by \code{handle-info}.
 
-Messages sent using \code{send}, including \code{\#(EXIT \var{pid}
-  \var{reason})} and \code{\#(DOWN \var{monitor} \var{pid}
-  \var{reason})}, are processed by \code{handle-info}.
+Messages sent using \code{send}, including those matching
+\code{`(EXIT \var{pid} \var{reason})}
+and \code{`(DOWN \var{monitor} \var{pid} \var{reason})},
+are processed by \code{handle-info}.
 
 The generic server framework will automatically interpret an
 \code{EXIT} message from the process which spawned it as a reason
@@ -367,9 +400,9 @@ directly. \code{handle-info} will not be called. The server must use
   \argrow{reason}{any Scheme datum}
 \end{argtbl}
 
-\code{(init \var{arg} \etc)} is called from a new server process and
-must complete before \code{gen-server:start\&link} or
-\code{gen-server:start} returns.
+\code{(init \var{arg} \etc)} is called from a new server process
+started by a call to \code{gen-server:start\&link} or \code{gen-server:start}.
+Calls to those procedures block until \code{init} returns.
 
 A successful \code{init} returns \code{\#(ok \var{state}
   \opt{\var{timeout}})}. The \var{state} is then maintained
@@ -380,7 +413,7 @@ returning \code{\#(stop \var{reason})}. The server will then fail to
 start using this \var{reason}. \code{terminate} will not be called
 as the server has not properly started.
 
-\code{init} may specify \code{ignore}. The server will then exit
+\code{init} may return \code{ignore}. The server will then exit
 with reason \code{normal}, and \code{gen-server:start\&link} will
 return \code{ignore}. This is used to inform a
 supervisor that the server is not necessary
@@ -510,8 +543,9 @@ allocated. When it returns, the server exits for the given
 \code{\#(stop \etc)}. When a supervision tree is terminating,
 \var{reason} will be \code{shutdown}.
 
-The return value of \code{terminate} is ignored.  Unless the
-termination reason is either \code{normal} or \code{shutdown}, the
+The return value of \code{terminate} is ignored.  If the
+termination reason satisifies the \code{informative-exit-reason?}
+predicate, the
 generic server framework uses \code{event-mgr:notify} to report the
 termination. The server then terminates for that reason.
 

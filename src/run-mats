@@ -15,8 +15,8 @@ fail() {
 }
 
 case $# in
-  0) TESTARGS="src"; PROGRESS="suite";;
-  1) TESTARGS="$1"; PROGRESS="test";;
+  0) TESTARGS="src"; PROGRESS="${PROGRESS:-suite}";;
+  1) TESTARGS="$1"; PROGRESS="${PROGRESS:-test}";;
   *) fail;;
 esac
 
@@ -56,8 +56,8 @@ PATH="${LIBDIR}:${PATH}"
 
 if [ "$PROFILE_MATS" = "yes" ]; then
   # shellcheck disable=SC2086
-  "${LIBDIR}"/swish-test -s src -L src${LIBSEP}${LIBDIR}/lib --report "${REPORT}" --progress "${PROGRESS}" --coverage "${COVERAGE}" --save-profile "${PROFILE}" --exclude '**mat-output**' ${TESTARGS}
+  "${LIBDIR}"/swish-test --info -s src -L src${LIBSEP}${LIBDIR}/lib --report "${REPORT}" --progress "${PROGRESS}" --coverage "${COVERAGE}" --save-profile "${PROFILE}" --exclude '**mat-output**' ${TESTARGS}
 else
   # shellcheck disable=SC2086
-  "${LIBDIR}"/swish-test -s src -L src${LIBSEP}${LIBDIR}/lib --report "${REPORT}" --progress "${PROGRESS}" ${TESTARGS}
+  "${LIBDIR}"/swish-test --info -s src -L src${LIBSEP}${LIBDIR}/lib --report "${REPORT}" --progress "${PROGRESS}" ${TESTARGS}
 fi

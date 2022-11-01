@@ -30,6 +30,7 @@
    script-test
    swish-exe
    test-os-process
+   with-script-test-parameters
    write-test-file
    )
   (import
@@ -83,7 +84,7 @@
                 [out-time (mtime out)])
            (when (or (not out-time) (time>? in-time out-time))
              (copy-file in out))))
-       '("libuv.dll" "sqlite3.dll" "osi.dll"))))
+       '("uv.dll" "sqlite3.dll" "osi.dll"))))
 
   (define-tuple <os-process-failed> command args stdout stderr exit-status)
 
@@ -92,10 +93,10 @@
       (display for-stdin op)
       (newline op)
       (flush-output-port op))
-    (match (run-os-process command args write-stdin 10000 '())
+    (match (run-os-process command args write-stdin #f '())
       [`(<os-result> ,stdout ,stderr ,exit-status)
        (unless (eqv? exit-status 0)
-         (raise
+         (throw
           (<os-process-failed> make
             [command command]
             [args args]
@@ -104,8 +105,25 @@
             [exit-status exit-status])))
        (match-regexps patterns (append stdout stderr))]))
 
+  (define script-test-parameters (make-parameter '()))
+
+  (define-syntax with-script-test-parameters
+    (syntax-rules ()
+      [(_ ([param-name val] ...) e0 e1 ...)
+       (parameterize ([script-test-parameters `(#(param-name ,val) ...)])
+         e0 e1 ...)]))
+
   (define (script-test maybe-script args for-stdin patterns)
     (define script-file (or maybe-script "-q"))
+    (define set-parameters
+      (match (script-test-parameters)
+        [() #f]
+        [,params
+         `(for-each
+           (lambda (p)
+             (match-define #(,',param-name ,',val) p)
+             ((eval param-name) val))
+           ',params)]))
     (cond
      [(whereis 'profiler)
       (let ([tmp-file (string-append (profile:filename) ".sub-process")])
@@ -114,7 +132,7 @@
            (profile:merge tmp-file)
            (delete-file tmp-file))
          (test-os-process swish-exe '("-q" "--")
-           (format "~{~s\n~}~a"
+           (format "~{~s\n~}~a\n(exit)"
              `((load ,(path-combine (prereq-path) "lib" "swish" "profile.so"))
                (import (swish profile))
                ;; return void so repl doesn't print #(ok #<process 4 profiler>)
@@ -126,10 +144,21 @@
                  (library-extensions (append (library-extensions) '((".ss" . ".so"))))
                  (reset-handler (lambda () (exit 1)))
                  (void))
-               (on-exit (begin (profile:save) (unless ,maybe-script (exit)))
+               ;; adjust REPL level to account for the one we started to
+               ;; capture profile data
+               (repl-level 0)
+               (on-exit (profile:save)
+                 ,set-parameters
                  (apply swish-start ',script-file ',args)))
              for-stdin)
            patterns)))]
+     [set-parameters
+      (test-os-process swish-exe '("-q" "--")
+        (format "~{~s\n~}~a\n(exit)"
+          `(,set-parameters
+           (apply swish-start ',script-file ',args))
+          for-stdin)
+        patterns)]
      [else (test-os-process swish-exe `(,script-file ,@args) for-stdin patterns)]))
 
   )

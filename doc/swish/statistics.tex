@@ -65,9 +65,9 @@ then posts a \code{<statistics>} event with \code{reason} =
 
 The \code{statistics:resume} procedure casts a message to the
 \code{statistics} gen-server that causes it to publish a
-\code{<statistics>} event with \code{reason} =
-\code{resume}. This procedure is aliased to \code{app:resume} and
-called from the operating system interface.
+\code{<statistics>} event with \code{reason} = \code{resume}. This
+procedure is called from the operating system interface via the
+top-level-value \code{\$resume}.
 
 \defineentry{statistics:suspend}
 \begin{procedure}
@@ -76,9 +76,9 @@ called from the operating system interface.
 
 The \code{statistics:suspend} procedure casts a message to the
 \code{statistics} gen-server that causes it to publish a
-\code{<statistics>} event with \code{reason} = \code{suspend}.
-This procedure is aliased to \code{app:suspend} and called from the
-operating system interface.
+\code{<statistics>} event with \code{reason} = \code{suspend}.  This
+procedure is called from the operating system interface via the
+top-level-value \code{\$suspend}.
 
 \section {Published Events}
 
@@ -88,6 +88,11 @@ operating system interface.
   \argrow{reason}{\code{startup}, \code{update}, \code{suspend},
     \code{resume}, or \code{shutdown}}
   \argrow{bytes-allocated}{Scheme heap size from \code{bytes-allocated}}
+  \argrow{current-memory-bytes}{Scheme heap size including overhead,
+    from \code{current-memory-bytes}}
+  \argrow{maximum-memory-bytes}{maximum Scheme heap size including overhead,
+    since startup or since the last \code{<statistics>} event,
+    from \code{maximum-memory-bytes}}
   \argrow{osi-bytes-used}{C heap size from \code{osi\_get\_bytes\_used}}
   \argrow{sqlite-memory}{SQLite memory used from
     \code{osi\_get\_sqlite\_status}}
@@ -103,15 +108,20 @@ operating system interface.
   \argrow{gc-real}{elapsed time in seconds of garbage collections
     since last event}
   \argrow{gc-bytes}{Scheme heap bytes reclaimed since last event}
+  \argrow{os-free-memory}{current free memory from \code{osi\_get\_free\_memory}}
 \end{pubevent}
+
+Each time a \code{<statistics>} event is emitted,
+the maximum memory bytes value is reset via \code{reset-maximum-memory-bytes!}.
 
 The JSON object in the \code{foreign-handles} field contains at least the following entries:
 
 \begin{tabular}{ll}
+ \code{bindings} & {number of live marshaled SQLite bindings} \\
  \code{databases} & {number of open SQLite databases} \\
  \code{osi-ports} & {number of open osi-ports} \\
  \code{path-watchers} & {number of open path watchers} \\
- \code{statements} & {number of allocated SQLite statements} \\
+ \code{statements} & {number of unfinalized SQLite statements} \\
  \code{tcp-listeners} & {number of open TCP/IP listeners} \\
 \end{tabular}
 

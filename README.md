@@ -1,19 +1,40 @@
-[![Build Status](https://travis-ci.org/becls/swish.svg?branch=master)](https://travis-ci.org/becls/swish)
+[![Build Status](https://github.com/becls/swish/actions/workflows/test.yml/badge.svg?branch=dev)](https://github.com/becls/swish/actions/workflows/test.yml)
 
 # Swish Concurrency Engine
 
 The Swish Concurrency Engine is a framework used to write
 fault-tolerant programs with message-passing concurrency. It uses the
-Chez Scheme programming language and embeds concepts from the Erlang
-programming language. Swish also provides a web server.
+[Chez Scheme](https://cisco.github.io/ChezScheme) programming language
+and embeds concepts from the Erlang programming language. Swish also
+provides a web server.
 
-# [Design](https://becls.github.io/swish/swish.pdf)
+# Design
+
+The latest design document can be found
+[here](https://becls.github.io/swish/swish.pdf).
 
 Swish uses [libuv](http://libuv.org) for cross-platform asynchronous
 I/O.
 
 Although Swish can be run in threaded Chez Scheme for convenience, it
 is not thread safe and should be used from the main thread only.
+
+# Versioning
+
+Swish follows the [semantic versioning](http://semver.org/)
+scheme, starting with 2.0.0 to avoid confusion with internal projects.
+
+Odd minor-version numbers are used for development. As such,
+we are extremely unlikely to use a patch number other than 0 during
+development.
+
+Even minor-version numbers are used for official tagged
+releases.
+
+The first commit after an official tagged release should increment
+either the minor-version or patch-version number so that the version
+number for an official tagged release corresponds to a unique commit
+hash.
 
 # Notes
 
@@ -42,51 +63,32 @@ is not thread safe and should be used from the main thread only.
 
 ## Linux
 
-- Chez Scheme 9.5.2 or later
+- Chez Scheme 9.5.6, 9.5.8, or 9.5.9
 - GCC, the GNU Compiler Collection
-- GNU C++ compiler for libuv
 - GNU make
-- Python 2.7 for libuv
-- uuid-dev package
+- GNU C++ compiler for libuv
+- cmake for libuv
+- libsystemd-dev and uuid-dev packages
+- graphviz, texlive, texlive-latex-recommended, and texlive-latex-extra packages for building the documentation
 
 ## Mac
 
-- Chez Scheme 9.5.2 or later
-- dot (can be installed through homebrew using `brew install graphviz --with-app`)
-- pdflatex (can be installed through homebrew using `brew cask install mactex`)
+- Chez Scheme 9.5.6, 9.5.8, or 9.5.9
 - ginstall and realpath (can be installed through homebrew using `brew install coreutils`)
-- XCode and the command-line tools must be set
-  (Xcode->Preferences->Locations->command line tools)
+- cmake for libuv (can be installed through homebrew using `brew install cmake`)
+- XCode Command Line Tools
+- dot (can be installed through homebrew using `brew install graphviz`)
+- pdflatex (can be installed through homebrew using `brew cask install mactex`)
+- Latin Modern fonts from LaTeX (can be installed with Font Book from a location like `/usr/local/texlive/2020/texmf-dist/fonts/opentype/public/lm`)
 
 ## Windows
 
-- Chez Scheme 9.5.2 or later
+- Chez Scheme 9.5.6, 9.5.8, or 9.5.9
 - Cygwin or MinGW/MSYS with bash, git, graphviz, grep, perl, texlive,
   GNU make, etc.
-- Microsoft Visual Studio 2017 with Visual C++
-- Python 2.7 for Windows in C:\Python27 (see below for other options)
+- cmake for libuv (https://cmake.org/)
+- Microsoft Visual Studio 2022, 2019, or 2017 with Visual C++
 - Put scheme in PATH.
-
-### Building on Windows with Miniconda Python
-
-- Install [Python 2.7](https://conda.io/miniconda.html)
-- Provide the path to the python2.7 executable as an argument to the configure script:
-
-  ```
-  ./configure --python=~/Miniconda2/python.exe
-  ```
-
-### Building on Windows with Anaconda Python
-
-- Make an [environment containing Python 2.7](https://conda.io/docs/user-guide/tasks/manage-python.html#installing-a-different-version-of-python)
-
-  `conda create -n py27 python=2.7 anaconda`
-
-- Provide the path to the python2.7 executable as an argument to the configure script:
-
-  ```
-  ./configure --python=~/Anaconda3/envs/py27/python.exe
-  ```
 
 # Stand-alone Swish Applications
 
@@ -113,8 +115,9 @@ On Linux and macOS, you can deploy your application's executable and
 boot file.
 
 On Windows, your install should include the application's executable
-and boot file, `osi.dll`, `libuv.dll`, `sqlite3.dll`, Chez Scheme's
-`csv952.dll`, and Microsoft's C Runtime Library `vcruntime140.dll`.
+and boot file, `osi.dll`, `uv.dll`, `sqlite3.dll`, Chez Scheme's
+`csv956.dll` or `csv958.dll`, and Microsoft's C Runtime Library
+`vcruntime140.dll`.
 
 Developers writing stand-alone applications should clone the Swish
 repository and run `configure`.  Swish's source repository provides

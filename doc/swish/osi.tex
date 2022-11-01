@@ -37,7 +37,7 @@ libraries. Please refer to Chapter~4 of the \emph{Chez Scheme Version
   9 User's Guide}~\cite{chez-scheme-users-guide} for information on
 the foreign function interface. C++ is not used because C++
 destructors may interact badly with setjmp/longjmp, used by Chez
-Scheme.
+Scheme and Swish.
 
 The single-threaded version of Chez Scheme is used because of its
 simplicity. All Scheme code runs in the main thread, and all C code
@@ -121,8 +121,10 @@ called.
 \end{function}
 
 The \code{osi\_add\_callback\_list} function adds the callback list
-\code{(\var{callback} . \var{args})} to the list of callbacks. This
-function must be called on the main thread only.
+\code{(\var{callback} . \var{args})} to the list of callbacks.
+This function must be called only on the main thread and only within the
+context of the event-loop's call to \code{osi\_get\_callbacks}, e.g., within a
+libuv callback such as \code{uv\_async\_cb}.
 
 \defineentry{osi\_add\_callback1}
 \begin{function}
@@ -130,8 +132,10 @@ function must be called on the main thread only.
 \end{function}
 
 The \code{osi\_add\_callback1} function adds the callback list
-\code{(\var{callback} \var{arg})} to the list of callbacks. This
-function must be called on the main thread only.
+\code{(\var{callback} \var{arg})} to the list of callbacks.
+This function must be called only on the main thread and only within the
+context of the event-loop's call to \code{osi\_get\_callbacks}, e.g., within a
+libuv callback such as \code{uv\_async\_cb}.
 
 \defineentry{osi\_add\_callback2}
 \begin{function}
@@ -141,7 +145,10 @@ function must be called on the main thread only.
 
 The \code{osi\_add\_callback2} function adds the callback list
 \code{(\var{callback} \var{arg1} \var{arg2})} to the list of
-callbacks. This function must be called on the main thread only.
+callbacks.
+This function must be called only on the main thread and only within the
+context of the event-loop's call to \code{osi\_get\_callbacks}, e.g., within a
+libuv callback such as \code{uv\_async\_cb}.
 
 \defineentry{osi\_add\_callback3}
 \begin{function}
@@ -151,7 +158,10 @@ callbacks. This function must be called on the main thread only.
 
 The \code{osi\_add\_callback3} function adds the callback list
 \code{(\var{callback} \var{arg1} \var{arg2} \var{arg3})} to the list
-of callbacks. This function must be called on the main thread only.
+of callbacks.
+This function must be called only on the main thread and only within the
+context of the event-loop's call to \code{osi\_get\_callbacks}, e.g., within a
+libuv callback such as \code{uv\_async\_cb}.
 
 \defineentry{osi\_make\_error\_pair}
 \begin{function}
@@ -161,6 +171,20 @@ of callbacks. This function must be called on the main thread only.
 The \code{osi\_make\_error\_pair} function returns the error pair
 \code{(\var{who} . \var{error})}. This function must be called on the
 main thread only.
+
+\defineentry{osi\_send\_request}
+\begin{function}
+  \code{int osi\_send\_request(handle\_request\_func \var{handler}, void* \var{payload});}
+\end{function}
+
+The \code{osi\_send\_request} function blocks the calling thread until
+the main thread returns from calling
+\code{\var{handler}(\var{payload})} within \code{osi\_get\_callbacks}.
+The \var{handler} function should execute quickly to avoid blocking
+the event loop. Typical handlers call \code{osi\_add\_callback\_list}
+or one of its variants. \code{osi\_send\_request} returns zero if
+successful.  Otherwise, it returns a libuv error code. Calling it from
+the main thread returns \code{UV\_EPERM}.
 
 \defineentry{osi\_string\_to\_utf8}
 \begin{function}
@@ -174,7 +198,98 @@ nul is written to \code{*\var{utf8\_len}}. It returns NULL if
 \code{malloc} fails. It is the caller's responsibility to call
 \code{free} when this memory is no longer needed.
 
-\subsection {System Functions}
+\defineentry{swish\_run}
+\begin{function}
+  \code{int swish\_run(int \var{argc}, const char* \var{argv}[], void (*\var{custom\_init})(void));}
+\end{function}
+
+The \code{swish\_run} function:
+\begin{enumerate} % keep in sync with swish_service
+\item resolves the boot file based on
+  \code{\var{argv}[0]} by replacing the extension, if any, with
+  \code{.boot},
+\item initializes Scheme by calling \code{Sscheme\_init},
+  \code{Sregister\_boot\_file}, and \code{Sbuild\_heap},
+\item initializes the operating system interface by calling \code{osi\_init},
+\item establishes a context for \code{osi\_exit},
+\item starts the application by invoking the value of the \code{scheme-start} parameter, and
+\item returns the status provided by \code{osi\_exit}.
+\end{enumerate}
+
+\defineentry{swish\_service}\label{swishservice}
+\begin{function}
+  \codebegin
+#if defined(\_\_linux\_\_)
+int swish\_service(int \var{argc}, const char* \var{argv}[]);
+#elif defined(\_WIN32)
+int swish\_service(const wchar\_t* \var{service\_name}, const wchar\_t* \var{logfile},
+                  int \var{argc}, const char* \var{argv}[]);
+#endif \strut\codeend
+\end{function}
+
+On Linux, the \code{swish\_service} function:
+\begin{enumerate} % keep in sync with swish_run
+\item resolves the boot file based on
+  \code{\var{argv}[0]} by replacing the extension, if any, with
+  \code{.boot},
+\item initializes Scheme by calling \code{Sscheme\_init},
+  \code{Sregister\_boot\_file}, and \code{Sbuild\_heap},
+\item initializes the operating system interface by calling \code{osi\_init},
+\item adds a handler to listen for messages from
+  \code{systemd-logind} on the D-Bus system bus,
+\item establishes a context for \code{osi\_exit},
+\item starts the application by invoking the value of the \code{scheme-start} parameter,
+\item tears down the handler on exit, and
+\item returns the status provided to \code{osi\_exit}.
+\end{enumerate}
+
+If the handler receives a \code{PrepareForShutdown} message with the argument
+true, it calls \code{\$shutdown}.
+If it receives a \code{PrepareForSleep} message, it calls
+\code{\$suspend} if the argument is true
+and \code{\$resume} if the argument is false.
+See Figure~\ref{fig:service-callbacks} for information on these callbacks.
+
+On Windows, the \code{swish\_service} function:
+\begin{enumerate}
+\item redirects stdout and stderr to \var{logfile} and stdin from NUL,
+\item connects to the Service Control Manager, establishing a
+  new thread of execution to:
+  \begin{enumerate} % keep in sync with swish_run
+    \item resolve the boot file based on \code{\var{argv}[0]} by
+      replacing the extension, if any, with \code{.boot},
+    \item initialize Scheme by calling \code{Sscheme\_init},
+      \code{Sregister\_boot\_file}, and \code{Sbuild\_heap},
+    \item initialize the operating system interface by calling \code{osi\_init},
+    \item register a control handler with the Service Control Manager,
+    \item establish a context for \code{osi\_exit}, and
+    \item start the application by invoking the value of the
+      \code{scheme-start} parameter
+  \end{enumerate}
+\item sets the service status to the status provided by \code{osi\_exit}.
+\end{enumerate}
+
+Once running as a service, the Service Control Manager may send
+control messages to the process via the control handler. For a stop
+message, the control handler calls the \code{\$shutdown} top-level
+procedure.  For a suspend power event or resume power event, the
+control handler calls \code{\$suspend} or \code{\$resume}
+respectively.
+See Figure~\ref{fig:service-callbacks} for information on these callbacks.
+
+\begin{figure}[H]
+\begin{tabular}{lll}
+  symbol & default top-level value & with statistics gen-server~(Chapter \ref{chap:stats}) \\
+  \hline
+  \code{\$shutdown} & \code{application:shutdown} & \code{application:shutdown} \\
+  \code{\$suspend} & \code{void} & \code{statistics:suspend} \\
+  \code{\$resume} & \code{void} & \code{statistics:resume} \\
+  \hline
+\end{tabular}
+\caption{Service callbacks. \label{fig:service-callbacks}}
+\end{figure}
+
+\subsection {System Functions and Procedures}
 
 \defineentry{osi\_get\_argv}
 \begin{function}
@@ -194,6 +309,24 @@ The \code{osi\_get\_bytes\_used} function returns the number of bytes
 used by the C run-time heap. On Linux, it calls the \code{mallinfo}
 function. On macOS, it calls the \code{mstats} function. On Windows,
 it calls the \code{\_heapwalk} function.
+
+\defineentry{osi\_get\_free\_memory}
+\begin{procedure}
+  \code{(osi\_get\_free\_memory)}
+\end{procedure}
+\returns{} an unsigned integer
+
+The \code{osi\_get\_free\_memory} procedure returns the number of bytes of free
+memory as reported by \code{uv\_get\_free\_memory}.
+
+\defineentry{osi\_get\_total\_memory}
+\begin{procedure}
+  \code{(osi\_get\_total\_memory)}
+\end{procedure}
+\returns{} an unsigned integer
+
+The \code{osi\_get\_total\_memory} procedure returns the number of bytes of
+total physical memory as reported by \code{uv\_get\_total\_memory}.
 
 \defineentry{osi\_get\_callbacks}
 \begin{function}
@@ -222,6 +355,23 @@ for the given error number.
 
 The \code{osi\_get\_hostname} function returns the host name from
 \code{uv\_os\_gethostname}.
+
+\defineentry{osi\_get\_uname}
+\begin{function}
+  \code{ptr osi\_get\_uname(void);}
+\end{function}
+
+The \code{osi\_get\_uname} function returns a \code{<uname>} tuple
+of the values retrieved by \code{uv\_os\_uname}.
+
+\defineentry{\code{<uname>}}\label{uname-tuple}
+\begin{tuple}\code{<uname>}\end{tuple}\antipar
+\begin{argtbl}
+  \argrow{system}{operating system name as a string}
+  \argrow{release}{operating system release as a string}
+  \argrow{version}{operating system version as a string}
+  \argrow{machine}{hardware architecture identifier as a string}
+\end{argtbl}
 
 \defineentry{osi\_get\_hrtime}
 \begin{function}
@@ -385,10 +535,12 @@ successful and a negative error code otherwise.
   \code{void osi\_exit(int \var{status});}
 \end{function}
 
-The \code{osi\_exit} function calls the \code{\_exit} function to
-terminate the current process with the given exit \var{status}. It
-does not return. The \code{exit} function is not used because on Unix
-systems it blocks if there is an outstanding read on stdin.
+The \code{osi\_exit} function returns \var{status} to the context
+established by \code{swish\_run} or \code{swish\_service}, if any.
+Otherwise it calls the \code{\_exit} function to terminate the current
+process with the given exit \var{status}. It does not return. The
+\code{exit} function is not used because on Unix systems it blocks if
+there is an outstanding read on stdin.
 
 \defineentry{osi\_spawn}
 \begin{function}
@@ -411,6 +563,17 @@ When the process exits, the callback list \code{(\var{callback}
 \var{pid} is the integer process identifier, \var{exit-status} is the
 integer exit status, and \var{term-signal} is the integer termination
 signal or 0 if the process did not terminate because of a signal.
+
+\defineentry{osi\_spawn\_detached}
+\begin{function}
+  \code{ptr osi\_spawn\_detached(const char* \var{path}, ptr \var{args});}
+\end{function}
+
+The \code{osi\_spawn\_detached} function uses the \code{uv\_spawn}
+function to create a process with the list of string-valued \var{args}
+and the \code{UV\_PROCESS\_DETACHED} flag set. It returns an integer
+identifying the process when the process has been successfully created
+and an error pair otherwise.
 
 \defineentry{osi\_get\_pid}
 \begin{function}
@@ -551,6 +714,15 @@ issued and an error pair otherwise. When the realpath operation
 finishes, it enqueues the callback list \code{(\var{callback}
   \var{result})}, where \var{result} is the string path when
 successful and a negative error code otherwise.
+
+\defineentry{osi\_get\_home\_directory}
+\begin{function}
+  \code{ptr osi\_get\_home\_directory(void);}
+\end{function}
+
+The \code{osi\_get\_home\_directory} function uses the
+\code{uv\_os\_homedir} function to return the string path of the
+current user's home directory and an error pair otherwise.
 
 \defineentry{osi\_get\_temp\_directory}
 \begin{function}
@@ -900,11 +1072,21 @@ statement is finalized regardless of the return value.
 \end{function}
 
 The \code{osi\_bind\_statement} function maps the Scheme \var{datum}
-to SQLite and binds it to the \var{statement} at the zero-based SQL
+to SQLite and binds it to the prepared \var{statement} at the zero-based SQL
 parameter \var{index}.  It returns \code{\#t} when successful and an
 error pair otherwise. The error pair \code{(osi\_bind\_statement
   . \textrm{UV\_EINVAL})} is returned when \code{datum} cannot be
 mapped to SQLite.
+
+\defineentry{osi\_bind\_statement\_bindings}
+\begin{function}
+  \code{ptr osi\_bind\_statement\_bindings(uptr \var{statement}, uptr \var{mbindings});}
+\end{function}
+
+The \code{osi\_bind\_statement\_bindings} binds the marshaled
+bindings \var{mbindings} to the prepared \var{statement}.
+It returns \code{\#t} when successful and an
+error pair otherwise.
 
 \defineentry{osi\_clear\_statement\_bindings}
 \begin{function}
@@ -974,12 +1156,13 @@ Scheme. Otherwise, the callback list \code{(\var{callback}
 
 \defineentry{osi\_interrupt\_database}
 \begin{function}
-  \code{void osi\_interrupt\_database(uptr \var{database});}
+  \code{ptr osi\_interrupt\_database(uptr \var{database});}
 \end{function}
 
 The \code{osi\_interrupt\_database} function calls the
 \code{sqlite3\_interrupt} function to interrupt the current operation
-of the \var{database}.
+of the \var{database}. It returns \code{\#t} when the database is busy
+and \code{\#f} otherwise.
 
 \defineentry{osi\_get\_sqlite\_status}
 \begin{function}
@@ -990,6 +1173,55 @@ The \code{osi\_get\_sqlite\_status} function uses the
 \code{sqlite3\_status64} function with the given \var{operation} and
 \var{reset} flag to return \code{\#(\var{current} \var{highwater})}
 when successful and an error pair otherwise.
+
+\defineentry{osi\_marshal\_bindings}
+\begin{function}
+  \code{ptr osi\_marshal\_bindings(ptr \var{bindings});}
+\end{function}
+
+The \code{osi\_marshal\_bindings} function allocates an internal
+structure and copies each Scheme datum in \var{bindings}. The
+\var{bindings} argument may be a list or a vector. The result is a
+handle to the internal structure or NULL if \var{bindings} is empty.
+An error pair is returned when the internal structure cannot be allocated or the
+\var{bindings} cannot be mapped to SQLite data types.
+
+\defineentry{osi\_get\_bindings}
+\begin{function}
+  \code{ptr osi\_get\_bindings(uptr \var{mbindings});}
+\end{function}
+
+The \code{osi\_get\_bindings} function allocates a vector
+containing a copy of each Scheme datum marshaled into \var{mbindings}
+by \code{osi\_marshal\_bindings}.
+It is an error to call \code{osi\_get\_bindings} on \var{mbindings}
+after calling \code{osi\_unmarshal\_bindings} on \var{mbindings}.
+
+\defineentry{osi\_unmarshal\_bindings}
+\begin{function}
+  \code{ptr osi\_unmarshal\_bindings(uptr \var{mbindings});}
+\end{function}
+
+The \code{osi\_unmarshal\_bindings} function deallocates the internal
+structure allocated by \code{osi\_marshal\_bindings}.
+
+\defineentry{osi\_bulk\_execute}
+\begin{function}
+  \code{ptr osi\_bulk\_execute(ptr \var{statements}, ptr \var{mbindings}, ptr \var{callback});}
+\end{function}
+
+The \code{osi\_bulk\_execute} function executes all the queries
+defined by \var{statements} and \var{mbindings} on the database worker
+thread associated with the statements. The vector \var{statements}
+must contain statement handles created by
+\code{osi\_prepare\_statement}. All \var{statements} must be prepared
+on the same database. The vector \var{mbindings} must contain binding
+handles created by \code{osi\_marshal\_bindings}. It returns
+\code{\#t} when the operation is started and an error pair otherwise.
+
+When the bulk execute operation finishes, it enqueues the callback
+list \code{(\var{callback} \var{result})}, where \var{result} is
+\code{\#t} when successful and an error pair otherwise.
 
 \subsection {Message-Digest Functions}
 

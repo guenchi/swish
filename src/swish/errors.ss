@@ -20,18 +20,23 @@
 ;;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 ;;; DEALINGS IN THE SOFTWARE.
 
+#!chezscheme
 (library (swish errors)
   (export
    current-exit-reason->english
    exit-reason->english
+   exit-reason->stacks
    swish-exit-reason->english
    )
   (import
    (chezscheme)
    (swish erlang)
+   (swish internal)
    (swish io)
    (swish osi)
    )
+
+  ($import-internal &fault-condition)
 
   (define (exit-reason->english x)
     ((current-exit-reason->english) x))
@@ -55,21 +60,25 @@
       [#(db-retry-failed ,sql ,count) (format "Database query failed after ~d retries: ~a." count sql)]
       [#(deadlock ,resource) (format "Deadlock on resource ~s." resource)]
       [#(error ,reason) (exit-reason->english reason)]
-      [#(error ,reason ,_stack) (exit-reason->english reason)]
       [#(find-files-failed ,spec ,who ,errno) (format "Error ~d from ~a during find-files ~s: ~a." errno who spec (errno->english errno))]
       [#(http-file-not-found ,path) (format "HTTP file not found: ~a." path)]
       [#(http-handler-failed ,reason) (format "HTTP handler failed: ~a" (exit-reason->english reason))]
+      [#(http-invalid-content-disposition ,x) (format "Invalid Content-Disposition HTTP header: ~a" x)]
+      [#(http-invalid-content-length ,x) (format "Invalid Content-Length HTTP header: ~a" x)]
+      [#(http-invalid-header ,name) (format "Invalid HTTP header: ~s." name)]
+      [#(http-invalid-media-type ,x) (format "Invalid MIME type: ~s." x)]
+      [#(http-invalid-method ,method ,path) (format "Invalid HTTP method ~s for path ~s." method path)]
+      [#(http-invalid-param ,name) (format "Invalid HTTP parameter: ~s." name)]
+      [#(http-invalid-path ,path) (format "Invalid HTTP path: ~a." path)]
+      [#(http-no-response-body-allowed ,status)
+       (format "HTTP response body is not allowed for status code ~a." status)]
+      [#(http-unhandled-input ,x) (format "Unhandled HTTP input: ~s." x)]
       [#(invalid-config-file ,config-file ,reason) (format #f "invalid config file ~s: ~a" config-file (exit-reason->english reason))]
-      [#(invalid-content-length ,x) (format "Invalid Content-Length HTTP header: ~a" x)]
       [#(invalid-context ,who) (format "Invalid context for ~a." who)]
       [#(invalid-datum ,x) (format "Invalid datum: ~s." x)]
-      [#(invalid-http-method ,method ,path) (format "Invalid HTTP method ~s for path ~s." method path)]
-      [#(invalid-http-path ,path) (format "Invalid HTTP path: ~a." path)]
       [#(invalid-intensity ,x) (format "Invalid intensity: ~s." x)]
-      [#(invalid-mime-type ,x) (format "Invalid MIME type: ~s." x)]
       [#(invalid-number ,x) (format "Invalid number: ~s." x)]
       [#(invalid-owner ,owner) (format "Invalid owner: ~s." owner)]
-      [#(invalid-param ,name ,params) (format "Invalid parameter ~s in ~s." name params)]
       [#(invalid-period ,period) (format "Invalid period: ~s." period)]
       [#(invalid-procedure ,proc) (format "Invalid procedure: ~s." proc)]
       [#(invalid-strategy ,x) (format "Invalid strategy: ~s." x)]
@@ -89,21 +98,37 @@
       [#(timeout-value ,x ,src) (format "Invalid timeout value~a: ~s." (src->english src) x)]
       [#(type-already-registered ,name) (format "Type ~s is already registered." name)]
       [#(unexpected-input ,x ,position) (format "Unexpected input at position ~d: ~s." position x)]
-      [#(unhandled-input ,x) (format "Unhandled HTTP input: ~s." x)]
       [#(unknown-shared-object ,so-name) (format "Unknown shared object ~s." so-name)]
       [#(unowned-resource ,resource) (format "Unowned resource: ~s." resource)]
       [#(unsupported-db-version ,name ,version) (format "The database ~s schema version (~a) is unsupported by this software." name version)]
       [#(watch-directory-failed ,path ,who ,errno) (format "Error ~d from ~a during watch-directory ~s: ~a." errno who path (errno->english errno))]
-      [content-limit-exceeded "HTTP content limit exceeded."]
+      [#(websocket-control-frame-too-long ,len) (format "WebSocket control frame too long: ~d" len)]
+      [#(websocket-invalid-header ,name ,actual) (format "Invalid WebSocket header ~s: ~s" name actual)]
+      [#(websocket-invalid-method ,method) (format "Invalid WebSocket method: ~s" method)]
+      [#(websocket-missing-header ,name) (format "Missing WebSocket header: ~s" name)]
+      [#(websocket-remote-close ,code) (format "WebSocket remote endpoint closed with status code ~a" code)]
+      [#(websocket-unknown-opcode ,opcode) (format "Unknown WebSocket opcode: ~d" opcode)]
+      [#(websocket-upgrade-failed ,status) (format "WebSocket upgrade failed: ~s" status)]
       [expected-dictionary "Expected dictionary."]
-      [http-violation "HTTP Content-Length violation."]
-      [input-limit-exceeded "HTTP input limit exceeded."]
-      [invalid-header "Invalid HTTP header."]
+      [http-content-limit-exceeded "HTTP content limit exceeded."]
+      [http-file-upload-limit-exceeded "HTTP file upload limit exceeded."]
+      [http-input-limit-exceeded "HTTP input limit exceeded."]
+      [http-input-violation "Read too much HTTP input."]
+      [http-invalid-header "Invalid HTTP header."]
+      [http-invalid-multipart-boundary "Invalid HTTP multipart/form-data boundary."]
+      [http-output-violation "Attempted to send too much HTTP output."]
+      [http-request-timeout "Timeout waiting for HTTP request."]
+      [http-side-effecting-handler "Invalid side-effecting HTTP handler."]
       [invalid-surrogate-pair "Invalid Unicode surrogate pair"]
       [log-handler-already-set "The log handler is already set."]
       [no-process "No process."]
       [timeout "Timeout."]
       [unexpected-eof "Unexpected end-of-file."]
+      [websocket-message-limit-exceeded "WebSocket incoming message too large."]
+      [websocket-no-pong "WebSocket failed to receive a ping response."]
+      [websocket-protocol-violation "WebSocket protocol violation."]
+      [websocket-reserved-bits-must-be-zero "WebSocket reserved bits must be zero."]
+      [`(&fault-condition ,reason) (exit-reason->english reason)]
 
       ;; The following must come last:
       [,x
@@ -128,4 +153,48 @@
     (if (pair? x)
         (cdr x)
         (osi_get_error_text x)))
+
+  (define (exit-reason->stacks reason)
+    (define (get-k r)
+      (if (continuation-condition? r)
+          (condition-continuation r)
+          (match r
+            [#(EXIT ,reason) (get-k reason)]
+            [,_ #f])))
+    (define (cons-k r k*)
+      (let ([k (get-k r)])
+        (if (#%$continuation? k) (cons k k*) k*)))
+    (define (add-stack k* reason)
+      (match reason
+        [`(&fault-condition [reason ,r] ,inner*)
+         (fold-left add-stack (cons-k reason (cons-k r k*)) inner*)]
+        [,_ (cons-k reason k*)]))
+    (add-stack '() reason))
+
+  (define-syntax redefine
+    (syntax-rules ()
+      [(_ var e) (#%$set-top-level-value! 'var e)]))
+
+  ;; Native debugger doesn't know how to print our fault-condition and doesn't
+  ;; understand multiple stacks, so package up a message condition and shadow
+  ;; c's continuation by picking the first k returned by exit-reason->english,
+  ;; which is typically closest to the source of the original error. Folks get
+  ;; reasonable default behavior and they can inspect the condition directly
+  ;; for more details.
+  (redefine debug-condition
+    (let ([system-debug-condition (#%$top-level-value 'debug-condition)])
+      (case-lambda
+       [() (system-debug-condition)]
+       [(c)
+        (system-debug-condition
+         (match c
+           [`(&fault-condition)
+            (parameterize ([print-graph #t])
+              (let ([msg (make-message-condition (exit-reason->english c))])
+                (match (exit-reason->stacks c)
+                  [(,k0 ,k1 . ,_)
+                   (condition (make-continuation-condition k0) c msg)]
+                  [,_ (condition c msg)])))]
+           [,_ c]))])))
+
   )
