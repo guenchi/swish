@@ -23,6 +23,7 @@
 #!chezscheme
 (library (swish io)
   (export
+   $get-bytevector-exactly-n
    <stat>
    <uname>
    binary->utf8
@@ -32,9 +33,12 @@
    connect-tcp
    count-foreign-handles
    directory?
+   filter-files
+   fold-files
    force-close-output-port
    foreign-handle-count
    foreign-handle-print
+   get-bytevector-exactly-n
    get-datum/annotations-all
    get-file-size
    get-real-path
@@ -54,6 +58,7 @@
    make-foreign-handle-guardian
    make-osi-input-port
    make-osi-output-port
+   make-tcp-write2
    make-utf8-transcoder
    open-binary-file-to-append
    open-binary-file-to-read
@@ -77,6 +82,7 @@
    path-watcher-create-time
    path-watcher-path
    path-watcher?
+   port->notify-port
    print-foreign-handles
    print-osi-ports
    print-path-watchers
@@ -97,12 +103,14 @@
    stat-directory?
    stat-regular-file?
    tcp-listener-count
+   tcp-nodelay
    watch-path
    with-sfd-source-offset
    write-osi-port
    )
   (import
    (chezscheme)
+   (swish compat)
    (swish erlang)
    (swish meta)
    (swish osi)
@@ -128,13 +136,23 @@
     ctime
     birthtime)
 
+  ;; decided it was better to add a subtype field than to lose (sealed #t)
   (define-record-type osi-port
     (nongenerative)
     (sealed #t)
     (fields
      (immutable name)
      (immutable create-time)
+     (immutable subtype)
      (mutable handle)))
+
+  ;; Use port-subtype (not _port_subtypes) so we get compile-time checking that
+  ;; element is in the universe while letting everything expand into eq? check.
+  (define-enumeration port-subtype (fd file tcp pipe) _port_subtypes)
+
+  (define (tcp-osi-port? x)
+    (and (osi-port? x)
+         (eq? (osi-port-subtype x) (port-subtype tcp))))
 
   (define (get-osi-port-handle who p)
     (unless (osi-port? p)
@@ -144,13 +162,13 @@
 
   (define (read-osi-port port bv start n fp)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (let retry ()
        (match (osi_read_port* (get-osi-port-handle 'read-osi-port port)
                 bv start n fp
                 (let ([p self])
                   (lambda (r)
-                    (#%$keep-live port)
+                    (keep-live port)
                     (set! result r)
                     (complete-io p))))
          [#t
@@ -164,12 +182,12 @@
 
   (define (write-osi-port port bv start n fp)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_write_port* (get-osi-port-handle 'write-osi-port port)
               bv start n fp
               (let ([p self])
                 (lambda (r)
-                  (#%$keep-live port)
+                  (keep-live port)
                   (set! result r)
                   (complete-io p))))
        [#t
@@ -182,18 +200,21 @@
   (define (close-osi-port port)
     (unless (osi-port? port)
       (bad-arg 'close-osi-port port))
-    (with-interrupts-disabled
-     (let ([handle (osi-port-handle port)])
-       (when handle
-         (match (osi_close_port* handle
-                  (let ([p self])
-                    (lambda (result) ;; ignore failures
-                      (#%$keep-live port)
-                      (complete-io p))))
-           [#t
-            (osi-ports port #f)
-            (wait-for-io (osi-port-name port))]
-           [(,who . ,errno) (io-error (osi-port-name port) who errno)])))))
+    (with-interrupts-disabled-for-io
+     (@close-osi-port port)))
+
+  (define (@close-osi-port port)
+    (let ([handle (osi-port-handle port)])
+      (when handle
+        (match (osi_close_port* handle
+                 (let ([p self])
+                   (lambda (result) ;; ignore failures
+                     (keep-live port)
+                     (complete-io p))))
+          [#t
+           (osi-ports port #f)
+           (wait-for-io (osi-port-name port))]
+          [(,who . ,errno) (io-error (osi-port-name port) who errno)]))))
 
   (define (force-close-output-port op)
     (unless (port-closed? op)
@@ -214,35 +235,81 @@
   (define (binary->utf8 bp)
     (transcoded-port bp (make-utf8-transcoder)))
 
-  (define (make-iport name port close?)
-    (define fp 0)
-    (define (r! bv start n)
-      (let ([count (read-osi-port port bv start n -1)])
-        (set! fp (+ fp count))
-        count))
-    (define (gp) fp)
-    (make-custom-binary-input-port name r! gp #f
-      (and close? (lambda () (close-osi-port port)))))
+  ;; Chez Scheme's custom ports don't provide a way to associate custom data with the port.
+  (define scheme-port->osi-port (make-weak-eq-hashtable))
+  (define (@set-port-osi-port! port osi-port)
+    (cond
+     [(not osi-port) (eq-hashtable-delete! scheme-port->osi-port port)]
+     [(tcp-osi-port? osi-port)
+      (eq-hashtable-set! scheme-port->osi-port port osi-port)]
+     ;; restrict to TCP ports for now
+     [else (void)]))
+
+  (define (@port-osi-port p)
+    (eq-hashtable-ref scheme-port->osi-port p #f))
+
+  (define-syntax maybe-hook
+    (syntax-rules ()
+      [(_ orig-expr notify!-expr)
+       (let ([orig orig-expr] [notify! notify!-expr])
+         (if (not notify!)
+             orig
+             (lambda (bv start n)
+               (let ([count (orig bv start n)])
+                 (notify! count)
+                 count))))]))
+
+  (define @make-iport
+    (case-lambda
+     [(name port close?) (@make-iport name port close? #f 0)]
+     [(name port close? on-r! current-fp)
+      (define fp current-fp)
+      (define (r! bv start n)
+        (let ([count (read-osi-port port bv start n -1)])
+          (set! fp (+ fp count))
+          count))
+      (define (gp) fp)
+      (define (close)
+        (with-interrupts-disabled-for-io
+         (@set-port-osi-port! p #f)
+         (when close? (@close-osi-port port))))
+      (define p
+        (make-custom-binary-input-port name (maybe-hook r! on-r!)
+          gp #f close))
+      (@set-port-osi-port! p port)
+      p]))
 
   (define (make-osi-input-port p)
     (unless (osi-port? p)
       (bad-arg 'make-osi-input-port p))
-    (make-iport (osi-port-name p) p #t))
+    (with-interrupts-disabled
+     (@make-iport (osi-port-name p) p #t)))
 
-  (define (make-oport name port)
-    (define fp 0)
-    (define (w! bv start n)
-      (let ([count (write-osi-port port bv start n -1)])
-        (set! fp (+ fp count))
-        count))
-    (define (gp) fp)
-    (define (close) (close-osi-port port))
-    (make-custom-binary-output-port name w! gp #f close))
+  (define @make-oport
+    (case-lambda
+     [(name port) (@make-oport name port #f 0)]
+     [(name port on-w! current-fp)
+      (define fp current-fp)
+      (define (w! bv start n)
+        (let ([count (write-osi-port port bv start n -1)])
+          (set! fp (+ fp count))
+          count))
+      (define (gp) fp)
+      (define (close)
+        (with-interrupts-disabled-for-io
+         (@set-port-osi-port! p #f)
+         (@close-osi-port port)))
+      (define p
+        (make-custom-binary-output-port name (maybe-hook w! on-w!)
+          gp #f close))
+      (@set-port-osi-port! p port)
+      p]))
 
   (define (make-osi-output-port p)
     (unless (osi-port? p)
       (bad-arg 'make-osi-output-port p))
-    (make-oport (osi-port-name p) p))
+    (with-interrupts-disabled
+     (@make-oport (osi-port-name p) p)))
 
   (define (open-utf8-bytevector bv)
     (binary->utf8 (open-bytevector-input-port bv)))
@@ -254,6 +321,19 @@
            [ip (binary->utf8 raw-ip)])
       (on-exit (close-port ip)
         (handler ip sfd source-offset))))
+
+  (define ($get-bytevector-exactly-n ip size)
+    (let ([bv (make-bytevector size)])
+      (let ([count (get-bytevector-n! ip bv 0 size)])
+        (if (or (eof-object? count) (not (fx= count size)))
+            (throw 'unexpected-eof)
+            bv))))
+
+  (define (get-bytevector-exactly-n ip size)
+    (arg-check 'get-bytevector-exactly-n
+      [ip input-port? binary-port?]
+      [size fixnum? fxnonnegative?])
+    ($get-bytevector-exactly-n ip size))
 
   (define (get-datum/annotations-all ip sfd bfp)
     (let f ([bfp bfp])
@@ -404,8 +484,11 @@
   (define osi-port-count (foreign-handle-count 'osi-ports))
   (define print-osi-ports (foreign-handle-print 'osi-ports))
 
-  (define (@make-osi-port name handle)
-    (osi-ports (make-osi-port name (erlang:now) handle) handle))
+  (define @make-osi-port
+    (case-lambda
+     [(name handle) (@make-osi-port name handle (port-subtype file))]
+     [(name handle subtype)
+      (osi-ports (make-osi-port name (erlang:now) subtype handle) handle)]))
 
   ;; Path watching
 
@@ -463,83 +546,88 @@
   (define (make-console-input)
     (binary->utf8 (make-osi-input-port (open-fd-port "stdin-nb" 0 #f))))
 
+  ;; Create a console-input-port that calls the keyboard-interrupt-handler
+  ;; when interrupted via CTRL-C. The Chez Scheme REPL sets the handler to
+  ;; reset and retry the read.
   (define (make-interruptable-console-input)
-    ;; Provide CTRL-C for the repl with a custom binary input port
-    ;; that can be interrupted by CTRL-C to call the
-    ;; keyboard-interrupt-handler and then retry the read just as Chez
-    ;; Scheme does.
+    (define console-process self)
     (define osip (open-fd-port "stdin-nb" 0 #f))
     (define fp 0)
     (define (r! bv start n)
-      (match (with-interrupts-disabled (@r! bv start n))
-        [,count
-         (guard (fixnum? count))
-         (set! fp (+ fp count))
-         count]
-        [interrupt
-         ((keyboard-interrupt-handler))
-         (r! bv start n)]
-        [`(catch ,r) (throw r)]))
+      (let ([count (get-message bv start n)])
+        (set! fp (+ fp count))
+        count))
     (define (gp) fp)
     (define (close) (close-osi-port osip))
+    (define (return v) (void))
+    (define (get-message bv start n)
+      (if (not (eq? self console-process))
+          0 ;; return EOF for console read from another process
+          (let ([r #f] [me self] [request `#(read ,bv ,start ,n)])
+            (send reader request)
+            (on-exit (send reader `#(remove ,request))
+              (let lp ()
+                (with-interrupts-disabled-for-io
+                 (fluid-let ([return (lambda (v) (set! r v) (complete-io me))])
+                   (wait-for-io 'console-input)))
+                (match r
+                  [interrupt (lp)] ;; wait for keyboard-interrupt
+                  [#(io-result ,r) r]
+                  [`(catch ,_) (raise r)]))))))
+    (define reader
+      ;; When CTRL-C or CTRL-BREAK is pressed in Windows, the read returns 0
+      ;; immediately, and later the signal is processed. libuv could return
+      ;; UV_EINTR in this case, but it doesn't. When CTRL-C is pressed in
+      ;; Unix-like systems, the read returns EINTR, and libuv automatically
+      ;; retries.
+      (spawn
+       (lambda ()
+         (define (do-read bv start n)
+           ;; We still assume that each call has the same bv, start, and n,
+           ;; which the Chez Scheme transcoded-port appears to do.
+           (read-osi-port osip bv start n -1))
+         (let lp ([x #f] [timeout 'infinity] [requests '()] [msg #f])
+           (let ([x (or x (receive (after timeout 'timeout) [,x x]))])
+             (match x
+               [#(read ,bv ,start ,n)
+                (lp #f 0 (cons x requests)
+                  (or msg
+                      (let ([msg `#(io-result ,(do-read bv start n))])
+                        (send self msg)
+                        msg)))]
+               [#(remove ,request)
+                (lp #f 0 (remq request requests) msg)]
+               [#(io-result ,r)
+                (return
+                 (if (and windows? (eqv? r 0))
+                     (receive (after 250 x) [interrupt 'interrupt])
+                     x))
+                (lp #f 'infinity requests #f)]
+               [interrupt
+                (guard windows?)
+                (receive (after 250 'ok) [#(io-result 0) 'ok])
+                (lp #f 'infinity requests #f)]
+               [timeout
+                (match requests
+                  [() (lp #f 'infinity '() msg)]
+                  [(,req . ,requests) (lp req 'infinity requests msg)])]))))))
+    (define (CTRL-C-handler n)
+      (when windows? (send reader 'interrupt))
+      (return 'interrupt) ;; wake console-process if it's in our wait-for-io
+      (keyboard-interrupt console-process))
     (meta-cond
      [windows?
-      ;; When CTRL-C or CTRL-BREAK is pressed in Windows, the read
-      ;; returns 0 immediately, and later the signal is processed.
-      ;; libuv could return UV_EINTR in this case, but it doesn't.
-      (define (@r! bv start n)
-        (match (try (read-osi-port osip bv start n -1))
-          [0 (call/1cc
-              (lambda (return)
-                ;; Give Windows time to deliver the signal before we
-                ;; close the input port.
-                (parameterize ([keyboard-interrupt-handler
-                                (lambda () (return 'interrupt))])
-                  (receive (after 100 0)))))]
-          [,r r]))]
+      (signal-handler SIGBREAK CTRL-C-handler)
+      (signal-handler SIGINT CTRL-C-handler)]
      [else
-      ;; When CTRL-C is pressed in Unix-like systems, the read
-      ;; returns EINTR, and libuv automatically retries. As a
-      ;; result, we spawn a separate reader process so that we can
-      ;; interrupt the read.
-      (define reader
-        (spawn
-         (lambda ()
-           (disable-interrupts)
-           (@read-loop #f))))
-      ;; cell: (pid . active?) is used to keep the reader process from
-      ;; responding to an interrupted read request.
-      (alias pid car)
-      (alias active? cdr)
-      (alias active?-set! set-cdr!)
-      (define (@read-loop r)
-        ;; r: result of read-osi-port or #f
-        (receive
-         [#(,bv ,start ,n ,cell)
-          (let ([r (or r (try (read-osi-port osip bv start n -1)))])
-            (cond
-             [(active? cell)
-              (active?-set! cell #f)
-              (send (pid cell) `#(,self ,r))
-              (@read-loop #f)]
-             [else
-              ;; We assume the next call will have the same bv,
-              ;; start & n, which the Chez Scheme transcoded-port
-              ;; appears to do.
-              (@read-loop r)]))]))
-      (define (@r! bv start n)
-        (define cell (cons self #t))
-        (send reader `#(,bv ,start ,n ,cell))
-        (call/1cc
-         (lambda (return)
-           (parameterize
-               ([keyboard-interrupt-handler
-                 (lambda ()
-                   ;; Ignore when the reader has already responded.
-                   (when (active? cell)
-                     (active?-set! cell #f)
-                     (return 'interrupt)))])
-             (receive [#(,@reader ,r) r])))))])
+      (signal-handler SIGINT CTRL-C-handler)])
+    (spawn
+     (lambda ()
+       (monitor reader)
+       (receive
+        [`(DOWN ,_ ,@reader ,r ,e)
+         ($hook-console-input (make-console-input))
+         (return e)])))
     (binary->utf8
      (make-custom-binary-input-port "stdin-nb*" r! gp #f close)))
 
@@ -547,35 +635,62 @@
     (let ([hooked? #f])
       (lambda ()
         (unless hooked?
-          (let ([ip (if (interactive?)
-                        (make-interruptable-console-input)
-                        (make-console-input))])
-            ;; Chez Scheme uses $console-input-port to do smart
-            ;; flushing of console I/O.
-            (set! hooked? #t)
-            (#%$set-top-level-value! '$console-input-port ip)
-            (console-input-port ip)
-            (current-input-port ip))))))
+          ($hook-console-input
+           (if (interactive?)
+               (make-interruptable-console-input)
+               (make-console-input)))
+          (set! hooked? #t)))))
+
+  (define ($hook-console-input ip)
+    (let ([old-ip (console-input-port)])
+      ;; Chez Scheme uses $console-input-port to do smart
+      ;; flushing of console I/O.
+      (#%$set-top-level-value! '$console-input-port ip)
+      (console-input-port ip)
+      (current-input-port ip)
+      (close-port old-ip)))
 
   ;; File System
+
+  (define (ends-with-directory-separator? s)
+    (let ([n (string-length s)])
+      (and (fx> n 0)
+           (directory-separator? (string-ref s (fx- n 1))))))
 
   (define path-combine
     (case-lambda
      [(x y)
-      (let ([n (string-length x)])
-        (cond
-         [(eqv? n 0) y]
-         [(directory-separator? (string-ref x (fx- n 1)))
-          (string-append x y)]
-         [else (format "~a~c~a" x (directory-separator) y)]))]
+      (cond
+       [(eq? x "") y]
+       [(eq? y "") x]
+       [else
+        (if (or (ends-with-directory-separator? x)
+                (directory-separator? (string-ref y 0)))
+            (string-append x y)
+            (format "~a~c~a" x (directory-separator) y))])]
      [(x) x]
-     [(x y . rest) (apply path-combine (path-combine x y) rest)]))
+     [(x y . rest)
+      (define args (list* x y rest))
+      (let ([op (open-output-string)])
+        (set-port-output-buffer! op
+          (do ([ls args (cdr ls)]
+               [n 0 (fx+ n 1 (string-length (car args)))])
+              ((null? ls) (make-string n))))
+        (let f ([ls args] [end-sep? #t])
+          (match ls
+            [() (get-output-string op)]
+            [("" . ,more) (f more end-sep?)]
+            [(,s . ,more)
+             (unless (or end-sep? (directory-separator? (string-ref s 0)))
+               (write-char (directory-separator) op))
+             (display-string s op)
+             (f more (ends-with-directory-separator? s))])))]))
 
   (define make-directory
     (case-lambda
      [(path mode)
       (define result)
-      (with-interrupts-disabled
+      (with-interrupts-disabled-for-io
        (match (osi_make_directory* (tilde-expand path) mode
                 (let ([p self])
                   (lambda (r)
@@ -618,7 +733,7 @@
 
   (define (remove-directory path)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_remove_directory* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
@@ -632,7 +747,7 @@
 
   (define (remove-file path)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_unlink* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
@@ -646,7 +761,7 @@
 
   (define (rename-path path new-path)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_rename* (tilde-expand path) (tilde-expand new-path)
               (let ([p self])
                 (lambda (r)
@@ -660,7 +775,7 @@
 
   (define (set-file-mode path mode)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_chmod* (tilde-expand path) mode
               (let ([p self])
                 (lambda (r)
@@ -680,7 +795,7 @@
     (with-interrupts-disabled
      (match (osi_open_fd* fd close?)
        [(,who . ,errno) (io-error name who errno)]
-       [,handle (@make-osi-port name handle)])))
+       [,handle (@make-osi-port name handle (port-subtype fd))])))
 
   (define (tilde-expand path)
     (if (and (> (string-length path) 0)
@@ -692,7 +807,7 @@
   (define (open-file-port name flags mode)
     (define result)
     (arg-check 'open-file-port [name string?])
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_open_file* (tilde-expand name) flags mode
               (let ([p self])
                 (lambda (r)
@@ -709,11 +824,11 @@
 
   (define (get-file-size port)
     (define result)
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_get_file_size* (get-osi-port-handle 'get-file-size port)
               (let ([p self])
                 (lambda (r)
-                  (#%$keep-live port)
+                  (keep-live port)
                   (set! result r)
                   (complete-io p))))
        [#t
@@ -726,7 +841,7 @@
   (define (get-real-path path)
     (define result)
     (arg-check 'get-real-path [path string?])
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_get_real_path* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
@@ -744,7 +859,7 @@
      [(path follow?)
       (define result)
       (arg-check 'get-stat [path string?])
-      (with-interrupts-disabled
+      (with-interrupts-disabled-for-io
        (match (osi_get_stat* (tilde-expand path) follow?
                 (let ([p self])
                   (lambda (r)
@@ -759,7 +874,7 @@
   (define (list-directory path)
     (define result)
     (arg-check 'list-directory [path string?])
-    (with-interrupts-disabled
+    (with-interrupts-disabled-for-io
      (match (osi_list_directory* (tilde-expand path)
               (let ([p self])
                 (lambda (r)
@@ -771,6 +886,38 @@
             (io-error path 'osi_list_directory result)
             result)]
        [(,who . ,errno) (io-error path who errno)])))
+
+  (define (fold-files path init keep-dir? f)
+    (define (combine path fn) (if (equal? "." path) fn (path-combine path fn)))
+    (let search ([path path] [acc init])
+      (match (try (list-directory path))
+        [`(catch ,_) acc]
+        [,found
+         (fold-left
+          (lambda (acc entry)
+            (match entry
+              [(,fn . ,@DIRENT_DIR)
+               (let ([full (combine path fn)])
+                 (if (keep-dir? full)
+                     (search full acc)
+                     acc))]
+              [(,fn . ,@DIRENT_FILE)
+               (f (combine path fn) acc)]
+              [,_ acc])) ;; not following symlinks
+          acc
+          found)])))
+
+  (define (keep-all _) #t)
+
+  (define filter-files
+    (case-lambda
+     [(path) (filter-files path keep-all keep-all)]
+     [(path keep-dir? keep-file?)
+      (fold-files path '() keep-dir?
+        (lambda (fn acc)
+          (if (keep-file? fn)
+              (cons fn acc)
+              acc)))]))
 
   (define-syntax define-export
     (syntax-rules ()
@@ -796,17 +943,25 @@
       (define (gp) fp)
       (define (sp! pos) (set! fp pos))
       (define (close) (close-osi-port port))
-      (let open ([type type])
-        (case type
-          [(binary-input)
-           (make-custom-binary-input-port name r! gp sp! close)]
-          [(binary-output)
-           (make-custom-binary-output-port name w! gp sp! close)]
-          [(binary-append)
-           (make-custom-binary-output-port name a! #f #f close)]
-          [(input) (binary->utf8 (open 'binary-input))]
-          [(output) (binary->utf8 (open 'binary-output))]
-          [(append) (binary->utf8 (open 'binary-append))]))))
+      (define buffer-size (fxmax 4 (file-buffer-size)))
+      (parameterize ([custom-port-buffer-size buffer-size]
+                     [make-codec-buffer
+                      (lambda (bp)
+                        (or (and (input-port? bp)
+                                 (let ([bv (binary-port-input-buffer bp)])
+                                   (and (fx>= (bytevector-length bv) 4) bv)))
+                            (make-bytevector buffer-size)))])
+        (let open ([type type])
+          (case type
+            [(binary-input)
+             (make-custom-binary-input-port name r! gp sp! close)]
+            [(binary-output)
+             (make-custom-binary-output-port name w! gp sp! close)]
+            [(binary-append)
+             (make-custom-binary-output-port name a! #f #f close)]
+            [(input) (binary->utf8 (open 'binary-input))]
+            [(output) (binary->utf8 (open 'binary-output))]
+            [(append) (binary->utf8 (open 'binary-append))])))))
 
   (define (open-file-to-read name)
     (open-file name O_RDONLY 0 'input))
@@ -862,11 +1017,11 @@
        [#(,to-stdin ,from-stdout ,from-stderr ,os-pid)
         (values
          (let ([name (format "process ~d stdin" os-pid)])
-           (make-oport name (@make-osi-port name to-stdin)))
+           (@make-oport name (@make-osi-port name to-stdin (port-subtype pipe))))
          (let ([name (format "process ~d stdout" os-pid)])
-           (make-iport name (@make-osi-port name from-stdout) #t))
+           (@make-iport name (@make-osi-port name from-stdout (port-subtype pipe)) #t))
          (let ([name (format "process ~d stderr" os-pid)])
-           (make-iport name (@make-osi-port name from-stderr) #t))
+           (@make-iport name (@make-osi-port name from-stderr (port-subtype pipe)) #t))
          os-pid)]
        [(,who . ,errno) (io-error path who errno)])))
 
@@ -948,10 +1103,10 @@
                           (send process
                             `#(accept-tcp-failed ,listener ,(car r) ,(cdr r)))
                           (let* ([name (@safe-get-ip-address r "")]
-                                 [port (@make-osi-port name r)])
+                                 [port (@make-osi-port name r (port-subtype tcp))])
                             (send process
-                              `#(accept-tcp ,listener ,(make-iport name port #f)
-                                  ,(make-oport name port)))))
+                              `#(accept-tcp ,listener ,(@make-iport name port #f)
+                                  ,(@make-oport name port)))))
                       (unless (pair? r)
                         (osi_close_port* r 0))))))
        [(,who . ,errno)
@@ -986,7 +1141,7 @@
                   (lambda (r)
                     (if (pair? r)
                         (set! result r)
-                        (set! result (@make-osi-port (@safe-get-ip-address r name) r)))
+                        (set! result (@make-osi-port (@safe-get-ip-address r name) r (port-subtype tcp))))
                     (complete-io p))))
          [#t
           (wait-for-io name)
@@ -994,7 +1149,97 @@
             [(,who . ,errno) (io-error name who errno)]
             [,port
              (let ([name (osi-port-name port)])
-               (values (make-iport name port #f) (make-oport name port)))])]))))
+               (values (@make-iport name port #f) (@make-oport name port)))])]
+         [(,who . ,errno) (io-error name who errno)]))))
+
+  (define (reuse-or-make-new-buffer p get-buffer)
+    (define (reuse-or-make orig get-length make-new copy!)
+      (let ([len (get-length orig)])
+        (if (fx>= len target-len)
+            orig
+            (let ([new (make-new target-len)])
+              (copy! orig 0 new 0 len)
+              new))))
+    (define orig (get-buffer p))
+    (define target-len (custom-port-buffer-size))
+    (cond
+     [(bytevector? orig)
+      (reuse-or-make orig bytevector-length make-bytevector bytevector-copy!)]
+     [else not-reached]))
+
+  (define (port->notify-port p notify!)
+    (define who 'port->notify-port)
+    (with-interrupts-disabled
+     (let ([osi-port (@port-osi-port p)])
+       (define (return new-p)
+         ;; prevent close-port from closing underlying osi-port if we collect p
+         (mark-port-closed! p)
+         (@set-port-osi-port! p #f)
+         (@set-port-osi-port! new-p osi-port)
+         new-p)
+       ;; limited to TCP ports for now
+       (unless (tcp-osi-port? osi-port) (bad-arg who p))
+       (unless (procedure? notify!) (bad-arg who notify!))
+       ;; see Chez Scheme's binary-custom-port-port-position for fp calculations below
+       (cond
+        [(input-port? p)
+         (let* ([fp (- (port-position p) (port-input-count p))]
+                [new-ip (@make-iport (port-name p) osi-port
+                          ;; preserve no close for tcp input port
+                          (not (tcp-osi-port? osi-port))
+                          notify! fp)])
+           (set-port-input-buffer! new-ip
+             (reuse-or-make-new-buffer p port-input-buffer))
+           (set-port-input-size! new-ip (port-input-size p))
+           (set-port-input-index! new-ip (port-input-index p))
+           (return new-ip))]
+        [(output-port? p)
+         (let* ([out-index (port-output-index p)]
+                [fp (- (port-position p) out-index)]
+                [new-op (@make-oport (port-name p) osi-port notify! fp)])
+           (set-port-output-buffer! new-op
+             (reuse-or-make-new-buffer p port-output-buffer))
+           (set-port-output-size! new-op (port-output-size p))
+           (set-port-output-index! new-op out-index)
+           (return new-op))]
+        [else not-reached]))))
+
+  (define (make-tcp-write2 op)
+    (define who 'make-tcp-write2)
+    (with-interrupts-disabled
+     (let ([osi-port (@port-osi-port op)])
+       (unless (and (tcp-osi-port? osi-port) (output-port? op))
+         (bad-arg who op))
+       (mark-port-closed! op)
+       (rec tcp-write2
+         (case-lambda
+          [() (close-osi-port osi-port)]
+          [(bv1 bv2) (tcp-write2 bv1 bv2 0 (bytevector-length bv2))]
+          [(bv1 bv2 start2 length2)
+           (define result)
+           (with-interrupts-disabled
+            (match (osi_tcp_write2* (get-osi-port-handle 'tcp-write2 osi-port)
+                     bv1 bv2 start2 length2
+                     (let ([p self])
+                       (lambda (r)
+                         (keep-live osi-port)
+                         (set! result r)
+                         (complete-io p))))
+              [#t
+               (wait-for-io (osi-port-name osi-port))
+               (if (>= result 0)
+                   result
+                   (io-error (osi-port-name osi-port) 'osi_tcp_write2 result))]
+              [(,who . ,errno)
+               (io-error (osi-port-name osi-port) who errno)]))])))))
+
+  (define (tcp-nodelay port enabled?)
+    (arg-check 'tcp-nodelay [port output-port?])
+    (with-interrupts-disabled
+     (let ([osi-port (@port-osi-port port)])
+       (unless (tcp-osi-port? osi-port)
+         (errorf 'tcp-nodelay "invalid port ~s" port))
+       (osi_tcp_nodelay (osi-port-handle osi-port) enabled?))))
 
   (define-record-type sighandler
     (nongenerative)
@@ -1035,16 +1280,15 @@
      [(signum)
       (arg-check 'signal-handler [signum fixnum? fxpositive?])
       (with-interrupts-disabled
-        (@signal-handler-callback signum))]
+       (@signal-handler-callback signum))]
      [(signum callback)
       (arg-check 'signal-handler
         [signum fixnum? fxpositive?]
         [callback (lambda (cb) (or (not cb) (procedure? cb)))])
       (with-interrupts-disabled
-       (let* ([cell (hashtable-cell signal-handlers signum #f)]
-              [prev (cdr cell)])
+       (let ([prev (hashtable-ref signal-handlers signum #f)])
          (define (set-handler! signum handle callback)
-           (set-cdr! cell
+           (hashtable-set! signal-handlers signum
              (make-sighandler signum (erlang:now) handle callback)))
          (cond
           [(sighandler? prev)

@@ -104,7 +104,7 @@
          (my-respond
           (http:call-with-ports conn
             (lambda (ip op)
-              (get-bytevector-n ip
+              (get-bytevector-exactly-n ip
                 (string->number
                  (or (find-param "count")
                      (http:get-header "Content-Length" header)))))
@@ -150,7 +150,15 @@
                    (put-bytevector op (string->utf8 "switched"))
                    (flush-output-port op)
                    (close-port op))]))]
-        ))))
+        )))
+  (write-exprs "plus+is+plus.ss"
+    ;; Don't convert #\+ to #\space in the path, but do convert
+    ;; within the query portion of the URI.
+    '((http:include "common.ss")
+      (match (get-param "plus is space in key")
+        ["plus is space in value"
+         (my-respond (string->utf8 "pass"))])))
+  )
 
 (define (start-default-file-server)
   (write-web-mats)
@@ -208,11 +216,10 @@
 
 (define (simple-tcp x)
   (let-values ([(ip op) (connect-tcp "127.0.0.1" (get-http-port))])
-    (put-bytevector op x)
-    (flush-output-port op)
-    (let ([r (get-bytevector-all ip)])
-      (close-port op)
-      r)))
+    (on-exit (begin (close-port op) (close-port ip))
+      (put-bytevector op x)
+      (flush-output-port op)
+      (get-bytevector-all ip))))
 
 (define (simple-get x)
   (simple-tcp (string->utf8 (format "GET ~a HTTP/1.1\r\nConnection: close\r\n\r\n" x))))
@@ -225,7 +232,7 @@
 (define-tuple <result> reason details output)
 
 (define (flush-errors)
-  (receive (after 10 'ok)
+  (test:receive (after 10 'ok)
     [`(<child-end>) (flush-errors)]))
 
 (define (test-error&output input)
@@ -235,7 +242,7 @@
                      output
                      (utf8->string output))])
     (let lp ([best #f])
-      (receive (after 100 (<result> make [reason best] [details best] [output output]))
+      (test:receive (after 100 (<result> make [reason best] [details best] [output output]))
         [`(<child-end> [reason normal])
          (lp (or best 'normal))]
         [`(<child-end> ,reason ,details)
@@ -256,7 +263,7 @@
     (let* ([status (http:read-status ip 4096)]
            [header (http:read-header ip 1048576)]
            [len (http:get-content-length header)]
-           [content (and len (f (get-bytevector-n ip len)))])
+           [content (and len (f (get-bytevector-exactly-n ip len)))])
       (<response> make
         [status status]
         [header header]
@@ -269,7 +276,7 @@
   (parse-response (test input) bytevector->sexpr))
 
 (define internal-server-error
-  "HTTP/1.1 500 \r\nContent-Length: 167\r\nCache-Control: no-cache\r\n\r\n<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Internal server error</title></head><body><h1>The server was unable to complete the request.</h1></body></html>")
+  "HTTP/1.1 500 \r\nContent-Length: 177\r\nCache-Control: no-cache\r\n\r\n<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Internal server error</title></head><body><h1>The server was unable to complete the request.</h1></body></html>")
 
 (http-mat handlers ()
   ;; The request-timeout option should be relatively short (500ms) for
@@ -777,7 +784,7 @@
   (let-values ([(ip op) (connect-tcp "127.0.0.1" (get-http-port))])
     (put-bytevector op (string->utf8 "Malformed Request\r\n\r\n"))
     (flush-output-port op)
-    (receive (after 10 (throw 'no-child-log))
+    (test:receive (after 10 (throw 'no-child-log))
       [`(<child-end> [reason #(http-unhandled-input ,x)])
        (assert (string=? (utf8->string x) "Malformed Request"))])
     (close-port op))
@@ -793,12 +800,28 @@
       (spawn&link
        (lambda ()
          (send me `#(read ,(utf8->string (get-bytevector-all ip)))))))
-    (receive (after 100 (throw 'timeout))
+    (test:receive (after 100 (throw 'timeout))
       [#(read ,x)
        (unless (string=? x
                  (string-append
                   "HTTP/1.1 200 \r\nContent-Length: 1\r\nCache-Control: no-cache\r\n\r\n1"
                   "HTTP/1.1 200 \r\nContent-Length: 1\r\nCache-Control: no-cache\r\n\r\n2"))
+         (throw `#(unexpected ,x)))])
+    (close-port op))
+
+  (let-values ([(ip op) (connect-tcp "127.0.0.1" (get-http-port))])
+    (put-bytevector op (string->utf8 "GET /plus+is+plus?plus+is+space+in+key=plus+is+space+in+value&ignore=0 HTTP/1.1\r\n"))
+    (http:write-header op '(("Connection" . "close")))
+    (flush-output-port op)
+    (let ([me self])
+      (spawn&link
+       (lambda ()
+         (send me `#(read ,(utf8->string (get-bytevector-all ip)))))))
+    (test:receive (after 100 (throw 'timeout))
+      [#(read ,x)
+       (unless (string=? x
+                 (string-append
+                  "HTTP/1.1 200 \r\nContent-Length: 4\r\nCache-Control: no-cache\r\n\r\npass"))
          (throw `#(unexpected ,x)))])
     (close-port op))
 
@@ -808,7 +831,7 @@
         [fail-msg `#(accept-tcp-failed "listener" "who" "errno")])
     (link http)
     (send http fail-msg)
-    (receive (after 100 (throw 'timeout))
+    (test:receive (after 100 (throw 'timeout))
       [`(EXIT ,@http ,@fail-msg) 'ok])))
 
 (http-mat http-respond ()
@@ -1059,7 +1082,7 @@
           (match ls
             [() 'ok]
             [(,n . ,rest)
-             (receive (after 100 (throw `#(failed-to-read-data ,n)))
+             (test:receive (after 100 (throw `#(failed-to-read-data ,n)))
                [#(read ,@n) (lp rest)])])))
 
       (check-loopback '(9 8 7 6 5))
@@ -1076,7 +1099,9 @@
         (assert (process? (g))))
 
       ;; I/O Continues after the connection exited
-      (check-loopback '(4 3 2 1 0)))))
+      (check-loopback '(4 3 2 1 0))
+      (close-port op)
+      (close-port ip))))
 
 (http-mat switch-protocol-fail ()
   (supervisor:start&link 'http-sup 'one-for-all 0 1
@@ -1196,8 +1221,13 @@
     (receive (after 1000 (throw 'get-msg-timeout))
       [#(ws:message ,@from ,msg) msg]))
 
-  (define (send/expect p1 p2 data)
-    (ws:send p1 data)
+  (define (send/expect do-send p1 p2 data)
+    ;; ws:send! is destructive only if data is a bytevector;
+    ;; for strings, we have to convert to utf8 in either case
+    (do-send p1
+      (if (and (eq? do-send ws:send!) (bytevector? data))
+          (bytevector-copy data)
+          data))
     (assert (equal? data (get-msg p2))))
 
   (define primes '(7 11 13 239 241 251))
@@ -1208,8 +1238,12 @@
      (lambda (prime)
        (for-each
         (lambda (size)
-          (send/expect p1 p2 (build-buffer size (make-byte-stream prime)))
-          (send/expect p1 p2 (build-string size (make-byte-stream prime))))
+          (let ([buffer (build-buffer size (make-byte-stream prime))])
+            (send/expect ws:send p1 p2 buffer)
+            (send/expect ws:send! p1 p2 buffer))
+          (let ([str (build-string size (make-byte-stream prime))])
+            (send/expect ws:send p1 p2 str)
+            (send/expect ws:send! p1 p2 str)))
         buffer-sizes))
      primes))
 
@@ -1345,7 +1379,9 @@
     [#(EXIT #(bad-arg ws:send a))
      (catch (ws:send 'test 'a))]
     [#(EXIT #(bad-arg ws:send 0))
-     (catch (ws:send 'test 0))])
+     (catch (ws:send 'test 0))]
+    [#(EXIT #(bad-arg ws:send! 12))
+     (catch (ws:send! 'test 12))])
    'ok))
 
 (http-mat websocket-linking ()
@@ -1375,14 +1411,14 @@
         (send pid msg)
         (check c s)))
     (define (check-crash c s)
-      (receive (after 100 (throw 'no-client-close))
+      (test:receive (after 100 (throw 'no-client-close))
         [#(ws:closed ,@c 1011 "") 'ok])
-      (receive (after 100 (throw 'no-child-log))
+      (test:receive (after 100 (throw 'no-child-log))
         [`(<child-end> [pid ,@s] [reason crashed]) 'ok]))
     (define (check-normal c s)
-      (receive (after 100 (throw 'no-client-close))
+      (test:receive (after 100 (throw 'no-client-close))
         [#(ws:closed ,@c 1000 "") 'ok])
-      (receive (after 100 (throw 'no-child-log))
+      (test:receive (after 100 (throw 'no-child-log))
         [`(<child-end> [pid ,@s] [reason normal]) 'ok]))
     (do-test #f 'crash check-crash)
     (do-test #t 'crash check-crash)
@@ -1413,9 +1449,9 @@
         (let ([str (make-string (+ max-size 1) #\b)])
           (ws:send c str)
           (receive (after 1000 (throw 'no-server-close))
-            [#(ws:closed ,@s 1002 ,_) 'ok]))
+            [#(ws:closed ,@s 1009 ,_) 'ok]))
         (receive (after 1000 (throw 'no-client-close))
-          [#(ws:closed ,@c 1002 ,_) 'ok]
+          [#(ws:closed ,@c 1009 ,_) 'ok]
           [#(ws:closed ,@c 1001 ,_)
            ;; When the message size is large, it is likely the server
            ;; side closes the connection, and the client side fails
@@ -1456,6 +1492,32 @@
          (receive (after 1000 (throw 'no-server-close))
            [#(ws:closed ,@s 1002 "no response from ping") 'ok])]))))
 
+(http-mat websocket-pong ()
+  ;; Send multiple pings, fail if pong is not processed.
+  (define me self)
+  (capture-events)
+  (supervisor:start&link 'http-sup 'one-for-all 0 1
+    (http:configure-server #f 0
+      (http:url-handler
+       (ws:upgrade conn request me
+         (ws:options
+          [ping-frequency 100]
+          [pong-timeout 1000])))))
+  (let* ([c (ws:connect "127.0.0.1" (get-http-port) "/" self)]
+         [_ (receive [#(ws:init ,@c) 'ok])]
+         [s (receive [#(ws:init ,s) s])])
+    ;; This delay needs to be more than the pong-timeout.
+    (receive (after 2000 'ok))
+    (ws:close c)
+    (receive (after 1000 (throw 'no-client-close))
+      [#(ws:closed ,@c 1000 "") 'ok]
+      [#(ws:closed ,@c ,code ,reason)
+       (throw `#(client-closed-for-bad-reason ,code ,reason))])
+    (receive (after 1000 (throw 'no-server-close))
+      [#(ws:closed ,@s 1000 "") 'ok]
+      [#(ws:closed ,@s ,code ,reason)
+       (throw `#(server-closed-for-bad-reason ,code ,reason))])))
+
 (http-mat websocket-client-connect-errors ()
   (define (do-test req)
     (catch (ws:connect "127.0.0.1" (get-http-port) req self)))
@@ -1490,3 +1552,18 @@
     [#(EXIT #(websocket-invalid-header sec-websocket-accept "bad-key"))
      (do-test "/?status=101&connection=upgrade&upgrade=websocket&sec-websocket-accept=bad-key")])
    'ok))
+
+(mat validate-path ()
+  (match-let*
+   ([,sep (string (directory-separator))]
+    [#f (http:valid-path? 'rubbish)]
+    [#f (http:valid-path? "rubbish")]
+    [#t (http:valid-path? "/")]
+    [#t (http:valid-path? "/okay")]
+    [#t (http:valid-path? (path-combine "/okay" "fine" "sure"))]
+    [#f (http:valid-path? (path-combine "/okay" ".." "bad"))]
+    [#f (http:valid-path? (path-combine "/okay" "bad" "wrong" ".."))]
+    [#f (http:valid-path? (path-combine "/.." "also" "bad"))]
+    [#t (http:valid-path? (path-combine "/a" "b" "c" "d" "e"))])
+   'ok)
+  )

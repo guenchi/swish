@@ -303,16 +303,21 @@ used:
 
   \code{file-transform} & \code{(lambda (path) \#f)} & a procedure; a
   cache process calls this procedure with a file path and expects an
-  evaluator procedure or \code{\#f} (see \S\ref{sec:dynamic-pages})
+  evaluator procedure or \code{\#f} (see \S\ref{sec:dynamic-pages}) \\
+
+  \code{validate-path} & \code{http:valid-path?} & a predicate;
+  the server raises an exception if the \code{<request>} \var{path}
+  does not satisfy this predicate. \\
+
 \end{tabular}
 
 \defineentry{http:add-server}
 \begin{syntax}
-  \code{(http:add-server \var{arg} \ldots)}
+  \code{(http:add-server \var{arg} \etc)}
 \end{syntax}
 
 The \code{http:add-server} macro expands to code that appends the
-result of \code{(http:configure-server \var{arg} \ldots)} to the
+result of \code{(http:configure-server \var{arg} \etc)} to the
 \code{app-sup-spec} parameter.
 
 \defineentry{http:configure-file-server}
@@ -333,11 +338,11 @@ defaults to one constructed via
 
 \defineentry{http:add-file-server}
 \begin{syntax}
-  \code{(http:add-file-server \var{arg} \ldots)}
+  \code{(http:add-file-server \var{arg} \etc)}
 \end{syntax}
 
 The \code{http:add-file-server} macro expands to code that appends the
-result of \code{(http:configure-file-server \var{arg} \ldots)} to the
+result of \code{(http:configure-file-server \var{arg} \etc)} to the
 \code{app-sup-spec} parameter.
 
 \defineentry{http:make-default-file-url-handler}
@@ -682,6 +687,16 @@ syntax with the constructs described in
 Section~\ref{sec:dynamic-page-constructs}, and calls the \code{eval}
 system procedure.
 
+\defineentry{http:valid-path?}
+\begin{procedure}
+  \code{(http:valid-path? \var{path})}
+\end{procedure}
+\returns{} boolean
+
+The \code{http:valid-path?} procedure checks that the \var{path} from a \code{<request>} is a string that begins with \code{/} and contains no \code{".."} path elements when decomposed as a filesystem path.
+On Windows this procedure treats both \code{/} and \code{\textbackslash}
+as path separators since some filesystem operations accept both.
+
 \subsection {Dynamic Page Constructs}\label{sec:dynamic-page-constructs}
 
 A dynamic page exposes the same implicit variables as a URL handler
@@ -774,14 +789,19 @@ defined in Section~\ref{sec:websocket-protocol} to the given
 The \var{options} are the same as defined for \code{ws:upgrade}.
 
 \defineentry{ws:send}
+\defineentry{ws:send"!} % use " to escape the ! for index entry
 \begin{procedure}
-  \code{(ws:send \var{server} \var{message})}
+  \code{(ws:send \var{server} \var{message})}\\
+  \code{(ws:send! \var{server} \var{message})}
 \end{procedure}
 \returns{} \code{ok}
 
 The \code{ws:send} procedure uses \code{gen-server:cast} to transmit
 the bytevector or string \var{message} to the websocket process or
 registered name \var{server}.
+The \code{ws:send!} procedure is like \code{ws:send} except that it does
+not copy bytevector messages, but may instead destructively update them
+to apply a mask for transmission.
 
 \defineentry{ws:close}
 \begin{procedure}
@@ -836,25 +856,28 @@ HTML. The transformation, $H$, is described below:
   \code{\#!void} & nothing\\
   \code{\var{string}} & $E(\var{string})$\\
   \code{\var{number}} & \var{number}\\
-  \code{(begin \var{pattern} \ldots)} & $H(\var{pattern})$\ldots\\
-  \code{(cdata \var{string} \ldots)} &
-  \code{[!CDATA[\var{string}$\ldots$]]}\\
-  \code{(html5 \opt{(@ \var{attr} \ldots)} \var{pattern} \ldots)} &
-  \code{<!DOCTYPE html><html $A(\var{attr})$ $\ldots$>$H(\var{pattern})\ldots$</html>}\\
-  \code{(raw \var{string} \ldots)} & \var{string}$\ldots$\\
-  \code{(script \opt{(@ \var{attr} \ldots)} \var{string} \ldots)} &
-  \code{<script $A(\var{attr})$ $\ldots$>\var{string}$\ldots$</script>}\\
-  \code{(style \opt{(@ \var{attr} \ldots)} \var{string} \ldots)} &
-  \code{<style $A(\var{attr})$ $\ldots$>\var{string}$\ldots$</style>}\\
-  \code{(\var{tag} \opt{(@ \var{attr} \ldots)} \var{pattern} \ldots)} &
-  \code{<\var{tag} $A(\var{attr})$ $\ldots$>$H(\var{pattern})\ldots$</\var{tag}>}\\
-  \code{(\var{void-tag} \opt{(@ \var{attr} \ldots)})} &
-  \code{<\var{void-tag} $A(\var{attr})$ $\ldots$>}\\
+  \code{(begin \var{pattern} \etc)} & $H(\var{pattern})$\etc\\
+  \code{(cdata \var{string} \etc)} &
+  \code{[!CDATA[\var{string}$\etc$]]}\\
+  \code{(html5 \opt{(@ \var{attr} \etc)} \var{pattern} \etc)} &
+  \code{<!DOCTYPE html><html $A(\var{attr})$ $\etc$>$H(\var{pattern})\etc$</html>}\\
+  \code{(raw \var{string} \etc)} & \var{string}$\etc$\\
+  \code{(script \opt{(@ \var{attr} \etc)} \var{string} \etc)} &
+  \code{<script $A(\var{attr})$ $\etc$>\var{string}$\etc$</script>}\\
+  \code{(style \opt{(@ \var{attr} \etc)} \var{string} \etc)} &
+  \code{<style $A(\var{attr})$ $\etc$>\var{string}$\etc$</style>}\\
+  \code{(\var{tag} \opt{(@ \var{attr} \etc)} \var{pattern} \etc)} &
+  \code{<\var{tag} $A(\var{attr})$ $\etc$>$H(\var{pattern})\etc$</\var{tag}>}\\
+  \code{(\var{void-tag} \opt{(@ \var{attr} \etc)})} &
+  \code{<\var{void-tag} $A(\var{attr})$ $\etc$>}\\
 
   \hline
 \end{tabular}
 
 $E$ denotes the \code{html:encode} function.
+
+For the \code{html5} tag, if there is no \var{attr} with \code{lang} as its key,
+then $H$ acts as if the \var{attr} \code{(lang "en")} were specified.
 
 A \var{void-tag} is one of \code{area}, \code{base}, \code{br},
 \code{col}, \code{embed}, \code{hr}, \code{img},
@@ -1076,9 +1099,12 @@ The following exceptions may be raised:
 \returns{} unspecified
 
 The \code{json:write} procedure writes the object \var{x} to the
-textual output port \var{op} in JSON format. JSON objects are sorted
-by key using \code{string<?} on the string values of the symbols to
-provide stable output. Scheme fixnums, bignums, and finite flonums may
+textual output port \var{op} in JSON format. By default, \code{json:write}
+sorts the keys of JSON objects using \code{string<?}, after converting
+the symbolic keys to strings.
+This sort order provides stable output.
+The \code{json:key<?} parameter may be used to alter or disable key sorting.
+Scheme fixnums, bignums, and finite flonums may
 be used as numbers.
 
 When \var{indent} is a non-negative fixnum, the output is more
@@ -1098,6 +1124,9 @@ arguments: the textual output port \var{op}, the Scheme object
 objects.  The \var{wr} procedure is equivalent to
 \code{(lambda (\var{op} \var{x} \var{indent}) (json:write \var{op} \var{x} \var{indent} \var{custom-write}))}.
 
+The default value of \var{custom-write} is the value stored in the
+\code{json:custom-write} process-parameter.
+
 If an object cannot be formatted, \code{\#(invalid-datum \var{x})}
 is raised.
 
@@ -1110,13 +1139,16 @@ is raised.
 Given a textual output port \var{op}, an \var{indent} level, and a
 writer procedure \var{wr}, the \code{json:write-object} construct
 writes a JSON object with the given \var{key} / \var{value} pairs to
-\var{op}, sorted by key using \code{string<?} on the string values of
-the symbols.  Each \var{key} must be a distinct symbol.  The \var{wr}
+\var{op}. By default, \code{json:write-object} sorts the keys using
+\code{string<?} on the string values of the symbols.
+To alter or disable key sorting, see the \code{json:key<?} parameter.
+
+Each \var{key} must be a distinct symbol.  The \var{wr}
 procedure takes \var{op}, an object \var{x}, and an \var{indent} level
 just like the \var{wr} procedure that is passed to \code{json:write}'s
 \var{custom-write} procedure.
 
-The following are equivalent, provided the keys are symbols.
+The following are equivalent, provided the keys are symbols and \code{json:key<?} has its default value.
 
 \antipar\begin{alltt}
 (begin (json:write \var{op} (json:make-object [\var{key} \var{value}] \etc) \var{indent}) \#t)
@@ -1125,6 +1157,54 @@ The following are equivalent, provided the keys are symbols.
 The latter trades code size and compile time for run-time efficiency.
 At compile time, \code{json:write-object} sorts the keys and
 preformats the strings that will separate values.
+
+\defineentry{json:pretty}
+\begin{procedure}
+  \code{(json:pretty \var{x} \opt{\var{op}})}
+\end{procedure}
+\returns{} unspecified
+
+The \code{json:pretty} procedure formats an object \var{x} to the
+optional textual output port \var{op} in a human-readable form. The
+object is indented and keys are sorted using
+\code{natural-string-ci<?}. The default value of \var{op} is
+\code{(current-output-port)}.
+
+Calling \code{(json:pretty x)} is roughly equivalent to the following:
+\antipar\codebegin
+(parameterize ([json:key<? natural-string-ci<?])
+  (json:write (current-output-port) x 0))
+\codeend
+
+\defineentry{json:custom-write}
+\begin{parameter}
+  \code{json:custom-write}
+\end{parameter}
+\returns{} a procedure or \code{\#f}
+
+The \code{json:custom-write} process-parameter determines the default
+\var{custom-write} argument for \code{json:write} and the other JSON
+output procedures.
+
+\defineentry{json:key<?}
+\begin{parameter}
+  \code{json:key<?}
+\end{parameter}
+\returns{} a boolean or a predicate for comparing two strings
+
+The \code{json:key<?} parameter determines whether and how
+\code{json:pretty}, \code{json:write}, and \code{json:write-object} sort keys
+when writing JSON objects.
+If set to \code{\#f}, keys are not sorted and the output order is arbitrary.
+Otherwise, the output is sorted by obtaining a string for each key
+via \code{symbol->string} and comparing those strings using the predicate
+specified by \code{json:key<?}.
+If \code{json:key<?} is set to \code{\#t}, which is the default,
+then \code{json:pretty} sorts with \code{natural-string-ci<?}
+while \code{json:write} and \code{json:write-object} sort with
+\code{string<?}.
+To affect the output of \code{json:write-object}, \code{json:key<?} must
+be set to the desired value at expand time.
 
 \defineentry{json:object->bytevector}
 \begin{procedure}

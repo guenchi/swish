@@ -28,7 +28,7 @@ This chapter describes the design of the message-passing concurrency
 model. It provides a Scheme embedding of a significant subset of the
 Erlang programming
 language~\cite{armstrong-thesis,programming-erlang}.\footnote{Tuples,
-  denoted by \{$e_1$, \ldots, $e_n$\} in Erlang, are implemented as
+  denoted by \{$e_1$, \etc, $e_n$\} in Erlang, are implemented as
   vectors: \code{\#(\var{e$_1$}~\etc~\var{e$_n$})}. Similarly
   records, defined as syntactic sugar over tuples in Erlang, are
   implemented as syntactic sugar over vectors.}  Tuple and pattern
@@ -259,10 +259,13 @@ Asynchronous I/O operations for COM ports, named pipes, external
 operating system processes, files, console input, and TCP connections
 are implemented with custom binary ports so that they have the same
 interface as the system I/O procedures. The system I/O procedures are
-not used because they perform synchronous I/O.  The custom port buffer
-size is set to 1024\footnote{1024 was chosen because Chez Scheme uses
-  1024 for the buffer size of buffered transcoded ports.} with
-\code{custom-port-buffer-size}.  The custom binary port read and write
+not used because they perform synchronous I/O.  The default custom port buffer
+size is set to 1024 with \code{custom-port-buffer-size}.\footnote{1024 was
+chosen because prior versions of Chez Scheme use 1024 for the buffer size
+of buffered transcoded ports.}
+When compiled with Chez Scheme versions 9.6.2 and later, Swish uses
+\code{file-buffer-size} as the buffer size for custom file ports.
+The custom binary port read and write
 procedures call \code{osi\_read\_port} and \code{osi\_write\_port}
 with callbacks that send a message to the calling process, which waits
 until it receives the message.
@@ -856,7 +859,7 @@ into arguments for \var{handle-field}:
   \code{,\var{field}} & \var{field} & \var{field} & \code{()} & \var{field} must be an identifier \\
   \code{,@\var{field}} & \var{field} & \var{unique} & \code{()} & \var{field} must be an identifier \\
   \code{[\var{field} \var{pattern} \var{option} \etc{}]} &
-    \var{field} & \var{unique} & \code{(\var{option} ...)} &
+    \var{field} & \var{unique} & \code{(\var{option} \etc)} &
     \var{unique} is matched against \var{pattern} \\
 \end{tabular}
 
@@ -970,11 +973,41 @@ garbage collected.
 \begin{parameter}
   \code{process-trap-exit}
 \end{parameter}
-\hasvalue{} boolean
+\hasvalue{} boolean or a procedure
 
 The \code{process-trap-exit} parameter specifies whether or not the
-calling process traps exit signals as messages. Processes start with
-this parameter set to \code{\#f}.
+calling process traps exit signals as messages.
+Processes do not trap exit signals by default; therefore,
+processes start with this parameter set to \code{\#f}.
+To trap exit signals as messages, a process sets this parameter
+to \code{\#t} or a procedure.
+A gen-server can set the parameter to \code{\#t} and handle exit messages
+via its \code{handle-info} callback; see Section~\ref{sec:gen-server-callback} for details.
+Other processes can handle these messages via \code{receive}.
+
+A process may set the \code{process-trap-exit} parameter to a \var{handler}
+procedure that accepts one argument, \var{msg}.
+When the scheduler resumes that process, it checks whether \code{kill} or
+\code{link} has delivered an exit signal as a message.
+If so, it retrieves the first exit message, invokes \var{handler} on that
+message, and repeats this until it has consumed the available exit messages.\footnote{An exit message delivered via \code{send} will not trigger \var{handler} on its own, but \var{handler} may consume that message if
+the scheduler invokes \var{handler}.}
+A \var{handler} procedure may be useful, for example, to perform some cleanup
+in case an exit signal arrives while a process is blocked awaiting a reply in
+\code{gen-server:call}.
+
+% ----------------------------------------------------------------------------
+\defineentry{raise-on-exit}
+\begin{procedure}
+  \code{(raise-on-exit \var{msg})}
+\end{procedure}
+\returns{} see below
+
+The \code{raise-on-exit} procedure expects an exit message \var{msg}
+matching \code{`(EXIT \var{pid} \var{reason})}.
+If \var{reason} is \code{normal}, \code{raise-on-exit} returns
+an unspecified value.
+Otherwise, it raises an exception involving \var{reason}.
 
 % ----------------------------------------------------------------------------
 \defineentry{self}
@@ -987,6 +1020,21 @@ The \code{self} macro uses \code{identifier-syntax} to expand into
 code that retrieves the global self variable's top-level value. The
 global variable cannot be used directly because library bindings are
 immutable.
+
+% ----------------------------------------------------------------------------
+\defineentry{with-interrupts-disabled-for-io}
+\begin{syntax}
+  \code{(with-interrupts-disabled-for-io \var{body$_1$} \var{body$_2$} \etc)}
+\end{syntax}
+\expandsto{} see below
+
+The \code{with-interrupts-disabled-for-io} macro is like
+\code{with-interrupts-disabled} except that, just before returning, it checks
+for trapped exit messages.
+The system handles trapped exit messages at this time only if
+\code{process-trap-exit} is set to a procedure.
+This macro is intended for use in code that calls \code{wait-for-io} and
+\code{complete-io} with interrupts disabled.
 
 % ----------------------------------------------------------------------------
 \subsection{Miscellaneous}
@@ -1129,21 +1177,37 @@ for each foreign-handle type registered with \code{make-foreign-handle-guardian}
 % ----------------------------------------------------------------------------
 \defineentry{arg-check}
 \begin{syntax}
-  \code{(arg-check \var{who} [\var{arg} \var{pred} \ldots] \ldots)}
+  \code{(arg-check \var{who} [\var{arg} \var{pred} \etc] \etc)}
 \end{syntax}
 \expandsto{}\begin{alltt}\antipar
 (let ([who \var{who}])
   (let ([arg \var{arg}])
-    (unless (and (pred arg) \ldots)
+    (unless (and (pred arg) \etc)
       (profile-me-as arg-check)
       (bad-arg who arg)))
-  \ldots
+  \etc
   (void))\end{alltt}
 
 The \code{arg-check} macro raises a \code{bad-arg} exception if
 any \var{arg} fails any \var{pred} specified for that \var{arg}.
 Within coverage reports, profile counts on the \code{arg-check}
 keyword indicate the number of \code{bad-arg} cases encountered.
+
+% ----------------------------------------------------------------------------
+\defineentry{procedure/arity?}
+\begin{procedure}
+  \code{(procedure/arity? \var{mask} \opt{\var{obj}})}
+\end{procedure}
+\returns{} see below
+
+If both arguments are supplied, \code{procedure/arity?} returns true if
+\var{obj} is a procedure that supports all of the argument counts specified by
+\var{mask}.
+If only the \var{mask} is supplied, then \code{procedure/arity?}
+returns a procedure \code{(lambda (p) (procedure/arity? \var{mask} p))}
+suitable for use with \code{andmap} or \code{arg-check}, for example.
+In either case \var{mask} must be an exact integer bitmask of the
+form returned by \code{procedure-arity-mask}.
 
 % ----------------------------------------------------------------------------
 \defineentry{bad-arg}
@@ -1756,6 +1820,41 @@ The \code{directory?} procedure calls \code{(get-stat \var{path})} to
 determine whether or not \var{path} is a directory.
 
 % ----------------------------------------------------------------------------
+\defineentry{filter-files}
+\begin{procedure}
+  \code{(filter-files \var{path} \opt{\var{keep-dir?} \var{keep-file?}})}
+\end{procedure}
+\returns{} a list of filenames
+
+The \code{filter-files} procedure calls \code{fold-files} to
+accumulate a list of filenames. \var{keep-dir?} is a procedure which
+should accept a full directory name and return true to descend into
+that directory. \var{keep-file?} is a procedure which should accept a
+full path to a file and return true to keep the filename in the final
+result list.
+
+When \var{keep-dir?} and \var{keep-file?} are not specified, all
+directories under \var{path} are traversed, and all filenames are
+returned.
+
+% ----------------------------------------------------------------------------
+\defineentry{fold-files}
+\begin{procedure}
+  \code{(fold-files \var{path} \var{init} \var{keep-dir?} \var{f})}
+\end{procedure}
+\returns{} see below
+
+The \code{fold-files} procedure folds over directories and files
+starting at \var{path} and calls \var{f} with the full path to each
+file and an accumulator (initially \var{init}).
+
+For each directory, \code{fold-files} calls \var{keep-dir?} with the
+full directory name. When \var{keep-dir?} returns true
+\code{fold-files} will descend into that directory.
+
+Errors while enumerating the file system are ignored.
+
+% ----------------------------------------------------------------------------
 \defineentry{force-close-output-port}
 \begin{procedure}
   \code{(force-close-output-port \var{op})}
@@ -1769,6 +1868,20 @@ cause it to fail to close.  If \var{op} is not already closed,
 \code{(close-output-port \var{op})}. If it fails, the output buffer is
 cleared with \code{(clear-output-port \var{op})}, and
 \code{(close-output-port \var{op})} is called again.
+
+% ----------------------------------------------------------------------------
+\defineentry{get-bytevector-exactly-n}
+\begin{procedure}
+  \code{(get-bytevector-exactly-n \var{ip} \var{n})}
+\end{procedure}
+\returns{} a bytevector of length \var{n}
+
+The \code{get-bytevector-exactly-n} procedure takes a binary input
+port \var{ip} and an exact nonnegative integer \var{n} and
+returns a bytevector of the next \var{n} bytes from \var{ip}.
+If \var{ip} reaches end-of-file before it obtains \var{n} bytes,
+\code{get-bytevector-exactly-n} throws an \code{unexpected-eof}
+exception.
 
 % ----------------------------------------------------------------------------
 \defineentry{get-datum/annotations-all}
@@ -2295,7 +2408,9 @@ The \code{osi-port?} procedure determines whether or not the datum
 
 The \code{path-combine} procedure appends one or more paths, inserting
 the directory-separator character between each pair of paths as
-needed.
+needed, while ignoring empty paths.
+
+% fine point: we preserve directory separators present in the input
 
 % ----------------------------------------------------------------------------
 \defineentry{path-watcher-count}
@@ -2337,6 +2452,20 @@ given path \var{watcher}\index{path watcher}.
 
 The \code{path-watcher?} procedure determines whether or not the datum
 \var{x} is a path watcher.
+
+% ----------------------------------------------------------------------------
+\defineentry{port->notify-port}
+\begin{procedure}
+  \code{(port->notify-port \var{p} \var{notify!})}
+\end{procedure}
+\returns{} a port
+
+The \code{port->notify-port} procedure takes a custom binary port \var{p} and a
+\var{notify!} procedure of one argument.
+It marks port \var{p} as closed and returns a new custom port whose \code{r!} or
+\code{w!} procedure calls \var{notify!} with the number of bytes returned.
+This procedure is currently restricted to ports returned by \code{connect-tcp}
+and ports obtained from an \code{\#(accept-tcp \var{listener} \var{ip} \var{op})} tuple.
 
 % ----------------------------------------------------------------------------
 \defineentry{print-osi-ports}
@@ -2615,6 +2744,17 @@ The \code{tcp-listener-count} procedure returns the number of open TCP
 listeners\index{TCP listener}.
 
 % ----------------------------------------------------------------------------
+\defineentry{tcp-nodelay}
+\begin{procedure}
+  \code{(tcp-nodelay \var{port} \var{enabled?})}
+\end{procedure}
+\returns{} a boolean
+
+The \code{tcp-nodelay} procedure calls \code{osi\_tcp\_nodelay} to enable
+or disable the Nagle algorithm on the specified TCP/IP \var{port}.
+It returns true if successful or false otherwise.
+
+% ----------------------------------------------------------------------------
 \defineentry{watch-path}
 \begin{procedure}
   \code{(watch-path \var{path} \var{process})}
@@ -2627,6 +2767,7 @@ with the path-watcher guardian\index{path-watcher guardian}.
 
 Every time a change is detected, \code{\#(path-changed \var{path}
   \var{filename} \var{events})} is sent to \var{process}, where
+\var{filename} is a string or \code{\#f} and
 \var{events} is 1 for rename, 2 for change, and 3 for rename and
 change. If the watcher encounters an error,
 \code{\#(path-watcher-failed \var{path} \var{errno})} is sent to
@@ -2920,6 +3061,28 @@ The \code{join} procedure returns the string formed by displaying each
 of the elements of list \var{ls} separated by displaying
 \var{separator}. When \var{last-separator} is specified, it is used as
 the last separator.
+
+% ----------------------------------------------------------------------------
+\defineentry{natural-string<?}
+\defineentry{natural-string-ci<?}
+\begin{procedure}
+  \code{(natural-string<? \var{s$_1$} \var{s$_2$})}\\
+  \code{(natural-string-ci<? \var{s$_1$} \var{s$_2$})}\strut
+\end{procedure}
+\returns{} a boolean
+
+These procedures compare strings \var{s$_1$} and \var{s$_2$} in a way that is
+more natural to humans than the corresponding
+\code{string<?} and \code{string-ci<?} predicates.
+The natural comparison predicates:
+\begin{enumerate}
+ \item ignore leading and trailing whitespace,
+ \item treat runs of multiple whitespace characters as a single space,
+ \item compare integers numerically, treating \code{-} as a dash
+   if it follows an alphanumeric character or else as negation, and
+ \item fall back to character comparison otherwise, with the \code{-ci<?}
+   variant being case-insensitive.
+\end{enumerate}
 
 % ----------------------------------------------------------------------------
 \defineentry{oxford-comma}
@@ -3291,7 +3454,7 @@ condition within the compound condition it constructs.
 % ----------------------------------------------------------------------------
 \defineentry{with-temporaries}
 \begin{syntax}
-  \code{(with-temporaries (\var{id} ...) e0 e1 ...)}
+  \code{(with-temporaries (\var{id} \etc) e0 e1 \etc)}
 \end{syntax}
 \expandsto{}\begin{alltt}\antipar
 (with-syntax ([(id ...) (generate-temporaries '(id ...))])
@@ -3299,4 +3462,80 @@ condition within the compound condition it constructs.
 
 The \code{with-temporaries} macro binds each macro-language
 pattern variable \var{id} to a fresh generated identifier
-within the body \code{(begin \var{e0}\ \var{e1}\ ...)}.
+within the body \code{(begin \var{e0}\ \var{e1}\ \etc)}.
+
+% ----------------------------------------------------------------------------
+\defineentry{define-syntactic-monad}
+\begin{syntax}
+  \code{(define-syntactic-monad \var{m} \var{id} \etc)}
+\end{syntax}
+\expandsto{} see below
+
+The \code{define-syntactic-monad} macro defines a macro \var{m} for defining
+and calling procedures that take implicit \code{\var{id} \etc} arguments in addition
+to any explicit arguments that may be provided.
+Such macros make it easier to write state machines in a functional style
+by allowing the programmer to specify only the values that change at a call.
+
+A call to \var{m} takes the form
+\code{(\var{m} \var{e$_0$} ([\var{id$_i$} \var{e$_i$}] \etc) \var{x} \etc)}
+or
+\code{(\var{m} \var{kwd} \var{form} \etc)}
+where \var{kwd} is
+\code{case-lambda},
+\code{define},
+\code{lambda},
+\code{let},
+\code{trace-case-lambda},
+\code{trace-define},
+\code{trace-lambda}, or
+\code{trace-let}.
+The first form constructs a call to \code{\var{e$_0$}} and is described below
+along with the \code{let} case.
+The other cases may be understood in terms of the following template
+expansions or their natural extension to tracing variants:
+
+~\code{(\var{m} lambda \var{fmls} \var{body} \etc)}
+$\rightarrow$
+\code{(lambda (\var{id} \etc{} . \var{fmls}) \var{body} \etc)}
+
+~\code{(\var{m} define (\var{proc} . \var{fmls}) \var{body} \etc)}
+$\rightarrow$
+\code{(define \var{proc} (\var{m} lambda \var{fmls} \var{body} \etc))}
+
+~\code{(\var{m} case-lambda [\var{fmls} \var{body} \etc] \etc)}
+$\rightarrow$
+\code{(case-lambda [(\var{id} \etc{} . \var{fmls}) \var{body} \etc] \etc)}
+
+The call form
+\code{(\var{m} \var{e$_0$} ([\var{id$_i$} \var{e$_i$}] \etc) \var{x} \etc)}
+constructs a call to \code{\var{e$_0$}} where the arguments are
+the \code{\var{id} \etc} with any \var{id$_i$} replaced by \var{e$_i$}
+all followed by the \code{\var{x} \etc} expressions.
+Any \var{id} that does not have an explicit
+\code{[\var{id$_i$} \var{e$_i$}]} binding in the call form
+must have a binding in scope.
+For calls within the body of an
+\code{(\var{m} case-lambda \etc)},
+\code{(\var{m} define \etc)},
+\code{(\var{m} lambda \etc)}, or
+\code{(\var{m} let \etc)}
+form such bindings are already in scope.
+As a convenience, the call syntax \code{(\var{m} \var{f})} is equivalent to
+\code{(\var{m} \var{f} ())} which specifies an empty list of implicit-binding updates.
+
+The \code{(\var{m} let \etc)} form constructs a named \code{let} using
+syntax inspired by the call form described above.
+That is,
+\code{(\var{m} let \var{name} ([\var{id$_i$} \var{e$_i$}] \etc) ([\var{x$_j$} \var{e$_j$}] \etc) \var{body} \etc)}
+constructs a named \code{let} \var{name}
+that binds \code{\var{id} \etc{} \var{x} \etc}
+with the initial value of each \var{id} coming from
+the value of the corresponding \var{e$_i$}
+or else the binding already in scope
+and the initial value of each \var{x$_j$} supplied by
+the corresponding \var{e$_j$}.
+Within \code{\var{body} \etc}, a call
+of the form \code{(\var{m} \var{name} (\var{id$_i$} \etc) \var{e$_j$} \etc)}
+can supply required values for each of the \var{x$_j$}
+along with new values for \var{id} \etc{} if needed.

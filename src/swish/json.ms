@@ -87,6 +87,14 @@
     #(-1.234e-10 "-1.234e-10")
     #((1.0 2) "[1.0e0,2]")
     #("" "\"\"")
+    ,@(map (lambda (n) `#(,n ,(format "~d" n)))
+        (list
+         (most-negative-fixnum)
+         (+ (most-negative-fixnum) 1)
+         (- (most-negative-fixnum) 1)
+         (most-positive-fixnum)
+         (+ (most-positive-fixnum) 1)
+         (fx/ (most-positive-fixnum) 2)))
     #(,(list->string (map integer->char (iota #xD800)))
       ,(let ([op (open-output-string)])
          (write-char #\" op)
@@ -154,7 +162,10 @@
   (for-each
    (lambda (obj)
      (match-let* ([#(,x ,_) obj])
-       (round-trip x)))
+       (round-trip x)
+       ;; show that json:write is immune to print-radix
+       (parameterize ([print-radix 2])
+         (round-trip x))))
    test-objs))
 
 (mat whitespace ()
@@ -180,17 +191,69 @@
            [foo "tstep"]
            [ace "rbic"])
          (get))]
-      [,custom-write
+      [(,@by-write ,@by-write ,@by-write ,@by-write ,@by-write)
+       ;; hit difference cases where we pre-compute all or part of a field write
+       ;; at expand-time; ideally cp0 would take it further from here
+       (let ()
+         (define (go1 x)
+           (json:write-object op #f json:write
+             [bar "rel"]
+             [foo "tstep"]
+             [ace x])
+           (get))
+         (define (go2 x)
+           (json:write-object op #f json:write
+             [bar "rel"]
+             [foo x]
+             [ace "rbic"])
+           (get))
+         (define (go3 x)
+           (json:write-object op #f json:write
+             [bar x]
+             [foo "tstep"]
+             [ace "rbic"])
+           (get))
+         (define (go4 x y)
+           (json:write-object op #f json:write
+             [bar x]
+             [foo "tstep"]
+             [ace y])
+           (get))
+         (define (go5 x y z)
+           (json:write-object op #f json:write
+             [bar x]
+             [foo z]
+             [ace y])
+           (get))
+         (list (go1 "rbic") (go2 "tstep") (go3 "rel")
+           (go4 "rel" "rbic")
+           (go5 "rel" "rbic" "tstep")))]
+      ["{\"pi\":3.14,\"zip\":null}"
+       (begin
+         (json:write-object op #f json:write
+           [pi 3.14]
+           [zip #\nul])
+         (get))]
+      [,fail
+       (guard (procedure? fail))
+       (lambda ()
+         ;; no error at expand time
+         (json:write-object op #f json:write
+           [abc 123456]
+           [bad +nan.0])
+         (get))]
+      [`(catch #(invalid-datum +nan.0)) (on-exit (get) (try (fail)))]
+      [,write-field-value
        (lambda (op v indent wr)
          (if (vector? v)
              (fprintf op "[~{\"~r\"~^,~}]" (vector->list v))
-             (wr op v)))]
+             (wr op v indent)))]
       ["{\"abc\":[\"four\",\"five\",\"six\"],\"def\":[7,8,9],\"ghi\":3}"
        (begin
          (json:write-object op #f json:write
            [ghi 3]
-           [abc '#(4 5 6) custom-write]
-           [def '(7 8 9) custom-write])
+           [abc '#(4 5 6) write-field-value]
+           [def '(7 8 9) write-field-value])
          (get))]
       [,g1 (gensym)]
       [,g2 (gensym)]
@@ -210,6 +273,41 @@
        (begin
          (json:write-object op #f json:write)
          (get))]
+      ;; interaction of json:custom-write with json:write-object
+      ;; also mix in some indentation for good measure
+      [,custom-write
+       (lambda (op x indent wr)
+         (and (box? x) (wr op (format "BOX ~a" (unbox x)) indent)))]
+      [,expected
+       (let ([obj (json:make-object
+                   [abc 123]
+                   [n0 (box 0)]
+                   [n1 (list (box 1) (box 2))])])
+         (json:write op obj 0 custom-write)
+         (get))]
+      [,@expected
+       (parameterize ([json:custom-write custom-write])
+         (json:write-object op 0 json:write
+           [abc 123]
+           [n0 (box 0)]
+           [n1 (list (box 1) (box 2))])
+         (get))]
+      ;; exercise custom-write with write-field-value
+      ["{\"aux\":11,\"zap\":[\"BOX 1\",2,\"BOX 3\"]}"
+       (let ([write-vector
+              (lambda (op v indent wr)
+                (if (vector? v)
+                    (let ([len (vector-length v)])
+                      (do ([i 0 (fx+ i 1)] [pre #\[ #\,]) ((fx= i len))
+                        (write-char pre op)
+                        (wr op (vector-ref v i) indent))
+                      (write-char #\] op))
+                    (wr op v indent)))])
+         (parameterize ([json:custom-write custom-write])
+           (json:write-object op #f json:write
+             [zap (vector (box 1) 2 (box 3)) write-vector]
+             [aux 11])
+           (get)))]
       )
      'ok)))
 
@@ -382,6 +480,8 @@
   (match-let*
    ([#(EXIT #(bad-arg json:write -1))
      (catch (json:write (open-output-string) 12 -1))]
+    [#(EXIT #(bad-arg json:write 7)) (catch (json:write 7 #f 0))]
+    [#(EXIT #(bad-arg json:pretty 9)) (catch (json:pretty #t 9))]
     [#(EXIT #(invalid-datum 1/2)) (catch (json:object->string 1/2))]
     [#(EXIT #(invalid-datum +inf.0)) (catch (json:object->string +inf.0))]
     [#(EXIT #(invalid-datum -inf.0)) (catch (json:object->string -inf.0))]
@@ -458,36 +558,114 @@
      (catch (json:set! 1 2 3))]
     [#(EXIT #(bad-arg json:cells apoptosis))
      (catch (json:cells 'apoptosis))]
+    [#(EXIT #(bad-arg json:key<? "wrong"))
+     (catch (json:key<? "wrong"))]
+    [,proc1 (lambda (x) #t)]
+    [#(EXIT #(bad-arg json:key<? ,@proc1))
+     (catch (json:key<? proc1))]
+    [#(EXIT #(bad-arg json:custom-write #t))
+     (catch (json:custom-write #t))]
+    [,proc3 (lambda (a b c) "bad")]
+    [#(EXIT #(bad-arg json:custom-write ,@proc3))
+     (catch (json:custom-write proc3))]
     )
    'ok))
 
+;; default canonical ordering for JSON serialization
 (mat stable-ordering ()
-  (define (find-collision s1 bound)
-    (define (gen)
-      (let* ([len (+ 1 (random 5))]
-             [s (make-string len)])
-        (do ([i 0 (fx+ i 1)]) ((fx= i len) (string->symbol s))
-          (string-set! s i
-            (integer->char (fx+ (char->integer #\a) (random 26)))))))
-    (define target (symbol-hash s1))
-    (let search ([i 0])
-      (and (fx< i bound)
-           (let ([s2 (gen)])
-             (if (= (symbol-hash s2) target)
-                 `(,s1 ,s2)
-                 (search (fx+ i 1)))))))
+  (define (gen)
+    (let* ([len (+ 1 (random 5))]
+           [s (make-string len)])
+      (do ([i 0 (fx+ i 1)]) ((fx= i len) (string->symbol s))
+        (string-set! s i
+          (integer->char (fx+ (char->integer #\a) (random 26)))))))
+  (define (gen-keys n)
+    ;; assumes n < size of the key space
+    (let lp ([i n] [acc '()])
+      (if (= i 0)
+          acc
+          (let ([key (gen)])
+            (if (memq key acc)
+                (lp i acc)
+                (lp (- i 1) (cons key acc)))))))
+  (define (scramble ls)
+    (let ([v (list->vector ls)])
+      (do ([i 0 (+ i 1)]) ((= i (vector-length v)) (vector->list v))
+        (let ([j (random (+ i 1))])
+          (unless (= i j)
+            (let ([t (vector-ref v i)])
+              (vector-set! v i (vector-ref v j))
+              (vector-set! v j t)))))))
+  (define (kvs->json kvs)
+    (let ([obj (json:make-object)])
+      (for-each
+       (lambda (kv)
+         (match-let* ([(,k . ,v) kv])
+           (json:extend-object obj [,k v])))
+       kvs)
+      obj))
+  (define (test n)
+    (match-let*
+     ([,kvs (map cons (gen-keys n) (iota n))]
+      [,obj1 (kvs->json (scramble kvs))]
+      [,str1 (json:object->string obj1)]
+      [,obj2 (kvs->json (scramble kvs))]
+      [,@str1 (json:object->string obj2)])
+     'ok))
+  (test 1)
+  (test 10)
+  (test 100)
+  (test 1000))
+
+(mat custom-ordering ()
+  (define (test-write-object key<?)
+    (let-values ([(op get) (open-string-output-port)])
+      (parameterize ([json:key<? key<?])
+        ((eval
+          `(lambda (op)
+             (json:write-object op #f json:write
+               [foo2 2]
+               [foo1 1]
+               [foo10 10])))
+         op)
+        (get))))
+  (define obj (json:make-object
+               [foo2 2]
+               [foo1 1]
+               [foo10 10]))
+  (define (test-write key<?)
+    (let-values ([(op get) (open-string-output-port)])
+      (parameterize ([json:key<? key<?])
+        (json:write op obj)
+        (get))))
+
   (match-let*
-   ([,hash (symbol-hash 'foo)]
-    [,@hash (symbol-hash 'byu)] ;; use find-collision if this fails
-    [,obj1 (json:make-object
-            [foo 1]
-            [byu 2])]
-    [,str1 (json:object->string obj1)]
-    [,obj2 (json:make-object
-            [byu 2]
-            [foo 1])]
-    [,@str1 (json:object->string obj2)])
-   'ok))
+   (["{\"foo2\":2,\"foo1\":1,\"foo10\":10}" ; no sort
+     (test-write-object #f)]
+    ["{\"foo1\":1,\"foo10\":10,\"foo2\":2}" ; default string<?
+     (test-write-object #t)]
+    ["{\"foo2\":2,\"foo10\":10,\"foo1\":1}" ; custom (reverse)
+     (test-write-object string>?)]
+    ["{\"foo1\":1,\"foo2\":2,\"foo10\":10}" ; custom (natural)
+     (test-write-object natural-string-ci<?)]
+    ;; Particularly difficult to prove that json:write does not
+    ;; sort. Here we serialize to a string, then deserialize to
+    ;; compare that the new object matches the original.
+    [,unsorted (test-write #f)]         ; no sort
+    [,_ (assert
+         (equal?
+          (dump obj)
+          (dump (json:string->object unsorted))))]
+
+    ["{\"foo1\":1,\"foo10\":10,\"foo2\":2}" ; default string<?
+     (test-write #t)]
+    ["{\"foo2\":2,\"foo10\":10,\"foo1\":1}" ; custom (reverse)
+     (test-write string>?)]
+    ["{\"foo1\":1,\"foo2\":2,\"foo10\":10}" ; custom (natural)
+     (test-write natural-string-ci<?)]
+    )
+   'ok)
+  )
 
 (mat manipulate ()
   (match-let*
@@ -561,4 +739,4 @@
   ;; - behavior of json:update! is unspecified if given invalid path
   ;;   such as (foo . bar)
   ;;   in particular, we'll smash everything along that path
-   )
+  )

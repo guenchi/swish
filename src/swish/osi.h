@@ -51,6 +51,7 @@ typedef struct {
 } jmp_t;
 
 EXPORT jmp_t g_exit;
+EXPORT int g_is_service;
 
 // System
 EXPORT ptr osi_get_argv(void);
@@ -68,11 +69,14 @@ EXPORT ptr osi_list_uv_handles(void);
 EXPORT ptr osi_make_uuid(void);
 EXPORT void osi_set_argv(int argc, const char* argv[]);
 EXPORT void osi_set_quantum(uint64_t nanoseconds);
+EXPORT int osi_is_service();
 
 // Ports
 EXPORT ptr osi_read_port(uptr port, ptr buffer, size_t start_index, uint32_t size, int64_t offset, ptr callback);
 EXPORT ptr osi_write_port(uptr port, ptr buffer, size_t start_index, uint32_t size, int64_t offset, ptr callback);
 EXPORT ptr osi_close_port(uptr port, ptr callback);
+
+EXPORT ptr osi_tcp_write2(uptr port, ptr bv1, ptr bv2, size_t start_index2, uint32_t size2, ptr callback);
 
 // Process
 EXPORT void osi_exit(int status);
@@ -106,6 +110,7 @@ EXPORT ptr osi_listen_tcp(const char* address, uint16_t port, ptr callback);
 EXPORT void osi_close_tcp_listener(uptr listener);
 EXPORT ptr osi_get_tcp_listener_port(uptr listener);
 EXPORT ptr osi_get_ip_address(uptr port);
+EXPORT ptr osi_tcp_nodelay(uptr port, int enable);
 
 // Message Digest
 EXPORT ptr osi_open_SHA1();

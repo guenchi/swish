@@ -289,6 +289,14 @@ See Figure~\ref{fig:service-callbacks} for information on these callbacks.
 \caption{Service callbacks. \label{fig:service-callbacks}}
 \end{figure}
 
+\defineentry{osi\_is\_service}\label{isservice}
+\begin{procedure}
+  \code{(osi\_is\_service)}
+\end{procedure}
+\returns{} a boolean
+
+If Swish is running as a service, then \code{osi\_is\_service} returns true, otherwise false.
+
 \subsection {System Functions and Procedures}
 
 \defineentry{osi\_get\_argv}
@@ -967,6 +975,17 @@ and the port number, e.g. \code{127.0.0.1:80}.
 
 An IPv6 address is shown in bracketed colon-hexadecimal notation
 followed by a colon and the port number, e.g. \code{[::1]:80}.
+
+\defineentry{osi\_tcp\_nodelay}
+\begin{function}
+  \code{ptr osi\_tcp\_nodelay(uptr \var{port}, int \var{enable});}
+\end{function}
+
+The \code{osi\_tcp\_nodelay} function calls \code{uv\_tcp\_nodelay} to
+enable or disable \code{TCP\_NODELAY} for the specified TCP/IP \var{port}
+based on the value of \var{enable}.
+It returns \code{\#t} if successful and \code{\#f} otherwise.
+Enabling \code{TCP\_NODELAY} disables the Nagle algorithm.
 
 \subsection {SQLite Functions}
 

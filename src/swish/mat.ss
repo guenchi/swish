@@ -142,7 +142,7 @@
 
   (define (add-mat name tags test)
     (if (find-mat name)
-        (errorf 'add-mat "mat ~a is already defined." name)
+        (errorf 'add-mat "mat ~a is already defined" name)
         (mats (cons (make-mat name tags test) (mats)))))
 
   (define run-mat
@@ -152,7 +152,7 @@
       (cond
        [(mat? mat/name) (do-run-mat mat/name reporter incl-tags excl-tags)]
        [(find-mat mat/name) => (lambda (mat) (do-run-mat mat reporter incl-tags excl-tags))]
-       [else (errorf 'run-mat "mat ~a is not defined." mat/name)])]))
+       [else (errorf 'run-mat "mat ~a is not defined" mat/name)])]))
 
   (define (skip? mat incl-tags excl-tags)
     (or (and (pair? incl-tags) (not (present (%mat-tags mat) incl-tags)))
@@ -312,23 +312,37 @@
   (define (write-totals pass fail skip)
     (printf "Tests run: ~s   Pass: ~s   Fail: ~s   Skip: ~s\n\n"
       (+ pass fail) pass fail skip))
+  (define (write-result r print-pass?)
+    (case (mat-result-type r)
+      [pass (when print-pass? (print-col "pass" (mat-result-test r) ""))]
+      [fail (print-col "FAIL" (mat-result-test r) (mat-result-message r))]
+      [skip (print-col "SKIP" (mat-result-test r) "")]
+      [else (errorf 'test-progress-reporter "unknown result ~s" r)]))
   (define (progress-reporter progress)
     (case progress
       [(none summary) (values NOP NOP NOP)]
-      [(suite)
-       (values
-        ;; write-header
-        (lambda (test-file)
-          (printf "~39a " test-file))
-        ;; write-result
-        NOP
-        ;; write-tally
-        (lambda (pass fail skip)
-          (cond
-           [(= pass fail skip 0) (printf "no tests\n")]
-           [(> fail 0) (printf "fail\n")]
-           [(> pass 0) (printf "pass~[~:;     (skipped ~s)~]\n" skip skip)]
-           [else (printf "skipped\n")])))]
+      [(suite suite-verbose)
+       (let ([op (and (eq? progress 'suite-verbose) (open-output-string))])
+         (values
+          ;; write-header
+          (lambda (test-file)
+            (printf "~39a " test-file))
+          ;; write-result
+          (if (eq? progress 'suite)
+              NOP
+              (lambda (r)
+                (parameterize ([current-output-port op])
+                  (write-result r #f))))
+          ;; write-tally
+          (lambda (pass fail skip)
+            (cond
+             [(= pass fail skip 0) (printf "no tests\n")]
+             [(> fail 0) (printf "fail\n")]
+             [(> pass 0) (printf "pass~[~:;     (skipped ~s)~]\n" skip skip)]
+             [else (printf "skipped\n")])
+            (cond
+             [(and op (get-output-string op)) => display-string])
+            (flush-output-port))))]
       [(test)
        (values
         ;; write-header
@@ -339,11 +353,7 @@
           (sep))
         ;; write-result
         (lambda (r)
-          (case (mat-result-type r)
-            [pass (print-col "pass" (mat-result-test r) "")]
-            [fail (print-col "FAIL" (mat-result-test r) (mat-result-message r))]
-            [skip (print-col "SKIP" (mat-result-test r) "")]
-            [else (errorf 'test-progress-reporter "unknown result ~s" r)])
+          (write-result r #t)
           (flush-output-port))
         ;; write-tally
         (lambda (pass fail skip)
@@ -377,15 +387,16 @@
     (define meta-data (json:make-object))
     (define obj (make-mat-data filename meta-data '()))
     (let ([ip (open-file-to-read filename)])
-      (let rd ()
-        (let ([r (json:read ip)])
-          (unless (eof-object? r)
-            (match (json:ref r '_type_ #f)
-              ["mat-result"
-               (json:update! obj 'results (lambda (old) (cons r old)) #f)]
-              ["meta-kv"
-               (json:set! meta-data (string->symbol (meta-kv-key r)) (meta-kv-value r))])
-            (rd)))))
+      (on-exit (close-port ip)
+        (let rd ()
+          (let ([r (json:read ip)])
+            (unless (eof-object? r)
+              (match (json:ref r '_type_ #f)
+                ["mat-result"
+                 (json:update! obj 'results (lambda (old) (cons r old)) #f)]
+                ["meta-kv"
+                 (json:set! meta-data (string->symbol (meta-kv-key r)) (meta-kv-value r))])
+              (rd))))))
     (json:set! obj 'results (reverse (json:ref obj 'results '())))
     obj)
 

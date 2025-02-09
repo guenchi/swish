@@ -30,6 +30,7 @@
    find-clause
    find-source
    get-clause
+   not-reached
    pretty-syntax-violation
    profile-me
    profile-me-as
@@ -64,7 +65,15 @@
   (define-syntax (profile-omit x)
     (syntax-case x ()
       [(kwd expr ...)
-       (datum->syntax #'kwd `(begin ,@(syntax->datum #'(expr ...))))]))
+       (if (compile-profile)
+           (datum->syntax #'kwd `(begin ,@(syntax->datum #'(expr ...))))
+           #`(begin expr ...))]))
+
+  (define-syntax (not-reached x)
+    (with-syntax ([not-reached (syntax-case x () [(k) #'k] [_ x])])
+      #`(profile-omit
+         (let ([not-reached #f])
+           (assert not-reached)))))
 
   (define (find-source x)
     (let ([annotation (syntax->annotation x)])
@@ -172,7 +181,7 @@
 
   (define-syntax windows?
     (meta-cond
-     [(memq (machine-type) '(i3nt ti3nt a6nt ta6nt))
+     [(eqv? (directory-separator) #\\)
       (identifier-syntax #t)]
      [else
       (identifier-syntax #f)]))

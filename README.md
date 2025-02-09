@@ -24,18 +24,6 @@ is not thread safe and should be used from the main thread only.
 Swish follows the [semantic versioning](http://semver.org/)
 scheme, starting with 2.0.0 to avoid confusion with internal projects.
 
-Odd minor-version numbers are used for development. As such,
-we are extremely unlikely to use a patch number other than 0 during
-development.
-
-Even minor-version numbers are used for official tagged
-releases.
-
-The first commit after an official tagged release should increment
-either the minor-version or patch-version number so that the version
-number for an official tagged release corresponds to a unique commit
-hash.
-
 # Notes
 
 1. install the prerequisites (see Build System Requirements)
@@ -63,9 +51,9 @@ hash.
 
 ## Linux
 
-- Chez Scheme 9.5.6, 9.5.8, or 9.5.9
+- Chez Scheme 9.6.4 or later
 - GCC, the GNU Compiler Collection
-- GNU make
+- GNU make 4.4 or later
 - GNU C++ compiler for libuv
 - cmake for libuv
 - libsystemd-dev and uuid-dev packages
@@ -73,17 +61,17 @@ hash.
 
 ## Mac
 
-- Chez Scheme 9.5.6, 9.5.8, or 9.5.9
-- ginstall and realpath (can be installed through homebrew using `brew install coreutils`)
-- cmake for libuv (can be installed through homebrew using `brew install cmake`)
+- Chez Scheme 9.6.4 or later
+- coreutils (install via [Homebrew](https://brew.sh): `brew install coreutils`)
+- cmake for libuv (install via [Homebrew](https://brew.sh): `brew install cmake`)
 - XCode Command Line Tools
-- dot (can be installed through homebrew using `brew install graphviz`)
-- pdflatex (can be installed through homebrew using `brew cask install mactex`)
+- dot (install via [Homebrew](https://brew.sh): `brew install graphviz`)
+- pdflatex (install via [Homebrew](https://brew.sh): `brew cask install mactex`)
 - Latin Modern fonts from LaTeX (can be installed with Font Book from a location like `/usr/local/texlive/2020/texmf-dist/fonts/opentype/public/lm`)
 
 ## Windows
 
-- Chez Scheme 9.5.6, 9.5.8, or 9.5.9
+- Chez Scheme 9.6.4 or later
 - Cygwin or MinGW/MSYS with bash, git, graphviz, grep, perl, texlive,
   GNU make, etc.
 - cmake for libuv (https://cmake.org/)
@@ -116,10 +104,11 @@ boot file.
 
 On Windows, your install should include the application's executable
 and boot file, `osi.dll`, `uv.dll`, `sqlite3.dll`, Chez Scheme's
-`csv956.dll` or `csv958.dll`, and Microsoft's C Runtime Library
+`csv964.dll` or the `csv*.dll` for the version you are using, and Microsoft's C Runtime Library
 `vcruntime140.dll`.
 
-Developers writing stand-alone applications should clone the Swish
-repository and run `configure`.  Swish's source repository provides
-`swish.h` to define callable exports for `osi.dll`. `Mf-config` can be
-used in makefiles to define variables for system-specific paths.
+You can define most applications entirely in Scheme, using the Swish libraries.
+If you need to integrate C code that relies on Swish exports, clone the Swish
+repository and run `configure`. This generates a `src/swish/Mf-config` that your
+makefile can `include` to define variables for system-specific paths.
+Swish's source repository provides `swish.h` to define callable exports for `osi.dll`.

@@ -14,6 +14,7 @@
 /osi.obj
 /run.o
 /run.obj
+/scheme_aux.h
 /script-testing.so
 /sh-config
 /sha1.o
@@ -32,6 +33,7 @@
 /sqlite3.obj
 /swish-revision.include
 /swish-version.include
+/swish-version.mk
 /swish_kernel.o
 /test-request.dll
 /test-request.dylib
@@ -41,4 +43,5 @@
 /test-request.obj
 /test-request.pdb
 /test-request.so
+/unsafe.ss.dep
 /vc140.pdb

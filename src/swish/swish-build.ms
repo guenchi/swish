@@ -26,6 +26,8 @@
  (swish testing)
  )
 
+(set-scheme-exe "src/swish/sh-config")
+
 (define swish-build
   (get-real-path (path-combine (prereq-path) "swish-build")))
 
@@ -87,7 +89,7 @@
   (swish-build-test '("--help")
     '("Usage:"
       seek
-      "write output"
+      "compile to <output>"
       seek
       "source filename"))
   (swish-build-test '("-h" "details")
@@ -103,7 +105,7 @@
 
 (isolate-mat version ()
   (swish-build-test '("--version")
-    '("swish-build Version (?:\\d+\\.){2}\\d+ \\([[:xdigit:]dirty-]+\\)")))
+    '("swish-build Version (?:\\d+\\.){2}\\d+(?:-\\d+)?(?:-dirty)? \\([[:xdigit:]dirty-]+\\)")))
 
 (isolate-mat info ()
   (swish-build-test '("--info")
@@ -158,7 +160,7 @@
             (match-regexps `patterns stderr)])
          ...)]))
   (expect-errors
-   [("swish-build: unexpected eof in fasl file.*")
+   [("swish-build: (unexpected eof in fasl file|malformed fasl-object header).*")
     (swish-build-test `("--library" "-o" "fail" ,empty) '())]
    [("swish-build: expected .*library form, but encountered.*")
     (swish-build-test `("--library" "-o" "fail" ,non-lib) '())]
@@ -177,9 +179,10 @@
    )
   ;; empty program or component is okay; silly, but okay
   (match-let*
-   ([() (swish-build-test `("-c" "-o" "empty" ,empty) '())]
-    [() (swish-build-test `("-o" "empty" ,empty) '())]
-    [() (swish-build-test `("-o" "empty" ,empty "-b" "petite") '())])
+   ([,dest (path-combine (output-dir) "empty")]
+    [() (swish-build-test `("-c" "-o" ,dest ,empty) '())]
+    [() (swish-build-test `("-o" ,dest ,empty) '())]
+    [() (swish-build-test `("-o" ,dest ,empty "-b" "petite") '())])
    'ok)
   )
 
@@ -217,10 +220,27 @@
   (run-fat "fat2" '() '("Hello, World!")))
 
 (isolate-mat fat3 ()
+  (define-environment-parameters SCHEMEHEAPDIRS)
   ;; fat with scheme only
   (write-example "fat3" hello-fat)
   (build-example "fat3" '("-b" "scheme"))
-  (run-fat "fat3" '() '("Hello, World!")))
+  ;; To allow the fat3 binary to find petite.boot, we explicitly set
+  ;; SCHEMEHEAPDIRS. Chez v10.x changes the default heap search path
+  ;; so that it is relative to the executable. As of Chez v10.x, the
+  ;; executables are installed into the lib directory, so we must also
+  ;; include the base executable path.
+  (parameterize ([SCHEMEHEAPDIRS
+                  (let ([base (path-parent scheme-exe)])
+                    (join
+                     (list
+                      base ;; v10.x symlinks .../bin/scheme to .../lib/csv%v/%m/scheme
+                      (path-combine base ".." ".." "boot" "%m")
+                      (path-combine base ".." "lib" "csv%v" "%m")
+                      "")
+                     (meta-cond
+                      [windows? #\;]
+                      [else #\:])))])
+    (run-fat "fat3" '() '("Hello, World!"))))
 
 (isolate-mat fat-ext ()
   ;; fat with petite, where output filename contains an extension
@@ -439,7 +459,7 @@
        (lib-abc)
        (scheme)
        (swish imports))
-      abc                            ; must reference the export
+      abc                               ; must reference the export
       (printf "abc: ~a\n"
         (top-level-value 'abc (environment '(lib-abc))))))
   (build-example "libsvis-fat"
@@ -562,7 +582,7 @@
               [stdout ("A: [1,2,3]")]
               [stderr (,err-msg)]))
      (assert
-      (or (string=? err-msg "rtlibs-swish-fat: library (swish json) is not visible.")
+      (or (string=? err-msg "rtlibs-swish-fat: library (swish dsm) not found.") ;; (swish json) now imports (swish dsm)
           ;; 9.5.3 provides a more precise error message
           (string=? err-msg "rtlibs-swish-fat: attempt to import invisible library (swish json).")))
      'ok])
@@ -723,11 +743,14 @@
   (run-fat "hook-exit" '() expected-output))
 
 (isolate-mat application-shutdown ()
-  (define event "Event: #\\(<child-end> [0-9]+ #<process [0-9]+:[0-9]+> 1 (normal|shutdown)")
-  (define expected-output
-    `(seek "Date:" "Timestamp:" ,event
-       seek "Date:" "Timestamp:" ,event
-       seek "Date:" "Timestamp:" ,event))
+  (define (exit-status err)
+    (match err
+      [`(catch `(<os-process-failed> [stdout ()] [stderr ()] ,exit-status))
+       exit-status]
+      [,_
+       ;; Expect no stdout or stderr. If we get here, we've violated
+       ;; that assumption.
+       (raise err)]))
   (define app-shutdown
     (write-test-file "app-shutdown.ss"
       (lambda ()
@@ -747,41 +770,27 @@
                  (app:shutdown 42)
                  (receive))]))))))
   (set-file-mode app-shutdown #o755)
-  ;; run as /usr/bin/env script
-  (run-bash "app-shutdown.ss" '("normal") expected-output)
-  (match (catch (run-bash "app-shutdown.ss" '("abnormal") '()))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 2]))
-     (match-regexps expected-output stderr)])
-  (match (catch (run-bash "app-shutdown.ss" '("specific") '()))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 42]))
-     (match-regexps expected-output stderr)])
-  ;; run as swish script
-  (run-script app-shutdown '("normal") expected-output)
-  (match (catch (run-script app-shutdown '("abnormal") expected-output))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 2]))
-     (match-regexps expected-output stderr)])
-  (match (catch (run-script app-shutdown '("specific") expected-output))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 42]))
-     (match-regexps expected-output stderr)])
-  ;; run as thin app
-  (build-example "app-shutdown" '())
-  (run-thin "app-shutdown" '("normal") expected-output)
-  (match (catch (run-thin "app-shutdown" '("abnormal") '()))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 2]))
-     (match-regexps expected-output stderr)])
-  (match (catch (run-thin "app-shutdown" '("specific") '()))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 42]))
-     (match-regexps expected-output stderr)])
-  (assert (delete-file (output-file "app-shutdown")))
-  ;; run as fat app
-  (build-example "app-shutdown" '("--rtlib" "swish" "-b" "petite"))
-  (run-fat "app-shutdown" '("normal") expected-output)
-  (match (catch (run-fat "app-shutdown" '("abnormal") '()))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 2]))
-     (match-regexps expected-output stderr)])
-  (match (catch (run-fat "app-shutdown" '("specific") '()))
-    [#(EXIT `(<os-process-failed> ,stderr [exit-status 42]))
-     (match-regexps expected-output stderr)]))
+  (match-let*
+   (;; run as /usr/bin/env script
+    [() (run-bash "app-shutdown.ss" '("normal") '())]
+    [2 (exit-status (try (run-bash "app-shutdown.ss" '("abnormal") '())))]
+    [42 (exit-status (try (run-bash "app-shutdown.ss" '("specific") '())))]
+    ;; run as swish script
+    [() (run-script app-shutdown '("normal") '())]
+    [2 (exit-status (try (run-script app-shutdown '("abnormal") '())))]
+    [42 (exit-status (try (run-script app-shutdown '("specific") '())))]
+    ;; run as thin app
+    [() (build-example "app-shutdown" '())]
+    [() (run-thin "app-shutdown" '("normal") '())]
+    [2 (exit-status (try (run-thin "app-shutdown" '("abnormal") '())))]
+    [42 (exit-status (try (run-thin "app-shutdown" '("specific") '())))]
+    [,_ (assert (delete-file (output-file "app-shutdown")))]
+    ;; run as fat app
+    [() (build-example "app-shutdown" '("--rtlib" "swish" "-b" "petite"))]
+    [() (run-fat "app-shutdown" '("normal") '())]
+    [2 (exit-status (try (run-fat "app-shutdown" '("abnormal") '())))]
+    [42 (exit-status (try (run-fat "app-shutdown" '("specific") '())))])
+   'ok))
 
 (isolate-mat compile-library ()
   (define source (input-file "clib"))
@@ -913,9 +922,9 @@
               [stdout ,@common-prefix]
               [stderr (,err-msg)]))
      (assert
-       (or (string=? err-msg "prog1: variable say is not bound.")
-           ;; 9.5.3 change in library-manager error messages
-           (string=? err-msg "prog1: attempt to invoke invisible library (lib1).")))
+      (or (string=? err-msg "prog1: variable say is not bound.")
+          ;; 9.5.3 change in library-manager error messages
+          (string=? err-msg "prog1: attempt to invoke invisible library (lib1).")))
      'ok])
 
   ;; table not duplicated when prog2 is loaded and say is visible
@@ -1107,6 +1116,37 @@
               [stderr ("broken-echo: 17 is not a pair.")]))
      'ok])
   )
+
+(isolate-mat claim-exceptions-stderr-closed ()
+  (define default-application-exit-code 2) ;; see app-core.ss
+  (define doomed-writer
+    (write-example "doomed-writer"
+      ;; keep trying to write, but parent closed ports; default exception
+      ;; handler should exit instead of repeatedly trying to write to stderr
+      `((do () (#f)
+          (receive (after 1 (write-char #\x)))
+          (flush-output-port)))))
+  (define (hangup-on-process command args)
+    (let-values ([(to-stdin from-stdout from-stderr os-pid)
+                  (spawn-os-process command args self)])
+      (close-port from-stderr)
+      (close-port from-stdout)
+      ;; typically takes < 150 ms real time, so allow 10x that and then
+      ;; scale for slow macOS build agents
+      (receive (after (scale-timeout 1500) (osi_kill* os-pid SIGKILL) (throw 'ran-too-long))
+        [#(process-terminated ,@os-pid ,exit-status ,signal)
+         (assert (= signal 0))
+         (assert (= exit-status default-application-exit-code))])))
+  ;; run as swish script
+  (hangup-on-process swish-exe `(,doomed-writer))
+  ;; run as thin app
+  (build-example "doomed-writer" '())
+  (hangup-on-process swish-exe `(,(output-file "doomed-writer")))
+  ;; run as fat app
+  (assert (delete-file (output-file "doomed-writer")))
+  (build-example "doomed-writer" '("-b" "petite"))
+  (ensure-dlls)
+  (hangup-on-process (output-file "doomed-writer") '()))
 
 (isolate-mat hash-bang ()
   ;; run one source example three different ways
@@ -1519,6 +1559,12 @@
         (for-each pretty-print
           `((include "here.ss")
             (pretty-print x))))))
+  (define file3
+    (write-test-file "another/nested/path/main.ss"
+      (lambda ()
+        (for-each pretty-print
+          `((include "here.ss")
+            (pretty-print (+ 4 (* x 10))))))))
   ;; fails to build if source directories not specified
   (match (catch (build-example "test-sd" '()))
     [#(EXIT
@@ -1527,7 +1573,17 @@
           ("swish-build: failed for here.ss: no such file or directory.")]))
      'ok])
   (build-example "test-sd" `("-s" ,(path-parent file1)))
-  (run-thin "test-sd" '() '("123")))
+  (run-thin "test-sd" '() '("123"))
+  ;; we should also be able to find the source-file itself via -s
+  ;; source-directories use swish-build-test directly to avoid the path-combine
+  (swish-build-test
+   `("-o" ,(output-file "test-sd2")
+     "-s" ,(path-parent file3)
+     "-s" ,(path-parent file1)
+     ,(path-last file3))
+   '())
+  (run-thin "test-sd2" '() '("1234"))
+  )
 
 (isolate-mat source-file-switch ()
   (define lib1
@@ -1625,3 +1681,94 @@
   (delete-file prog.so)
   (swish-build-test `(,prog.ss "-o" ,prog.so "-b" "petite") '())
   (assert (file-exists? prog.so)))
+
+(isolate-mat prelude ()
+  (define-syntax expect-error
+    (syntax-rules (stdout stderr)
+      [(_ expr (stdout stdout-pattern ...) (stderr stderr-pattern ...))
+       (match (try expr)
+         [`(catch `(<os-process-failed> ,stdout ,stderr))
+          (match-regexps `(,stdout-pattern ...) stdout)
+          (match-regexps `(,stderr-pattern ...) stderr)])]))
+  (define (so-file fn) (string-append (path-root fn) ".so"))
+  (define setup.ss
+    (write-example (path-combine "try-prelude-source" "setup")
+      '((printf "loaded setup.ss\n"))))
+  (define lib.ss
+    (write-example (path-combine "try-prelude-lib" "lib")
+      '((library (lib) (export x) (import (scheme)) (define x 123)))))
+  (define src.ss
+    (write-example "src"
+      '((let-syntax ([foo (lambda (x) (pretty-print (length (library-directories))) #'#f)]) foo)
+        (import (lib))
+        (printf "x = ~s\n" x))))
+  (define prog (path-combine (path-parent src.ss) (fix-exe "prog")))
+  (define (cleanup)
+    (for-each delete-file
+      (map so-file (list setup.ss lib.ss src.ss))))
+
+  ;; multiple explicit --prelude command-line arguments, some with multiple
+  ;; <prelude> arguments (segmented artificially here to show that we
+  ;; concatenate them before parsing the prelude expressions).
+  (cleanup)
+  (swish-build-test
+   `(,src.ss "-L" ,(path-parent lib.ss)
+     "--prelude" "(library-e" "xtens" "ions '((\".ss\" . \".so\")))"
+     "--prelude" "(import-notify #t)" "-o" ,prog)
+   '("3" ;; length of library-directories, since we add "try-prelude-lib"
+     seek "import: found source file.*try-prelude-lib.*lib[.]ss"
+     seek "import: compiling.*try-prelude-lib.*lib[.]ss.* to .*lib[.]so"))
+  (run-thin "prog" '() '("x = 123"))
+
+  ;; like the previous test, except a --prelude expression sets
+  ;; library-directories and this supercedes the -L command-line argument,
+  ;; so we don't find the library
+  (cleanup)
+  (expect-error
+   (swish-build-test `(,src.ss "-L" ,(path-parent lib.ss)
+                       "--prelude" "(library-extensions '((\".ss\" . \".so\")))"
+                       "(library-directories \".\")"
+                       "--prelude" "(import-notify #t)" "-o" "failed") '())
+   (stdout "1"
+     "import: did not find source file.*lib[.]ss"
+     "import: did not find object file.*lib[.]so")
+   (stderr "swish-build: library [(]lib[)] not found[.]"))
+
+  ;; --prelude-file located via -s source directories
+  ;; --prelude-file content evaluated after --prelude
+  ;; show that prelude works when compiling a component (-c)
+  (cleanup)
+  (swish-build-test
+   `(,src.ss "-c"
+     "-s" ,(path-parent setup.ss)
+     "-L" ,(path-parent lib.ss)
+     "--prelude-file" "setup.ss"
+     "--prelude" "(library-extensions '((\".ss\" . \".so\")))" "(pretty-print 'one)"
+     "--prelude" "(pretty-print 'two)" "(import-notify #t)" "-o" ,prog)
+   '("one" "two" "loaded setup.ss"
+     "3" ;; length of library-directories, since we add "try-prelude-lib"
+     seek "import: found source file.*try-prelude-lib.*lib[.]ss"
+     seek "import: compiling.*try-prelude-lib.*lib[.]ss.* to .*lib[.]so"))
+
+  ;; --prelude-file located via explicit path
+  ;; all prelude expressions evaluated before we start to compile and hit syntax error
+  (cleanup)
+  (expect-error
+   (swish-build-test
+    `(,(write-example "incomplete" '((define)))
+      "--prelude" "(pretty-print 'one)"
+      "--prelude-file" ,setup.ss
+      "--prelude" "(pretty-print 'two)" "-o" "failed") '())
+   (stdout "one" "two" "loaded setup.ss")
+   (stderr "swish-build: invalid syntax [(]define[)]"))
+
+  ;; we try to provide useful source error
+  (cleanup)
+  (expect-error
+   (swish-build-test
+    `(,src.ss
+      "--prelude" "(pretty-print 'one) (define)"
+      "-o" "failed") '())
+   (stdout) ;; error occurrs while expanding (begin (pretty-print 'one) (define)), so no output
+   (stderr "swish-build: invalid syntax [(]define[)] at char 20 of --prelude"))
+  )

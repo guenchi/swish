@@ -98,7 +98,7 @@ up. Timeouts during initialization should be considered carefully.
 
 \code{gen-server:start\&link} spawns the server process, links to
 the calling process, registers the server process as \var{name}, and calls
-\code{(init \var{arg} ...)} within that process. To ensure a
+\code{(init \var{arg} \etc)} within that process. To ensure a
 synchronized startup procedure, \code{gen-server:start\&link} does
 not return until \code{init} has returned.
 
@@ -138,8 +138,9 @@ process and yield \code{\#(error \#(bad-return-value \var{other}))}.
   \#(error \var{error})\alt{}%
   ignore}
 
-\code{gen-server:start} behaves the same as \code{start\&link}
-except that it does not link to the calling process.
+\code{gen-server:start} behaves the same as
+\code{gen-server:start\&link} except that it does not link to the
+calling process.
 
 \defineentry{gen-server:enter-loop}
 \begin{syntax}
@@ -345,7 +346,7 @@ new \var{reason}, the event contains the new \var{reason}.
   \argrow{reply}{the server's reply or \code{\#f}}
 \end{pubevent}
 
-\section {Callback Interface}
+\section {Callback Interface}\label{sec:gen-server-callback}
 
 A programmer implements the callback interface to define a particular
 server's behavior. All callback functions are called from within the

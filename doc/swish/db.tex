@@ -335,6 +335,18 @@ The \code{db:start\&link} procedure may return an \var{error} of
   \var{error} \var{filename})}, where \var{error} is a SQLite error
 pair.
 
+\defineentry{db:start}
+\begin{procedure}
+  \code{(db:start \var{name} \var{filename} \var{mode} \opt{\var{db-init}})}\\
+  \code{(db:start \var{name} \var{filename} \var{mode} \opt{\var{db-options}})}
+\end{procedure}
+\returns{}
+\code{\#(ok \var{pid})} $|$
+\code{\#(error \var{error})}
+
+\code{db:start} behaves the same as \code{db:start\&link} except that
+it does not link to the calling process.
+
 \defineentry{db:stop}
 \begin{procedure}
   \code{(db:stop \var{who})}
@@ -352,7 +364,7 @@ The \code{db:stop} procedure calls \code{(gen-server:call
 \expandsto{} \antipar\begin{alltt}
 (let ([\var{db} (sqlite:open \var{filename} \var{flags})])
   (on-exit (sqlite:close \var{db})
-    \var{body\(\sb{1}\)} \var{body\(\sb{2}\)} ...))
+    \var{body\(\sb{1}\)} \var{body\(\sb{2}\)} \etc))
 \end{alltt}
 
 The \code{with-db} macro opens the database in \var{filename},

@@ -1,14 +1,26 @@
-.PHONY: all build-dirs clean platform-clean ready reminders submodules
+.PHONY: all build-dirs clean platform-clean ready reminders submodules touch-includes
 
 SETUP := Makefile submodules build-dirs \
          chezscheme-revision.include swish-revision.include swish-version.include
 CORE := ../../${BUILD}/bin/swish${EXESUFFIX} ../../${BUILD}/bin/swish.boot ../../${BUILD}/bin/swish.library
 AUXLIB := ../../${BUILD}/lib/swish/mat.so ../../${BUILD}/lib/swish/profile.so ../../${BUILD}/lib/swish/testing.so ../../${BUILD}/lib/swish/internal-testing.so
 
+SSRC := $(shell git ls-files '*.ss')
+
 export CC CPPFLAGS CFLAGS LD LDFLAGS
 
+# We want to recompile code that includes unsafe.ss if it changes. So generate a
+# make include that touches any file that includes unsafe.ss and update those
+# dependencies if unsafe.ss itself changes. Use a grep pattern that won't match
+# Mf-base itself.
+unsafe.ss.dep: unsafe.ss
+	@git grep -l '[(]include "unsafe.ss"[)]' | tr '\n' ' ' > unsafe.ss.dep
+	@echo -e ': unsafe.ss\n\ttouch -r unsafe.ss $$@' >> unsafe.ss.dep
+
 ready:: | ${SETUP}
-ready:: io-constants.ss ${SwishLibs}
+ready:: io-constants.ss unsafe.ss.dep ${SwishLibs}
+
+-include unsafe.ss.dep
 
 submodules:
 	@if cd ../.. && git submodule status --recursive | grep -q '^[^ ]'; then \
@@ -23,20 +35,32 @@ build-dirs:
 	@mkdir -p ../../${BUILD}/bin
 	@mkdir -p ../../${BUILD}/lib
 
-all: ready ${CORE} ${AUXLIB} ${REMINDERS}
+all: ready ${SYNC} ${CORE} ${AUXLIB} ${REMINDERS}
 
 %.include: %.tmp-include
 	@if cmp --quiet "$@" "$<"; then \
 	  rm "$<"; \
 	else \
-	  mv "$<" "$@"; touch software-info.ss; echo "$@ changed"; \
+	  mv "$<" "$@"; $(MAKE) $@-changed; echo "$@ changed"; \
 	fi
+
+.PHONY: swish-revision.include-changed swish-version.include-changed chezscheme-revision.include-changed
+swish-revision.include-changed:
+	touch software-info.ss
+
+swish-version.include-changed:
+	touch software-info.ss
+
+chezscheme-revision.include-changed:
+	touch $(SSRC)
+	rm -f scheme_aux.h
+	$(MAKE) scheme_aux.h
 
 swish-revision.tmp-include:
 	@git describe --always --match none --abbrev=40 --dirty > "$@"
 
-swish-version.tmp-include: swish.h
-	@sed -n 's/^#define SWISH_VERSION "\([0-9a-z."]*\)"/\1/p' swish.h > "$@"
+swish-version.tmp-include:
+	@git describe --tags --dirty | sed -E 's/^v//; s/-g[0-9a-f]+//' > "$@"
 
 chezscheme-revision.tmp-include:
 	@if [ ! -f "${SCHEME_REVISION_PATH}/revision" ]; then \
@@ -44,6 +68,14 @@ chezscheme-revision.tmp-include:
 	else \
 	  cat "${SCHEME_REVISION_PATH}/revision" > "$@" ; \
 	fi
+
+${OsiObj}: ${SQLITE_SRCPATH}/sqlite3.h swish.h sha.h sha-private.h scheme_aux.h
+
+sqlite.c: scheme_aux.h
+
+scheme_aux.h:
+	@sed -n 's/^EXPORT \([^S].*\) Sinteger64_value.*/typedef \1 Sint64_t;/p' < "${SCHEME_REVISION_PATH}/scheme.h" > scheme_aux.h
+	@sed -n 's/EXPORT.*Stry_integer64_value.*/#define HAS_TRY_INT64_VALUE/p' < "${SCHEME_REVISION_PATH}/scheme.h" >> scheme_aux.h
 
 io-constants.ss: io-constants${EXESUFFIX}
 	./$< > $@
@@ -57,12 +89,12 @@ compile.ss: ${SwishLibs} | ${SETUP}
 	'(make-boot-file "../${BUILD}/bin/swish.boot" (quote ("scheme" "petite")) "../${BUILD}/bin/swish-core.library" "../${BUILD}/bin/swish.library" "swish/boot.ss")' \
 	| "${SCHEME}" -q compile.ss
 
-../../${BUILD}/bin/swish-core.library: *.ss io-constants.ss compile.ss
+../../${BUILD}/bin/swish-core.library: $(SSRC) io-constants.ss compile.ss
 	@echo \
 	'(wpo-make-library "../${BUILD}/lib" "swish/app-core.ss" "../${BUILD}/bin/swish-core.library")' \
 	| "${SCHEME}" -q compile.ss
 
-../../${BUILD}/bin/swish.library: *.ss compile.ss ../../${BUILD}/bin/swish-core.library
+../../${BUILD}/bin/swish.library: $(SSRC) compile.ss ../../${BUILD}/bin/swish-core.library
 	@echo \
 	'(exclude-from-wpo "../${BUILD}/bin/swish-core.library")' \
 	'(wpo-make-library "../${BUILD}/lib" "swish/imports.ss" "../${BUILD}/bin/swish.library")' \
@@ -87,60 +119,86 @@ clean: platform-clean
 	rm -f ../../${BUILD}/lib/swish/*.wpo
 	rm -f ${SwishLibs}
 	rm -f ${SHLIBTEST}
+	rm -f ${TESTREQUEST}
+	rm -f scheme_aux.h
 	rm -f chezscheme-revision.include
 	rm -f swish-revision.include
-	rm -f swish-version.include
+	rm -f swish-version.include swish-version.mk
 	rm -f io-constants.ss io-constants${EXESUFFIX}
 	rm -f ../*.ss.html ../mat-report.html ../server-profile.html
 	rm -f *.mo *.ms.html *.ss.html
 
-.PHONY: install install-bin install-check install-doc
-INSTLIBDIR := ${INSTALLROOT}/lib/swish${SWISH_VERSION}/${MACHINE_TYPE}
+.PHONY: install install-batteries install-bin install-check install-doc
+
+swish-version.mk: swish-version.include
+	sed 's/^/SWISH_VERSION:=/' < $< > $@
+
+-include swish-version.mk
+
+install-check: swish-version.mk
+ifeq (,${SWISH_VERSION})
+	$(error SWISH_VERSION is not set)
+endif
+ifeq (,${INSTALLROOT})
+	$(error INSTALLROOT is not set)
+endif
+
+INSTLIBDIR := ${INSTALLROOT}/lib/swish${SWISH_VERSION}/${ARCH_DEST}
 INSTWEBDIR := ${INSTALLROOT}/lib/swish${SWISH_VERSION}/web
 INSTDOCDIR := ${INSTALLROOT}/share/doc/swish${SWISH_VERSION}
 
 install: ready install-doc install-bin
 
-install-check:
-ifeq (,${INSTALLROOT})
-	$(error INSTALLROOT is not set)
+install-doc: install-check
+	${GNU_INSTALL} --directory "${INSTDOCDIR}"
+	${GNU_INSTALL} --mode=444 ../../LICENSE "${INSTDOCDIR}"
+	${GNU_INSTALL} --mode=444 ../../NOTICE.org "${INSTDOCDIR}"
+	${GNU_INSTALL} --mode=444 ../../doc/swish.pdf "${INSTDOCDIR}"
+	cd ../../; git ls-files -z examples | xargs -0 -I{} ${GNU_INSTALL} --mode=444 -D -T "{}" "${INSTDOCDIR}/{}"
+	${GNU_INSTALL} --mode=444 swish-revision.include ${INSTDOCDIR}/examples/git.revision
+
+install-batteries: install-check
+	${GNU_INSTALL} --directory "${INSTLIBDIR}"
+	${GNU_INSTALL} --mode=444 "${SCHEMEBOOT}"/petite.boot "${INSTLIBDIR}"
+	${GNU_INSTALL} --mode=444 "${SCHEMEBOOT}"/scheme.boot "${INSTLIBDIR}"
+	${GNU_INSTALL} --mode=444 "${SCHEMEBOOT}"/scheme.h "${INSTLIBDIR}"
+ifneq ($(SCHEMEDLL),)
+	${GNU_INSTALL} --mode=555 "${SCHEMEDLL}" "${INSTLIBDIR}"
 endif
 
-install-doc: install-check
-	${GNU_INSTALL} --directory ${INSTDOCDIR}
-	${GNU_INSTALL} ../../LICENSE ${INSTDOCDIR}
-	${GNU_INSTALL} ../../NOTICE ${INSTDOCDIR}
-	${GNU_INSTALL} ../../doc/swish.pdf ${INSTDOCDIR}
-
 install-bin: install-check all
-	${GNU_INSTALL} --directory ${INSTLIBDIR}
-	${GNU_INSTALL} ../../${BUILD}/bin/swish${EXESUFFIX} ${INSTLIBDIR}
-	${GNU_INSTALL} swish-build ${INSTLIBDIR}
-	${GNU_INSTALL} swish-test ${INSTLIBDIR}
-	${GNU_INSTALL} ../../${BUILD}/bin/swish.boot ${INSTLIBDIR}
-	${GNU_INSTALL} ../../${BUILD}/bin/swish.library ${INSTLIBDIR}
-	${GNU_INSTALL} ../../${BUILD}/bin/swish-core.library ${INSTLIBDIR}
-	${GNU_INSTALL} ${SwishLibs} ${INSTLIBDIR}
-	${GNU_INSTALL} --directory ${INSTALLROOT}/bin
-	ln -sf ${INSTLIBDIR}/swish${EXESUFFIX} ${INSTALLROOT}/bin/swish
-	ln -sf ${INSTLIBDIR}/swish-build ${INSTALLROOT}/bin/swish-build
-	ln -sf ${INSTLIBDIR}/swish-test ${INSTALLROOT}/bin/swish-test
-	${GNU_INSTALL} --directory ${INSTLIBDIR}/lib
-	cd ../../${BUILD}/lib ; find . -type f -name '*.wpo' -a -not -iname 'internal*' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/wpo/{} \;
-	cd ../../${BUILD}/lib ; find . -type f -name '*.so' -a -not -iname 'internal*' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/lib/{} \;
-	${GNU_INSTALL} ../../${BUILD}/lib/swish/mat.so ${INSTLIBDIR}/lib/swish
-	${GNU_INSTALL} ../../${BUILD}/lib/swish/profile.so ${INSTLIBDIR}/lib/swish
-	${GNU_INSTALL} ../../${BUILD}/lib/swish/testing.so ${INSTLIBDIR}/lib/swish
-	${GNU_INSTALL} --directory ${INSTWEBDIR}
-	cd ../../web ; find . -type f -exec ${GNU_INSTALL} -D -T {} ${INSTWEBDIR}/{} \;
+	${GNU_INSTALL} --directory "${INSTLIBDIR}"
+	${GNU_INSTALL} ../../${BUILD}/bin/swish${EXESUFFIX} "${INSTLIBDIR}"
+	${GNU_INSTALL} swish-build "${INSTLIBDIR}"
+	${GNU_INSTALL} swish-test "${INSTLIBDIR}"
+	${GNU_INSTALL} --mode=444 ../../${BUILD}/bin/swish.boot "${INSTLIBDIR}"
+	${GNU_INSTALL} --mode=444 ../../${BUILD}/bin/swish.library "${INSTLIBDIR}"
+	${GNU_INSTALL} --mode=444 ../../${BUILD}/bin/swish-core.library "${INSTLIBDIR}"
+ifeq ($(MACHINE_TYPE:nt=), ${MACHINE_TYPE}) # if not Windows
+	${GNU_INSTALL} --mode=444 ${SwishLibs} "${INSTLIBDIR}"
+else
+	${GNU_INSTALL} --mode=555 ${SwishLibs} "${INSTLIBDIR}"
+endif
+	${GNU_INSTALL} --directory "${INSTALLROOT}"/bin
+	${GNU_LN} -srf "${INSTLIBDIR}"/swish${EXESUFFIX} "${INSTALLROOT}"/bin/swish
+	${GNU_LN} -srf "${INSTLIBDIR}"/swish-build "${INSTALLROOT}"/bin/swish-build
+	${GNU_LN} -srf "${INSTLIBDIR}"/swish-test "${INSTALLROOT}"/bin/swish-test
+	${GNU_INSTALL} --directory "${INSTLIBDIR}"/lib
+	cd ../../${BUILD}/lib ; find . -type f -name '*.wpo' -a -not -iname 'internal*' -exec ${GNU_INSTALL} --mode=444 -D -T {} "${INSTLIBDIR}"/wpo/{} \;
+	cd ../../${BUILD}/lib ; find . -type f -name '*.so' -a -not -iname 'internal*' -exec ${GNU_INSTALL} --mode=444 -D -T {} "${INSTLIBDIR}"/lib/{} \;
+	${GNU_INSTALL} --mode=444 ../../${BUILD}/lib/swish/mat.so "${INSTLIBDIR}"/lib/swish
+	${GNU_INSTALL} --mode=444 ../../${BUILD}/lib/swish/profile.so "${INSTLIBDIR}"/lib/swish
+	${GNU_INSTALL} --mode=444 ../../${BUILD}/lib/swish/testing.so "${INSTLIBDIR}"/lib/swish
+	${GNU_INSTALL} --directory "${INSTWEBDIR}"
+	cd ../../web ; git ls-files | xargs -I {} ${GNU_INSTALL} --mode=444 -D -T {} "${INSTWEBDIR}"/{}
 
 install-internal: install-check all
-	cd ../../${BUILD}/lib ; find . -type f -name 'internal*.so' -exec ${GNU_INSTALL} -D -T {} ${INSTLIBDIR}/lib/{} \;
+	cd ../../${BUILD}/lib ; find . -type f -name 'internal*.so' -exec ${GNU_INSTALL} --mode=444 -D -T {} "${INSTLIBDIR}"/lib/{} \;
 
 .PHONY: mat-prereq
 mat-prereq:: | ${SETUP}
-mat-prereq:: ${SHLIBTEST} ${TESTREQUEST}
+mat-prereq:: ${SHLIBTEST} ${TESTREQUEST} scheme_aux.h
 	@printf "making mat-prereq ... "
 	@rm -rf ../../build/mat-prereq
-	@$(MAKE) install-bin install-internal INSTALLROOT="$$(${NORMALIZE_PATH} ../../build/mat-prereq)" SWISH_VERSION=".x.y.z" MACHINE_TYPE="arch" > /dev/null
+	@$(MAKE) install-batteries install-bin install-internal INSTALLROOT="$$(${NORMALIZE_PATH} ../../build/mat-prereq)" SWISH_VERSION=".x.y.z" ARCH_DEST="arch" > /dev/null
 	@printf "done.\n"

@@ -29,6 +29,8 @@
  (swish testing)
  )
 
+(set-scheme-exe "src/swish/sh-config")
+
 (parameterize ([library-extensions '((".ss" . ".so"))])
   (eval '(import (swish internal-testing))))
 
@@ -63,6 +65,7 @@
          ((eval enumerate-libs-expr)
           '((chezscheme)
             (swish app-core)
+            (swish compat)
             (swish erlang)
             (swish errors)
             (swish internal)
@@ -427,14 +430,19 @@
         '((log-file ":memory:")
           (app:start)
           ;; simulate winning race to exit-process with an earlier app:shutdown
-          (#%$set-top-level-value! '$console-input-port 'bogus)
-          (app:shutdown 1)
-          (receive (after 100 (osi_exit 3)))))
+          ;; (all within one expression since we can't read after closing stdin)
+          (let ([p (#%$top-level-value '$console-input-port)])
+            (#%$set-top-level-value! '$console-input-port #f)
+            ;; close port so leak checker is happy
+            (close-port p)
+            ;; poison the value so exit-process has to be careful
+            (#%$set-top-level-value! '$console-input-port 'bogus)
+            (app:shutdown 1)
+            (receive (after 100 (osi_exit 3))))))
       '("expected non-zero exit")))
-   [#(EXIT `(<os-process-failed> [exit-status 1] ,stdout ,stderr))
-    (match-regexps '("ok") stdout)
-    (match-regexps
-     '(seek #0="Event: #\\(<child-end> .*\\)" seek #0# seek #0# "") stderr)]
+   [#(EXIT `(<os-process-failed> [exit-status 1] ,stdout [stderr ()]))
+    (match (match-regexps '("ok") stdout)
+      [() 'no-extraneous-output])]
    [#(EXIT `(<os-process-failed> [exit-status 3] ,stderr))
     (printf "~{~a\n~}" stderr)
     (throw 'matched-wrong-case)]))
@@ -447,21 +455,15 @@
     (write-test-file "script"
       (lambda ()
         (printf "~{~s\n~}\n"
-        '((log-file ":memory:")
-          (app:start)
-          (cdr 7))))))
+          '((log-file ":memory:")
+            (app:start)
+            (cdr 7))))))
   (match (catch (script-test script '() "" '("expected non-zero exit")))
-   [#(EXIT `(<os-process-failed> ,stdout ,stderr))
-    (match-regexps '() stdout)
-    (match-regexps
-     '("^script: 7 is not a pair[.]$"
-       ""
-       "^Date: "
-       "^Timestamp: "
-       #0="Event: #\\(<child-end> .*\\)"
-       seek #0#
-       seek #0# "")
-     stderr)]))
+    [#(EXIT `(<os-process-failed> ,stdout ,stderr))
+     (match (match-regexps '() stdout)
+       [() 'no-extraneous-output])
+     (match (match-regexps '("^script: 7 is not a pair[.]$") stderr)
+       [() 'no-extraneous-output])]))
 
 (isolate-mat application-shutdown4 ()
   ;; Test for regression where application doesn't shut down when we
@@ -477,19 +479,13 @@
           (spawn&link (lambda () (raise 'issue)))))
       '("expected non-zero exit")))
    [#(EXIT `(<os-process-failed> [exit-status 2] ,stdout ,stderr))
-    (match-regexps '("ok") stdout)
-    (match-regexps
-     '("^Exception: issue[.]$"
-       ""
-       "^Date: "
-       "^Timestamp: "
-       #0="Event: #\\(<child-end> .*\\)"
-       seek #0#
-       seek #0# "")
-     stderr)]))
+    (match (match-regexps '("ok") stdout)
+      [() 'no-extraneous-output])
+    (match (match-regexps '("^Exception: issue[.]$") stderr)
+      [() 'no-extraneous-output])]))
 
 (meta-cond
- [(memq (machine-type) '(i3nt ti3nt a6nt ta6nt))
+ [windows?
   ;; test manually on Windows
   (void)]
  [else
@@ -536,22 +532,11 @@
            (receive (after 1500 'fail)
              [#(process-terminated ,@os-pid ,@expected-exit-code ,@expected-signal)
               'ok])])
-         (match-regexps
-          '(seek
-            "Date: "
-            "Timestamp: "
-            "Event: #\\(<child-end>.*normal #f\\)"
-            seek
-            "Date: "
-            "Timestamp: "
-            "Event: #\\(<child-end>.*shutdown #f\\)"
-            seek
-            "Date: "
-            "Timestamp: "
-            "Event: #\\(<child-end>.*shutdown #f\\)")
-          (let f ()
-            (receive (after 0 '())
-              [(,@from-stderr . ,msg) (cons msg (f))])))
+         (match (match-regexps '()
+                  (let f ()
+                    (receive (after 0 '())
+                      [(,@from-stderr . ,msg) (cons msg (f))])))
+           [() 'no-extraneous-output])
          'ok)))
     (test SIGINT)
     (test SIGTERM))])
@@ -757,3 +742,9 @@
     [(,@expected ,@expected ,@prompt)
      (script-test script '() "(exit)" '())])
    'ok))
+
+(mat semver ()
+  ;; from https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
+  (define pat (re "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"))
+  ;; check that we're building at or after a sensible tag
+  (assert (pregexp-match pat (software-version))))

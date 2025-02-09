@@ -87,7 +87,7 @@
 
 (isolate-mat version ()
   (zero-exit (swish-test "--version")
-   '("swish-test Version (?:\\d+\\.){2}\\d+ \\([[:xdigit:]dirty-]+\\)")))
+    '("swish-test Version (?:\\d+\\.){2}\\d+(?:-\\d+)?(?:-dirty)? \\([[:xdigit:]dirty-]+\\)")))
 
 (isolate-mat check-options ()
   (nonzero-exit (swish-test "--progress pilgrim")
@@ -857,7 +857,7 @@
   (define mo-path4 (string-append test-file4 ".mo"))
   (define mo-all-pass (string-append all-pass ".mo"))
   (define (get-data content)
-    (match-let* ([(,_ ,data) (pregexp-match "<script>var data = (.*);</script><script>\n  function escapeHtml" content)])
+    (match-let* ([(,_ ,data) (pregexp-match "<script[^>]*>var data = (.*);</script><script[^>]*>\n  function escapeHtml" content)])
       (json:string->object data)))
   (define (results-of-type t obj)
     (filter (lambda (r) (eq? t (mat-result-type r)))
@@ -1124,6 +1124,27 @@
         "--load-results " aggregate.json)
        expected))
     (let ([expected
+           `(,(string-append (pregexp-quote test-file) ".* fail")
+             " SKIP .*TEST2"
+             " FAIL .*TEST3"
+             ,(string-append (pregexp-quote test-file2) ".* no tests")
+             ,(string-append (pregexp-quote test-file3) ".* fail")
+             " FAIL .*zero"
+             ,(string-append (pregexp-quote "incomplete.ms") ".* no tests")
+             ,@summary-output)])
+      ;; --progress suite-verbose with --harvest
+      (nonzero-exit
+       (swish-test
+        "--harvest " mo-path1 " " mo-path2 " " mo-path3 " " incomplete " "
+        "--progress " "suite-verbose")
+       expected)
+      ;; --progress suite-verbose with --load-results
+      (nonzero-exit
+       (swish-test
+        "--progress " "suite-verbose "
+        "--load-results " aggregate.json)
+       expected))
+    (let ([expected
            `(,(pregexp-quote test-file)
              seek
              " pass .*TEST1"
@@ -1317,7 +1338,8 @@
   (define abort.ms
     (write-test-file "abort.ms"
       (lambda ()
-        (pretty-print '(abort)))))
+        ;; call exit instead of abort to clean up and prevent apparent leaks
+        (pretty-print '(exit 1)))))
   (define no-tests.ms (write-test-file "no-tests.ms" void))
   (define pass.ms
     (write-test-file "pass.ms"
@@ -1417,8 +1439,9 @@
         e0 e1 ...))]))
 
 (isolate-mat profile ()
+  (define src-file "profile-code.ss")
   (define source-file
-    (write-test-file "profile-code.ss"
+    (write-test-file src-file
       (lambda ()
         (display "#!chezscheme\n")
         (display "(define (fac n)\n")
@@ -1471,8 +1494,8 @@
      ([#t (file-regular? coverage-file)]
       [,cov (utf8->string (read-file coverage-file))]
       [(,_) (pregexp-match "Overall 74% coverage with 17 of 23 sites covered" cov)]
-      [(,_) (pregexp-match (summary-row source-file-rel 17 23 74 12) cov)]
-      [,ss.html (path-combine (path-parent coverage-file) (string-append source-file-rel ".html"))]
+      [(,_) (pregexp-match (summary-row src-file 17 23 74 12) cov)]
+      [,ss.html (path-combine (path-parent coverage-file) (string-append src-file ".html"))]
       [#t (file-regular? ss.html)]
       [,ss (utf8->string (read-file ss.html))]
       [(,_) (check-count 2 "1" ss)]  ;; base case
@@ -1490,8 +1513,8 @@
    ([#t (file-regular? coverage1-file)]
     [,cov1 (utf8->string (read-file coverage1-file))]
     [(,_) (pregexp-match "Overall 45% coverage with 18 of 40 sites covered" cov1)]
-    [(,_) (pregexp-match (summary-row source-file-rel 18 40 45 1) cov1)]
-    [,ss.html (path-combine (path-parent coverage1-file) (string-append source-file-rel ".html"))]
+    [(,_) (pregexp-match (summary-row src-file 18 40 45 1) cov1)]
+    [,ss.html (path-combine (path-parent coverage1-file) (string-append src-file ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
     [(,_) (check-count 1 "1" ss)] ;; base case
@@ -1518,8 +1541,8 @@
    ([#t (file-regular? coverage1-file)]
     [,cov1 (utf8->string (read-file coverage1-file))]
     [(,_) (pregexp-match "Overall 70% coverage with 28 of 40 sites covered" cov1)]
-    [(,_) (pregexp-match (summary-row source-file-rel 28 40 70 6) cov1)]
-    [,ss.html (path-combine (path-parent coverage1-file) (string-append source-file-rel ".html"))]
+    [(,_) (pregexp-match (summary-row src-file 28 40 70 6) cov1)]
+    [,ss.html (path-combine (path-parent coverage1-file) (string-append src-file ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
     [(,_) (check-count 1 "1" ss)] ;; base case
@@ -1539,8 +1562,8 @@
    ([#t (file-regular? coverage1-file)]
     [,cov1 (utf8->string (read-file coverage1-file))]
     [(,_) (pregexp-match "Overall 85% coverage with 34 of 40 sites covered" cov1)]
-    [(,_) (pregexp-match (summary-row source-file-rel 34 40 85 7) cov1)]
-    [,ss.html (path-combine (path-parent coverage1-file) (string-append source-file-rel ".html"))]
+    [(,_) (pregexp-match (summary-row src-file 34 40 85 7) cov1)]
+    [,ss.html (path-combine (path-parent coverage1-file) (string-append src-file ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
     [(,_) (check-count 2 "1" ss)] ;; base case
@@ -1574,8 +1597,8 @@
    ([#t (file-regular? coverage-file)]
     [,cov (utf8->string (read-file coverage-file))]
     [(,_) (pregexp-match "Overall 85% coverage with 34 of 40 sites covered" cov)]
-    [(,_) (pregexp-match (summary-row source-file-rel 34 40 85 31) cov)]
-    [,ss.html (path-combine (path-parent coverage-file) (string-append source-file-rel ".html"))]
+    [(,_) (pregexp-match (summary-row src-file 34 40 85 31) cov)]
+    [,ss.html (path-combine (path-parent coverage-file) (string-append src-file ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
     [(,_) (check-count (+ (* 2 2)  2) "1" ss)] ;; base case
@@ -1596,8 +1619,8 @@
    ([#t (file-regular? coverage-file)]
     [,cov (utf8->string (read-file coverage-file))]
     [(,_) (pregexp-match "Overall 85% coverage with 34 of 40 sites covered" cov)]
-    [(,_) (pregexp-match (summary-row source-file-rel 34 40 85 (+ 31 7)) cov)]
-    [,ss.html (path-combine (path-parent coverage-file) (string-append source-file-rel ".html"))]
+    [(,_) (pregexp-match (summary-row src-file 34 40 85 (+ 31 7)) cov)]
+    [,ss.html (path-combine (path-parent coverage-file) (string-append src-file ".html"))]
     [#t (file-regular? ss.html)]
     [,ss (utf8->string (read-file ss.html))]
     [(,_) (check-count (+ (* 2 2)  (* 2 2)) "1" ss)] ;; base case

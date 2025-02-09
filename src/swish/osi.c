@@ -53,6 +53,7 @@ typedef struct {
   ptr read_callback;
   uv_write_t write_req;
   ptr write_buffer;
+  ptr write_buffer2;
   uint32_t write_size;
   ptr write_callback;
   union {
@@ -95,6 +96,7 @@ typedef struct {
 uv_loop_t* osi_loop;
 
 jmp_t g_exit;
+int g_is_service;
 
 static uint64_t g_threshold;
 static ptr g_callbacks;
@@ -439,6 +441,10 @@ static void write_stream_cb(uv_write_t* req, int status) {
   stream_port_t* p = container_of(req, stream_port_t, write_req);
   ptr callback = p->write_callback;
   Sunlock_object(p->write_buffer);
+  if (p->write_buffer2) {
+    Sunlock_object(p->write_buffer2);
+    p->write_buffer2 = 0;
+  }
   Sunlock_object(callback);
   p->write_callback = 0;
   osi_add_callback1(callback, (status < 0) ? Sinteger32(status) : Sunsigned32(p->write_size));
@@ -453,6 +459,7 @@ static ptr write_stream_port(uptr port, ptr buffer, size_t start_index, uint32_t
   Slock_object(buffer);
   Slock_object(callback);
   p->write_buffer = buffer;
+  p->write_buffer2 = 0;
   p->write_size = size;
   p->write_callback = callback;
   uv_buf_t buf = {
@@ -464,6 +471,47 @@ static ptr write_stream_port(uptr port, ptr buffer, size_t start_index, uint32_t
     Sunlock_object(buffer);
     Sunlock_object(callback);
     p->write_callback = 0;
+    return osi_make_error_pair("uv_write", rc);
+  }
+  return Strue;
+}
+
+ptr osi_tcp_write2(uptr port, ptr bv1, ptr bv2, size_t start_index2, uint32_t size2, ptr callback) {
+  size_t last2 = start_index2 + size2;
+  size_t total_size = Sbytevector_length(bv1) + size2;
+  if (!Sbytevectorp(bv1) || !Sbytevectorp(bv2) || !Sprocedurep(callback) ||
+      // zero size2 is okay
+      (last2 < start_index2) || // start_index2 + size2 overflowed
+      (last2 > (size_t)Sbytevector_length(bv2)) ||
+      (total_size > UINT32_MAX))
+    return osi_make_error_pair("osi_tcp_write2", UV_EINVAL);
+  stream_port_t* p = (stream_port_t*)port;
+  if (p->write_callback)
+    return osi_make_error_pair("osi_tcp_write2", UV_EBUSY);
+  Slock_object(bv1);
+  Slock_object(bv2);
+  Slock_object(callback);
+  p->write_buffer = bv1;
+  p->write_buffer2 = bv2;
+  p->write_size = (uint32_t)total_size;
+  p->write_callback = callback;
+  uv_buf_t buf[] = {
+    {
+      .base = (char*)& Sbytevector_u8_ref(bv1, 0),
+      .len = (uint32_t)Sbytevector_length(bv1)
+    },
+    {
+      .base = (char*)& Sbytevector_u8_ref(bv2, start_index2),
+      .len = size2
+    }
+  };
+  int rc = uv_write(&(p->write_req), &(p->h.stream), buf, 2, write_stream_cb);
+  if (rc < 0) {
+    Sunlock_object(bv1);
+    Sunlock_object(bv2);
+    Sunlock_object(callback);
+    p->write_callback = 0;
+    p->write_buffer2 = 0;
     return osi_make_error_pair("uv_write", rc);
   }
   return Strue;
@@ -597,7 +645,15 @@ static void watch_path_cb(uv_fs_event_t* handle, const char* filename, int event
     osi_add_callback1(callback, Sinteger(status));
     return;
   }
-  osi_add_callback2(callback, Sstring_utf8(filename, -1), Sinteger(events));
+  osi_add_callback2(callback, filename ? Sstring_utf8(filename, -1) : Sfalse, Sinteger(events));
+}
+
+ptr osi_tcp_nodelay(uptr port, int enable) {
+  stream_port_t* p = (stream_port_t*)port;
+  if (p->vtable != &tcp_vtable)
+    return osi_make_error_pair("uv_tcp_nodelay", UV_EINVAL);
+  int rc = uv_tcp_nodelay(&(p->h.tcp), enable);
+  return (rc < 0) ? Sfalse : Strue;
 }
 
 static int string_list_length(ptr x) {
@@ -1453,6 +1509,10 @@ int osi_send_request(handle_request_func code, void* payload) {
   uv_cond_signal(&g_send_request.cond);
   uv_mutex_unlock(&g_send_request.mutex);
   return 0;
+}
+
+int osi_is_service() {
+  return g_is_service;
 }
 
 // Cannot use exports of scheme.h here; the Scheme heap may not have

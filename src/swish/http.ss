@@ -50,6 +50,7 @@
    http:respond-file
    http:switch-protocol
    http:url-handler
+   http:valid-path?
    http:write-header
    http:write-status
    )
@@ -106,6 +107,9 @@
     [response-timeout
      (default 60000)
      (must-be fixnum? fxpositive?)]
+    [validate-path
+     (default http:valid-path?)
+     (must-be procedure?)]
     )
 
   (define-syntax http:add-file-server
@@ -176,16 +180,16 @@
          #'(handler conn request header params))]))
 
   (define (http-listener:start&link name sup init-port url-handler options)
-    (define-state-tuple <http-listener> tcp-listener cache-manager pid->op)
+    (define-state-tuple <http-listener> tcp-listener cache-manager pid->ports)
     (define (init)
       (process-trap-exit #t)
       (match-let* ([#(ok ,cache-mgr) (cache-mgr:start&link sup options)])
         `#(ok ,(<http-listener> make
                  [tcp-listener (listen-tcp "::" init-port self)]
                  [cache-manager cache-mgr]
-                 [pid->op (ht:make process-id eq? process?)]))))
+                 [pid->ports (ht:make process-id eq? process?)]))))
     (define (terminate reason state)
-      ;; Ignore the pid->op table. In the rare event that this
+      ;; Ignore the pid->ports table. In the rare event that this
       ;; gen-server fails, the dispatchers can continue
       ;; processing. The garbage collector will clean up if necessary.
       (close-tcp-listener ($state tcp-listener)))
@@ -211,15 +215,17 @@
                              (conn:start&link cache-mgr ip op options)])
                            (http:handle-input conn url-handler options)))))))])
           (monitor pid)
-          `#(no-reply ,($state copy* [pid->op (ht:set pid->op pid op)])))]
+          `#(no-reply ,($state copy* [pid->ports (ht:set pid->ports pid (cons ip op))])))]
         [#(accept-tcp-failed ,_ ,_ ,_)
          `#(stop ,msg ,state)]
         [`(DOWN ,_ ,pid ,_)
          (cond
-          [(ht:ref ($state pid->op) pid #f) =>
-           (lambda (op)
-             (force-close-output-port op)
-             `#(no-reply ,($state copy* [pid->op (ht:delete pid->op pid)])))]
+          [(ht:ref ($state pid->ports) pid #f) =>
+           (lambda (ports)
+             (match-let* ([(,ip . ,op) ports])
+               (force-close-output-port op)
+               (close-port ip))
+             `#(no-reply ,($state copy* [pid->ports (ht:delete pid->ports pid)])))]
           [else
            `#(no-reply ,state)])]))
     (gen-server:start&link name))
@@ -229,8 +235,8 @@
 
   (define (conn:start&link cache-mgr ip op options)
     (define-state-tuple <conn>
-      input                     ; ready | #(advance ipos) | close
-      output                    ; ready | dirty
+      input                          ; ready | #(advance ipos) | close
+      output                         ; ready | dirty
       )
     (define host (port-name ip))
 
@@ -488,10 +494,10 @@
     ;; interpret the files and a cookie to determine if the result is
     ;; valid to be placed in the cache.
     (define-state-tuple <http-cache>
-      cookie     ; integer
-      mime-types ; #f | file-extension -> media-type
-      pages      ; path -> #(loaded ,handler) | #(loading ,path ,pid ,waiters)
-      watchers   ; (path-watcher ...)
+      cookie     ;; integer
+      mime-types ;; #f | file-extension -> media-type
+      pages      ;; path -> #(loaded ,handler) | #(loading ,path ,pid ,waiters)
+      watchers   ;; (path-watcher ...)
       )
     (define cache-timeout (* 5 60 1000))
     (define empty-ht (ht:make string-ci-hash string-ci=? string?))
@@ -511,8 +517,7 @@
           (let ([state (load-watchers state)])
             ($state copy [mime-types (read-mime-types)]))))
     (define (url->abs-paths path) ;; path starts with "/"
-      (let ([path (path-combine root-dir
-                    (substring path 1 (string-length path)))]
+      (let ([path (path-combine root-dir path)]
             [search-extensions (file-search-extensions)])
         (cond
          [(directory-separator? (string-ref path (- (string-length path) 1)))
@@ -649,8 +654,8 @@
         [timeout `#(stop normal ,state)]
         [#(path-changed ,path ,filename ,_)
          `#(no-reply
-            ,(if (and (string=? path root-dir)
-                      (string=? filename "mime-types"))
+            ,(if (and (equal? path root-dir)
+                      (equal? filename "mime-types"))
                  ($state copy [mime-types #f])
                  (clear-cache state))
             ,cache-timeout)]
@@ -802,16 +807,17 @@
       (bytevector-copy! bv start buf 0 len)
       (utf8->string buf)))
 
-  (define (parse-encoded-string bv i end stop-char)
+  (define (parse-encoded-string bv i end stop-char query?)
     (let-values ([(op get) (open-bytevector-output-port)])
+      (define stop (char->integer stop-char))
       (let lp ([i i])
         (if (fx>= i end)
             (values i (utf8->string (get)))
             (let ([c (bytevector-u8-ref bv i)])
               (cond
-               [(fx= c (char->integer stop-char))
+               [(fx= c stop)
                 (values i (utf8->string (get)))]
-               [(fx= c (char->integer #\+))
+               [(and query? (fx= c (char->integer #\+)))
                 (put-u8 op (char->integer #\space))
                 (lp (fx+ i 1))]
                [(and (fx= c (char->integer #\%)) (decode bv i end)) =>
@@ -828,8 +834,8 @@
         (if (fx>= i end)
             ht
             (let*-values
-                ([(stop key) (parse-encoded-string bv i end #\=)]
-                 [(stop val) (parse-encoded-string bv (fx+ stop 1) end #\&)])
+                ([(stop key) (parse-encoded-string bv i end #\= #t)]
+                 [(stop val) (parse-encoded-string bv (fx+ stop 1) end #\& #t)])
               (json:set! ht (string->symbol key) val)
               (lp (fx+ stop 1)))))))
 
@@ -858,7 +864,7 @@
        (cond
         [(string=? "HTTP/1.1"
            (bv-extract-string bv (fx+ s2 1) (bytevector-length bv)))
-         (let-values ([(s3 path) (parse-encoded-string bv (fx+ s1 1) s2 #\?)])
+         (let-values ([(s3 path) (parse-encoded-string bv (fx+ s1 1) s2 #\? #f)])
            (<request> make
              [method (string->symbol (bv-extract-string bv 0 s1))]
              [original-path path]
@@ -1042,23 +1048,24 @@
                          [(k fn) (',http:include-help #'k (datum fn) ,path)]))])
          ,@exprs))
     (eval
-     `(http:url-handler
-       (define-syntax find-param
-         (syntax-rules ()
-           [(_ key) (http:find-param key params)]))
-       (define-syntax get-param
-         (syntax-rules ()
-           [(_ key) (http:get-param key params)]))
-       ,(wrap-3D-include path exprs))))
+     `(let ()
+        (import (swish imports))
+        (http:url-handler
+         (define-syntax find-param
+           (syntax-rules ()
+             [(_ key) (http:find-param key params)]))
+         (define-syntax get-param
+           (syntax-rules ()
+             [(_ key) (http:get-param key params)]))
+         ,(wrap-3D-include path exprs)))))
 
-  (define (validate-path path)
-    (and (string=? (path-first path) "/")
-         (let lp ([path (path-rest path)])
-           (let ([first (path-first path)])
-             (cond
-              [(string=? first "") #t]
-              [(string=? first "..") #f]
-              [else (lp (path-rest path))])))))
+  (define (http:valid-path? path)
+    (and (string? path)
+         (starts-with? path "/")
+         (not (member ".."
+                (if windows?
+                    (pregexp-split (re "[\\\\/]") path)
+                    (split path (directory-separator)))))))
 
   (define (not-found conn)
     (http:respond conn 404 '()
@@ -1080,7 +1087,7 @@
       [header header]
       [params params])
     (cond
-     [(not (validate-path path))
+     [(not ((validate-path) path))
       (not-found conn)
       (raise `#(http-invalid-path ,path))]
      [(match (try (limit-stack (url-handler conn request header params)))

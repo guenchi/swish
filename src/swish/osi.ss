@@ -83,6 +83,7 @@
    osi_get_uname
    osi_interrupt_database
    osi_is_quantum_over
+   osi_is_service
    osi_kill
    osi_kill*
    osi_list_directory
@@ -123,6 +124,9 @@
    osi_step_statement*
    osi_stop_signal
    osi_stop_signal*
+   osi_tcp_nodelay
+   osi_tcp_nodelay*
+   osi_tcp_write2*
    osi_unlink
    osi_unlink*
    osi_unmarshal_bindings
@@ -183,11 +187,14 @@
     (foreign-procedure "uv_get_free_memory" () unsigned-64))
   (define osi_get_total_memory
     (foreign-procedure "uv_get_total_memory" () unsigned-64))
+  (fdefine osi_is_service boolean)
 
   ;; Ports
   (define-osi osi_read_port (port uptr) (buffer ptr) (start-index size_t) (size unsigned-32) (offset integer-64) (callback ptr))
   (define-osi osi_write_port (port uptr) (buffer ptr) (start-index size_t) (size unsigned-32) (offset integer-64) (callback ptr))
   (define-osi osi_close_port (port uptr) (callback ptr))
+
+  (define-osi osi_tcp_write2 (port uptr) (bv1 ptr) (bv2 ptr) (start-index2 size_t) (size2 unsigned-32) (callback ptr))
 
   ;; Process
   (fdefine osi_exit (status int) void)
@@ -219,6 +226,7 @@
   (fdefine osi_close_tcp_listener (listener uptr) void)
   (define-osi osi_get_tcp_listener_port (listener uptr))
   (define-osi osi_get_ip_address (port uptr))
+  (define-osi osi_tcp_nodelay (port uptr) (enabled? boolean))
 
   (define (uuid->string uuid)
     (unless (and (bytevector? uuid) (= (bytevector-length uuid) 16))

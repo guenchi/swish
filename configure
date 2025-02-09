@@ -48,7 +48,7 @@ case "${CONFIG_UNAME}" in
     Windows=no
     EXESUFFIX=
     DLLSUFFIX=.dylib
-    NORMALIZE_PATH="realpath -m"
+    NORMALIZE_PATH="grealpath -m"
     ;;
   *)
     Windows=no
@@ -144,7 +144,7 @@ fi
 if [ -n "${PREFIX}" ]; then
   # use absolute path, after limited tilde expansion, since "make install"
   # runs in src/swish where a relative path would cause confusion
-  PREFIX="$(realpath -m "$(weak_tilde_expansion "${PREFIX}")")"
+  PREFIX="$(${NORMALIZE_PATH} "$(weak_tilde_expansion "${PREFIX}")")"
 fi
 
 notilde() {
@@ -332,10 +332,21 @@ if [ "${Windows}" = "yes" ]; then
   check_missing "scheme.h" "$(cygpath -au "${SchemeInclude}")"
 else
   check_missing "scheme.h" "${SchemeInclude}"
-  check_missing "kernel.o" "${SchemeInclude}"
 fi
 
-SWISH_VERSION=$(sed -n 's/^#define SWISH_VERSION \([0-9a-z."]*\)/\1/p' src/swish/swish.h)
+if [ -f "${SchemeInclude}/kernel.o" ]; then
+  SCHEMELINK="\${SCHEME_LIBPATH}/kernel.o"
+elif [ -f "${SchemeInclude}/libkernel.a" ]; then
+  if [ ! -f "${SchemeInclude}/liblz4.a" ]; then
+    SCHEMELINK="-L\${SCHEME_LIBPATH}/../../lz4/lib "
+  fi
+  if [ ! -f "${SchemeInclude}/liblz4.a" ]; then
+    SCHEMELINK="${SCHEMELINK:-}-L\${SCHEME_LIBPATH}/../../zlib "
+  fi
+  SCHEMELINK="${SCHEMELINK:-}-L\${SCHEME_LIBPATH} -lkernel -llz4 -lz"
+elif [ "${Windows}" = "no" ]; then
+  err "Missing Chez Scheme kernel.o or libkernel.a"
+fi
 
 escape_backslash() { printf "%s" "$1" | sed 's_\\_\\\\_g' ; }
 ADD_TO=
@@ -362,6 +373,7 @@ BASE="$(git rev-parse --show-toplevel)"
 SWISH_INCLUDE="${BASE}/src/swish"
 SWISH_LIBPATH="${BASE}/build/release/bin"
 LIBUV_INCLUDE="${BASE}/libuv/include"
+SQLITE_SRCPATH="${BASE}/sqlite"
 case "${CONFIG_UNAME}" in
   CYGWIN_NT-* | MINGW64_NT-* | MSYS_NT-*)
     UvLib=libuv/build/Release
@@ -377,6 +389,7 @@ if [ "${Windows}" = "yes" ]; then
     SWISH_LIBPATH="$(cygpath -aw "${SWISH_LIBPATH}")"
     LIBUV_INCLUDE="$(cygpath -aw "${LIBUV_INCLUDE}")"
     LIBUV_LIBPATH="$(cygpath -aw "${LIBUV_LIBPATH}")"
+    SQLITE_SRCPATH="$(cygpath -aw "${SQLITE_SRCPATH}")"
 fi
 
 set_output "#" src/swish/sh-config
@@ -395,12 +408,17 @@ add "DLLSUFFIX:=${DLLSUFFIX}"
 add "INSTALLROOT:=${PREFIX}"
 add "BASE_MACHINE_TYPE:=${BASE_MACHINE_TYPE}"
 add "MACHINE_TYPE:=${MACHINE_TYPE}"
+add "ARCH_DEST:=${MACHINE_TYPE}"
 add "SCHEME:=${SCHEME}"
 if [ -n "${SCHEMEHEAPDIRS:-}" ]; then
   add "SCHEMEHEAPDIRS:=${SCHEMEHEAPDIRS:-}"
 fi
 add "SCHEME_INCLUDE:=${SchemeInclude}"
 add "SCHEME_LIBPATH:=${SCHEME_LIBPATH}"
+add "SCHEMEBOOT:=$(${NORMALIZE_PATH} "$(dirname "${PETITE_BOOT}")")"
+if [ -n "${SCHEMELINK:-}" ]; then
+  add "SCHEMELINK:=${SCHEMELINK:-}"
+fi
 if [ "${Windows}" = "yes" ]; then
   add "SCHEME_LIB_PREFIX:=${SchemeLibPrefix}"
   add "SCHEME_REVISION_PATH:=$(cygpath -u "${SchemeInclude}")"
@@ -409,21 +427,33 @@ else
 fi
 add "SWISH_INCLUDE:=${SWISH_INCLUDE}"
 add "SWISH_LIBPATH:=${SWISH_LIBPATH}"
-add "SWISH_VERSION:=${SWISH_VERSION}"
 add "LIBUV_INCLUDE:=${LIBUV_INCLUDE}"
 add "LIBUV_LIBPATH:=${LIBUV_LIBPATH}"
+add "SQLITE_SRCPATH:=${SQLITE_SRCPATH}"
 add "NORMALIZE_PATH:=${NORMALIZE_PATH}"
 if [ "${CONFIG_UNAME}" = "Darwin" ]; then
   add "GNU_INSTALL:=ginstall"
+  add "GNU_LN:=gln"
 else
   add "GNU_INSTALL:=install"
+  add "GNU_LN:=ln"
 fi
+# build server may not have GNU make >= 4.4, but we don't use -j there either
+TMPFILE="$(mktemp)"
+echo "target: .WAIT" > "${TMPFILE}"
+if make -qf "${TMPFILE}" 2> /dev/null ; then
+  add "SYNC=.WAIT"
+else
+  add "SYNC="
+  echo "Note: make does not support .WAIT, so make -j may not work."
+fi
+rm "${TMPFILE}"
 
 set_output ";;" src/osi-bootstrap.ss
 if [ "${Windows}" = "yes" ]; then
   ROOT="$(cygpath -am "${BASE}")"
 else
-  ROOT="$(realpath -m "${BASE}")"
+  ROOT="$(${NORMALIZE_PATH} "${BASE}")"
 fi
 add "(let ()"
 add "  (define (path-combine . paths) (format \"~{~a~^/~}\" paths))"
@@ -449,6 +479,7 @@ add "CFLAGS:=${MYCFLAGS}"
 add "LD:=${MYLD}"
 add "LDFLAGS:=${MYLDFLAGS}"
 if [ "${Windows}" = "yes" ]; then
+  add "export SCHEMEDLL:=${SchemeDLL}"
   if [ -n "${CUSTOMPATH}" ]; then
     case "${CONFIG_UNAME}" in
       MINGW64_NT-* | MSYS_NT-*)

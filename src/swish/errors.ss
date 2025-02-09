@@ -60,7 +60,6 @@
       [#(db-retry-failed ,sql ,count) (format "Database query failed after ~d retries: ~a." count sql)]
       [#(deadlock ,resource) (format "Deadlock on resource ~s." resource)]
       [#(error ,reason) (exit-reason->english reason)]
-      [#(find-files-failed ,spec ,who ,errno) (format "Error ~d from ~a during find-files ~s: ~a." errno who spec (errno->english errno))]
       [#(http-file-not-found ,path) (format "HTTP file not found: ~a." path)]
       [#(http-handler-failed ,reason) (format "HTTP handler failed: ~a" (exit-reason->english reason))]
       [#(http-invalid-content-disposition ,x) (format "Invalid Content-Disposition HTTP header: ~a" x)]
@@ -141,9 +140,6 @@
            (get-output-string op))]
         [else (format "~s" x)])]))
 
-  (define current-exit-reason->english
-    (make-parameter swish-exit-reason->english))
-
   (define (src->english x)
     (match x
       [#(,at ,offset ,file) (format " ~a offset ~a of ~a" at offset file)]
@@ -170,6 +166,9 @@
          (fold-left add-stack (cons-k reason (cons-k r k*)) inner*)]
         [,_ (cons-k reason k*)]))
     (add-stack '() reason))
+
+  (define current-exit-reason->english
+    (make-parameter swish-exit-reason->english))
 
   (define-syntax redefine
     (syntax-rules ()

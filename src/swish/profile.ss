@@ -36,6 +36,7 @@
   (import
    (chezscheme)
    (swish app-io)
+   (swish dsm)
    (swish erlang)
    (swish errors)
    (swish gen-server)
@@ -43,6 +44,7 @@
    (swish io)
    (swish meta)
    (swish pregexp)
+   (swish string-utils)
    )
 
   (define-state-tuple <profile-state> ht filename context waketime)
@@ -221,12 +223,12 @@
 
   (define (profile-update state)
     (<profile-state> open state [context filename ht])
-    (collect (collect-maximum-generation))
     (add-filedata ht
       (with-interrupts-disabled
        (let ([data (profile-dump)])
          (profile-clear)
          data)))
+    (profile-release-counters)
     (profile-save filename context ht))
 
   (define (resolve path)
@@ -343,25 +345,52 @@
          inputs))
       (let-values ([(keys vals) (hashtable-entries table)])
         (vector->list
-         (vector-sort (lambda (a b) (string<? (car a) (car b)))
-           (vector-map (lambda (k v) (cons (sfd-source-path k values) v))
-             keys vals)))))
+         (vector-sort (lambda (a b) (natural-string<? (car a) (car b)))
+           (vector-map
+            (lambda (sfd v)
+              (match (sfd-sig sfd)
+                [(,checksum . ,source-path) (cons source-path v)]))
+            keys vals)))))
     (unless (list-of-strings? inputs) (bad-arg 'profile:dump-html profile-in))
     (unless (string? output-fn) (bad-arg 'profile:dump-html output-fn))
     (unless (list-of-strings? include-globs) (bad-arg 'profile:dump-html include-globs))
     (unless (list-of-strings? exclude-globs) (bad-arg 'profile:dump-html exclude-globs))
     (let ([results (load-profiles)]
           [op (open-file-to-replace (make-directory-path output-fn))])
+      (define common-prefix
+        (fold-left
+         (lambda (pfx entry)
+           (match entry
+             [(,source-path . #f) pfx] ;; file skipped
+             [(,source-path . ,_)      ;; absolute path if not skipped
+              (let ([dir (path-parent source-path)])
+                (let loop ([pfx (or pfx dir)])
+                  (if (starts-with? dir pfx)
+                      pfx
+                      (loop (path-parent pfx)))))]))
+         #f
+         results))
+      (define strip-prefix
+        (if (not common-prefix)
+            values
+            (let* ([prefix-length (string-length common-prefix)]
+                   [n (if (ends-with? common-prefix (string (directory-separator)))
+                          prefix-length
+                          (+ prefix-length 1))])
+              (lambda (src)
+                (substring src n (string-length src))))))
       (fprintf op "<!DOCTYPE html>\n")
-      (fprintf op "<html>\n")
+      (fprintf op "<html lang=\"en\">\n")
       (html->string op
         `(head
-          (meta (@ (charset "UTF-8")))
+          (meta (@ (http-equiv "Content-Type")
+                   (content "text/html; charset=UTF-8")))
           (title "Test Coverage")
           (style
-            "td { text-align: right; }"
-            "td:first-child { text-align: left; }")))
-      (fprintf op "<body style='font-family:monospace;'>\n")
+           "BODY { font-family: monospace; }"
+           "td { text-align: right; }"
+           "td:first-child { text-align: left; }")))
+      (fprintf op "<body>\n")
       (let-values ([(hits sites percentage) (summarize-coverage results)])
         (fprintf op
           "<h2>Overall ~a% coverage with ~a of ~a sites covered.\n</h2>"
@@ -372,14 +401,15 @@
         (let ([root (path-parent (get-real-path output-fn))])
           (for-each
            (lambda (entry)
-             ;; entry = (sfd . skiplist | #f)
+             ;; entry = (source-path . skiplist | #f)
              (match entry
-               [(,name . ,sl)
+               [(,source-path . ,sl)
                 (match (and sl (sl))
                   [,data
                    (guard (pair? data))
                    ;; non-blocking i/o OK: profile:dump-html runs from dedicated OS process, not interested in concurrency
-                   (let* ([ip (open-input-file name)]
+                   (let* ([ip (open-input-file source-path)]
+                          [name (strip-prefix source-path)]
                           [file-op (open-file-to-replace (make-directory-path (path-combine root (string-append name ".html"))))])
                      (on-exit (close-port file-op)
                        (annotate (pregexp-replace* "\\\\" name "/") ip data op file-op)))]
@@ -406,22 +436,121 @@
             sites
             (round (* (/ hits sites) 100))
             max-count)))
-      (emit-header (sanitize name) file-op)
-      (let loop ([fp 0] [ls data] [stack '()])
-        (cond
-         [(and (pair? stack) (= (car stack) fp))
-          (display "</span>" file-op)
-          (loop fp ls (cdr stack))]
-         [(and (pair? ls) (= (source-object-bfp (caar ls)) fp))
-          (let ([count (cdar ls)])
-            (fprintf file-op "<span title=\"~:d\" style=\"background-color: ~a\">"
-              count (colorize count max-count)))
-          (loop fp (cdr ls) (cons (source-object-efp (caar ls)) stack))]
-         [else
-          (let ([c (read-char ip)])
-            (unless (eof-object? c)
-              (print-char c file-op)
-              (loop (+ fp 1) ls stack)))]))
+      (emit-header (sanitize name) max-count data file-op)
+
+      ;; Each line contains:
+      ;; 1. a table cell containing the line number
+      ;; 2. leading whitespace without an enclosing span
+      ;; 3. span tags for all enclosing source expressions including
+      ;;    profile counts
+      ;; 4. code expressions
+      ;; 5. closing span tags for all remaining open span tags on the
+      ;;    line
+      (let ()
+        (define-syntactic-monad $
+          c                     ; current character
+          fp                    ; current file position
+          line                  ; current line number
+          data                  ; profile data of upcoming exprs
+          stack                 ; profile data of containing exprs
+          num-spans             ; number of open span tags on the line
+          )
+
+        (define (entering? fp data)
+          (and (pair? data) (>= fp (source-object-bfp (caar data)))))
+        (define (leaving? fp stack)
+          (and (pair? stack) (>= fp (source-object-efp (caar stack)))))
+
+        (define (push-color count line num-spans)
+          (fprintf file-op "<span title=\"~:d\" class=\"~a\">"
+            count (color-class count max-count))
+          (fx+ num-spans 1))
+        (define (pop-color depth num-spans)
+          (cond
+           [(> depth 0)
+            (fprintf file-op "</span>")
+            (pop-color (- depth 1) (fx- num-spans 1))]
+           [else num-spans]))
+
+        (define (print-sol line)
+          (fprintf file-op "<tr><td>~a</td><td id=\"L~a\">" line line))
+        (define (print-eol num-spans)
+          (let ([num-spans (pop-color num-spans num-spans)])
+            (fprintf file-op "</td></tr>\n")
+            num-spans))
+
+        ($ define (update-char next-state)
+           ($ next-state
+              ([line (if (eq? c #\newline) (fx+ line 1) line)]
+               [c (begin (read-char ip) (peek-char ip))]
+               [fp (fx+ fp 1)])))
+        ($ define (start-of-line)
+           (cond
+            [(eof-object? c) (void)]
+            [(eq? c #\newline)
+             (print-sol line)
+             ($ end-of-line)]
+            [(char-whitespace? c)
+             (print-sol line)
+             (print-char c file-op)
+             ($ update-char () leading-whitespace)]
+            [else
+             (print-sol line)
+             ($ first-char)]))
+        ($ define (end-of-line)
+           (let ([num-spans (print-eol num-spans)])
+             ($ update-char () start-of-line)))
+        ($ define (leading-whitespace)
+           (cond
+            [(eof-object? c) ($ end-of-line)]
+            [(eq? c #\newline) ($ end-of-line)]
+            [(char-whitespace? c)
+             (print-char c file-op)
+             ($ update-char () leading-whitespace)]
+            [else ($ first-char)]))
+        ($ define (first-char)
+           (cond
+            [(eof-object? c) ($ end-of-line)]
+            [(eq? c #\newline) ($ end-of-line)]
+            [(leaving? fp stack)
+             ;; lookahead and eliminate stack items that would generate
+             ;; empty span tags.
+             ($ first-char ([stack (cdr stack)]))]
+            [else
+             ($ next-char
+                ([num-spans
+                  ;; From right-to-left, establish all enclosing spans
+                  (fold-right
+                   (lambda (x num-spans) (push-color (cdr x) line num-spans))
+                   num-spans
+                   stack)]))]))
+        ($ define (next-char)
+           (cond
+            [(eof-object? c) ($ end-of-line)]
+            [(eq? c #\newline) ($ end-of-line)]
+            [(leaving? fp stack)
+             ($ next-char
+                ([stack (cdr stack)]
+                 [num-spans (pop-color 1 num-spans)]))]
+            [(entering? fp data)
+             (let ([num-spans (push-color (cdar data) line num-spans)])
+               (print-char c file-op)
+               ($ update-char
+                  ([stack (cons (car data) stack)]
+                   [data (cdr data)])
+                  next-char))]
+            [else
+             (print-char c file-op)
+             ($ update-char () next-char)]))
+
+        ($ start-of-line
+           ([c (peek-char ip)]
+            [fp 0]
+            [line 1]
+            [data data]
+            [stack '()]
+            [num-spans 0])))
+
       (emit-trailer file-op)
       (close-input-port ip)))
 
@@ -437,6 +566,17 @@
                    #x80)
                 16)])
         (string-append "#FF" s "80"))]))
+
+  (define (color-class x max-count)
+    ;; Generate classes c0 - c128 on a log scale
+    (cond
+     [(= x 0) "c0"]
+     [(= max-count 1) "c128"]
+     [else
+      (format "c~d"
+        (+ (inexact->exact
+            (round (* (/ (log x) (log max-count)) 127)))
+           1))]))
 
   (define (sanitize s)
     (do ([i 0 (fx+ i 1)] [n (string-length s)] [op (open-output-string)])
@@ -464,36 +604,113 @@
             (print-char c op)))
         (get))))
 
-  (define (emit-header name op)
+  (define (emit-header name max-count data op)
     (fprintf op
-      "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">
-<html>
-<head>
-<meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\">
-<title>~a</title>
-<style type=\"text/css\">
-<!--
-SPAN
-{
- border-width: 1px;
-               border-top-width: 0;
-               border-bottom-width: 0;
-               border-style: solid;
-               }
--->
-</style>
-</head>
-<body>
-<h1>~a</h1>
+      (ct:join #\newline
+        "<!DOCTYPE html>"
+        "<html lang=\"en\">"
+        "<head>"
+        "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\">"
+        "<title>~a</title>"
+        "<style>"
+        "<!--\n") name)
+    (fprintf op "BODY { font-family: monospace; }\n")
+    (fprintf op "span:hover { outline: 1px solid darkgray; }\n")
+    (fprintf op "table.code { padding:0; border-spacing:0; white-space: pre; }\n")
+    (fprintf op "table.code td { padding-top:0; padding-bottom:0; }\n")
+    ;; For convenince when copy/pasting from the rendered output, the
+    ;; line numbers should not be selectable.
+    (fprintf op
+      (ct:join #\space
+        "table.code td:nth-child(1) {"
+        "text-align: right;"
+        "color:gray;"
+        "padding-left: 10px;"
+        "padding-right:10px;"
+        "-webkit-user-select: none;"
+        "-moz-user-select: none;"
+        "-ms-user-select: none;"
+        "user-select: none;"
+        "}\n"))
+    (fprintf op ".legend { position:fixed; top:0; right:0; float:right; height: 0px; margin-right: 1em; }\n")
+    (fprintf op "table.legend { padding:0; border-spacing:0; white-space: pre; }\n")
+    (fprintf op "table.legend th { text-align:center; }\n")
+    (fprintf op "table.legend td { text-align:right; padding-top:0; padding-bottom:0; }\n")
+    (fprintf op "table.legend td:nth-child(2) { border-left: solid 2px white;}\n")
 
-<pre>
-" name name))
+    ;; To emit the minimal set of style sheet classes, we union the
+    ;; set of counts in the profile and set of values displayed in the
+    ;; legend.
+    (let ([ht (make-hashtable string-hash string=?)])
+      (define (update! ht count max-count)
+        (hashtable-update! ht (color-class count max-count)
+          (lambda (old)
+            (or old (colorize count max-count)))
+          #f))
+      (do ([ls data (cdr ls)]) ((null? ls))
+        (update! ht (cdar ls) max-count))
+      (update! ht 0 max-count)
+      (let lp ([count 1])
+        (when (< count max-count)
+          (update! ht count max-count)
+          (lp (* count 10))))
+      (let ([v (hashtable-cells ht)])
+        ;; sort for deterministic output
+        (vector-sort!
+         (lambda (x y) (natural-string<? (car x) (car y)))
+         v)
+        (do ([i 0 (fx+ i 1)]) ((fx= i (vector-length v)))
+          (match-let* ([(,class . ,color) (vector-ref v i)])
+            (fprintf op ".~a { background-color: ~a; }\n" class color)))))
+
+    (fprintf op
+      (ct:join #\newline
+        "-->"
+        "</style>"
+        "</head>"
+        "<body>"
+        ""))
+    (let ([hist (make-hashtable equal-hash equal?)])
+      (define (hist-key count)
+        (if (= count max-count)
+            max-count
+            (exact (ceiling (log (+ count 1) 10)))))
+      (define (update! hist count)
+        (hashtable-update! hist (hist-key count)
+          (lambda (old) (+ old 1))
+          0))
+      (define (emit-legend op count max-count hist)
+        (fprintf op "<tr class=\"~a\"><td>~:d</td><td>~:d</td></tr>\n"
+          (color-class count max-count)
+          count
+          (hashtable-ref hist (hist-key count) 0)))
+      (do ([ls data (cdr ls)]) ((null? ls))
+        (update! hist (cdar ls)))
+      (fprintf op "<table class=\"legend\">\n")
+      (fprintf op "<tr><th>counts</th><th>sites</th></tr>\n")
+      (emit-legend op 0 max-count hist)
+      (let lp ([count 1])
+        (when (< count max-count)
+          (emit-legend op count max-count hist)
+          (lp (* count 10))))
+      (emit-legend op max-count max-count hist)
+      (fprintf op "</table>\n"))
+
+    (fprintf op
+      (ct:join #\newline
+        "<h1>~a</h1>"
+        "<table class=\"code\">"
+        "")
+      name))
 
   (define (emit-trailer op)
-    (display "
-</pre>
-</body>
-</html>" op))
+    (display
+     (ct:join #\newline
+       "</table>"
+       "</body>"
+       "</html>"
+       "")
+     op))
 
   (define (output-row op c1 c2 c3 c4 c5)
     (fprintf op
