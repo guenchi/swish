@@ -489,6 +489,13 @@
 
   (define-syntactic-monad W op indent custom-write key<?)
 
+  (W define (finish end-char)
+    (or (json:write-structural-char end-char indent op)
+        ;; Always return a non-false value (either a fixnum indent or void).
+        ;; This ensures that we recognize when `custom-write` has handled the input
+        ;; if it tail-calls `wr` on a list or JSON object.
+        (and custom-write (void))))
+
   (W define (wr x)
     (declare-unsafe-primitives display-string) ;; #3%
     (cond
@@ -510,7 +517,7 @@
               (json:write-structural-char #\, indent op)
               (W wr () (car ls))
               (lp ls))))
-        (json:write-structural-char #\] indent op))]
+        (W finish () #\]))]
      [(json:object? x)
       (if (zero? (#3%hashtable-size x))
           (display-string "{}" op)
@@ -524,7 +531,7 @@
                   (write-string (json-key->string key) op)
                   (json:write-structural-char #\: indent op)
                   (W wr () val))))
-            (json:write-structural-char #\} indent op)))]
+            (W finish () #\})))]
      [else (throw `#(invalid-datum ,x))]))
 
   (define (internal-write op x indent custom-writer default-key<? who)
