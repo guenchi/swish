@@ -308,6 +308,15 @@ The \code{osi\_get\_argv} function returns a Scheme vector of strings
 constructed from the most recent arguments passed to
 \code{osi\_set\_argv}.
 
+\defineentry{osi\_get\_available\_parallelism}
+\begin{procedure}
+  \code{(osi\_get\_available\_parallelism)}
+\end{procedure}
+\returns{} an unsigned integer
+
+Returns an estimate of the default amount of parallelism a program
+should use as reported by \code{uv\_available\_parallelism}.
+
 \defineentry{osi\_get\_bytes\_used}
 \begin{function}
   \code{size\_t osi\_get\_bytes\_used(void);}

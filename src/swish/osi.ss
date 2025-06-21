@@ -45,6 +45,7 @@
    osi_finalize_statement
    osi_finalize_statement*
    osi_get_argv
+   osi_get_available_parallelism
    osi_get_bindings
    osi_get_bindings*
    osi_get_bytes_used
@@ -188,6 +189,8 @@
   (define osi_get_total_memory
     (foreign-procedure "uv_get_total_memory" () unsigned-64))
   (fdefine osi_is_service boolean)
+  (define osi_get_available_parallelism
+    (foreign-procedure "uv_available_parallelism" () unsigned-32))
 
   ;; Ports
   (define-osi osi_read_port (port uptr) (buffer ptr) (start-index size_t) (size unsigned-32) (offset integer-64) (callback ptr))

@@ -111,6 +111,7 @@ static void swish_init(void) {
   add_foreign(osi_write_port);
   add_foreign(uv_get_free_memory);
   add_foreign(uv_get_total_memory);
+  add_foreign(uv_available_parallelism);
   if (g_aux_init) g_aux_init();
 }
 
