@@ -177,13 +177,10 @@
     (transaction db
       (define (check x result)
         (match result
-          [(#(,@x)) 'ok]
+          [#(,@x) 'ok]
           [,_ (errorf 'check "~s didn't match: ~s\n" x result)]))
-      (fold-left
-       (lambda (id x)
-         (check x (execute "select x from data where rowid=?" id))
-         (+ id 1))
-       1 goodies))
+      (for-each check goodies
+        (execute "select x from data order by rowid asc")))
     (db:stop db)))
 
 (db-mat marshal-bulk ()
@@ -208,13 +205,10 @@
         (let ()
           (define (check x result)
             (match result
-              [(#(,@x)) 'ok]
+              [#(,@x) 'ok]
               [,_ (errorf 'check "~s didn't match: ~s\n" x result)]))
-          (fold-left
-           (lambda (id x)
-             (check x (execute-sql db "select x from data where rowid=?" id))
-             (+ id 1))
-           1 goodies))))))
+          (for-each check goodies
+            (execute-sql db "select x from data order by rowid asc")))))))
 
 ;; wrong number of bindings for statement
 (db-mat bulk-execute ()
