@@ -389,6 +389,9 @@
     (case-lambda
      [(ip) (json:read ip no-custom-inflate)]
      [(ip custom-inflate)
+      (arg-check 'json:read
+        [ip input-port? textual-port?]
+        [custom-inflate valid-custom-inflate?])
       (let ([x (seek-non-ws ip)])
         (cond
          [(eof-object? x) x]
@@ -467,11 +470,17 @@
                   (put-string op buf i (fx- len i))]
                  [else (lp n (fx- i 1))]))))]))))
 
+  (define (valid-custom-write? x)
+    (or (not x) (procedure/arity? #b10000 x)))
+
+  (define (valid-custom-inflate? x)
+    (procedure/arity? #b10 x))
+
   (define json:custom-write
     (make-process-parameter #f
       (lambda (x)
         (arg-check 'json:custom-write
-          [x (lambda (x) (or (not x) (procedure/arity? #b10000 x)))])
+          [x valid-custom-write?])
         x)))
 
   (define json:key<?
@@ -545,19 +554,22 @@
            (letrec ([custom-adapter (lambda (op x indent) (custom-writer op x indent wr-adapter))]
                     [wr-adapter (lambda (op x indent) (W wr ([custom-write custom-adapter]) x))])
              custom-adapter)))
-    (unless (and (output-port? op) (textual-port? op))
-      (bad-arg who op))
+    (arg-check who
+      [op output-port? textual-port?])
     (W wr () x)
     (when (eqv? indent 0)
       (newline op)))
+
+  (define (valid-indent? x) (or (not x) (and (fixnum? x) (fx>= x 0))))
 
   (define json:write
     (case-lambda
      [(op x) (json:write op x #f)]
      [(op x indent) (json:write op x indent (json:custom-write))]
      [(op x indent custom-writer)
-      (when (and indent (or (not (fixnum? indent)) (negative? indent)))
-        (bad-arg 'json:write indent))
+      (arg-check 'json:write
+        [indent valid-indent?]
+        [custom-writer valid-custom-write?])
       (internal-write op x indent custom-writer string<? 'json:write)]))
 
   (define json:object->string

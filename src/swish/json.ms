@@ -514,7 +514,31 @@
   (match-let*
    ([#(EXIT #(bad-arg json:write -1))
      (catch (json:write (open-output-string) 12 -1))]
+    [,ip (open-input-string "wrong")]
+    [#(EXIT #(bad-arg json:write ,@ip))
+     (catch (json:write ip 123))]
+    [(,op ,_) (call-with-values open-bytevector-output-port list)]
+    [#(EXIT #(bad-arg json:write ,@op))
+     (catch (json:write op 123))]
+    [#(EXIT #(bad-arg json:write 3.0))
+     (catch (json:write (open-output-string) "adventure" 3.0))]
+    [,proc (lambda (x) x)]
+    [#(EXIT #(bad-arg json:write ,@proc))
+     (catch (json:write (open-output-string) "adventure" #f proc))]
     [#(EXIT #(bad-arg json:write 7)) (catch (json:write 7 #f 0))]
+    [#(EXIT #(bad-arg json:write "typed object"))
+     (catch (json:write "typed object" 123))]
+    [#(EXIT #(bad-arg json:read "typed object"))
+     (catch (json:read "typed object"))]
+    [,proc (lambda () 'bad)]
+    [#(EXIT #(bad-arg json:read ,@proc))
+     (catch (json:read (open-input-string "123") proc))]
+    [,op (open-output-string)]
+    [#(EXIT #(bad-arg json:read ,@op))
+     (catch (json:read op))]
+    [,ip (open-bytevector-input-port #vu8(1 2 3 4 5))]
+    [#(EXIT #(bad-arg json:read ,@ip))
+     (catch (json:read ip))]
     [#(EXIT #(bad-arg json:pretty 9)) (catch (json:pretty #t 9))]
     [#(EXIT #(invalid-datum 1/2)) (catch (json:object->string 1/2))]
     [#(EXIT #(invalid-datum +inf.0)) (catch (json:object->string +inf.0))]
